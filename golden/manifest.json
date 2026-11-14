@@ -1,0 +1,83 @@
+{
+  "generator_version": "0.1.0",
+  "python": "3.12.11",
+  "sqlite": "3.50.4",
+  "jieba": "0.42.1",
+  "pyuca": "9.0.0",
+  "unicode": "15.0.0",
+  "corpus_sha256": "8e8d1a5b067532b3b6b89909bf742fcf5052d7ef3d5e8dfb46b3b18733e8f9ea",
+  "files": [
+    {
+      "path": "retrieve.jsonl",
+      "sha256": "bf2b50a5f99b6cebc42247fe63886ca336e9cf257030092f97bf0cdad2a57858",
+      "lines": 221
+    },
+    {
+      "path": "index_dump.jsonl",
+      "sha256": "8d50de73fdf6fbe55a4d3ebb88391a4872c005d329062b6de3470d179d25337c",
+      "lines": 2805
+    }
+  ],
+  "fixtures": [
+    {
+      "fixture": "C0",
+      "index": "C0.sqlite",
+      "index_sha256": "6c1acc8d09cb07b505d289e472ee3a46b5034eaaf843fd4a76e6999b92827d8a",
+      "chunks": 23,
+      "cases": 40,
+      "passed": 39,
+      "errors": 1,
+      "signature": "[\"fixture\",2200,5,null,\"desktop-sentences-v1\",\"plain-text-default\"]"
+    },
+    {
+      "fixture": "C1-rare80",
+      "index": "C1-rare80.sqlite",
+      "index_sha256": "b50558dcdd53c92808324f9de40e137789cd97b81cee09f3ef0b8762368cdee7",
+      "chunks": 300,
+      "cases": 9,
+      "passed": 9,
+      "errors": 0,
+      "signature": "[\"prune\",10000,5,null,\"desktop-sentences-v1\",\"plain-text-default\"]"
+    },
+    {
+      "fixture": "C1-rare140",
+      "index": "C1-rare140.sqlite",
+      "index_sha256": "70cb3d80c7835cb0359ccc0080a78ca7c4f848cf9eddc95e1096958469a1e70c",
+      "chunks": 300,
+      "cases": 9,
+      "passed": 9,
+      "errors": 0,
+      "signature": "[\"prune\",10000,5,null,\"desktop-sentences-v1\",\"plain-text-default\"]"
+    },
+    {
+      "fixture": "C2",
+      "index": "C2.sqlite",
+      "index_sha256": "4f1facdbc8a608a8559c545ee91d109c34060f7e913d50cb2a202721da4a3c6c",
+      "chunks": 160,
+      "cases": 9,
+      "passed": 9,
+      "errors": 0,
+      "signature": "[\"limit\",10000,5,null,\"desktop-sentences-v1\",\"plain-text-default\"]"
+    },
+    {
+      "fixture": "C3",
+      "index": "C3.sqlite",
+      "index_sha256": "7e8b49e2c712831bc42e101c6ec1d366bb82b992d1bb8f0ee0453523c04544a3",
+      "chunks": 2000,
+      "cases": 100,
+      "passed": 100,
+      "errors": 0,
+      "signature": "[\"scale\",10000,5,null,\"desktop-sentences-v1\",\"plain-text-default\"]"
+    },
+    {
+      "fixture": "C5",
+      "index": "C5.sqlite",
+      "index_sha256": "1c63d5cfb246d343d75473700fb4429bfb3ee4d6ed42be9413f4b73f9e2b3a66",
+      "chunks": 16,
+      "cases": 54,
+      "passed": 54,
+      "errors": 0,
+      "signature": "[\"unicode\",10000,5,null,\"desktop-sentences-v1\",\"plain-text-default\"]"
+    }
+  ]
+}

@@ -1,0 +1,15 @@
+[package]
+name = "sag2-index"
+description = "SQLite FTS5 index access for the SAG2 port: open decision table, statistics and retrieve"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rusqlite = { version = "0.37", features = ["bundled"] }
+sag2-json = { path = "../sag2-json" }
+sag2-rank-sys = { path = "../sag2-rank-sys" }
+serde_json = "1"
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,16 @@
+[package]
+name = "sag2-cli"
+description = "Command line entry points for the SAG2 port; P0 provides gate verification"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "sag2-cli"
+path = "src/main.rs"
+
+[dependencies]
+sag2-index = { path = "../sag2-index" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
