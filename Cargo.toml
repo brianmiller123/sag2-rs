@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/sag2-json",
+    "crates/sag2-core",
     "crates/sag2-rank-sys",
     "crates/sag2-index",
     "crates/sag2-cli",

@@ -1,4 +1,9 @@
-//! `sag2-cli verify --gate A`: replay the golden Gate A cases (design §1.1, §7.3).
+//! `sag2-cli verify --gate A|D`: replay the golden gate cases (design §1.1,
+//! §4.4, §7.3).
+//!
+//! Gate A replays the retrieved hits; Gate D compares the tokenizer against the
+//! frozen reference lines, every corpus segment, the ASCII cross product and
+//! the exhaustive per-code-point Unicode tables.
 //!
 //! Comparison uses only the §1.0 tolerance functions: the ordered hit rows are
 //! compared field by field (`eq_ids` on `id`/`document_id`, `eq_str` on the
@@ -18,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Generator version this verifier understands.
-const GENERATOR_VERSION: &str = "0.2.0";
+const GENERATOR_VERSION: &str = "0.3.0";
 
 /// Minimum interpreter the goldens may come from (design §11 divergence D5).
 const REQUIRED_PYTHON: (u64, u64) = (3, 12);
@@ -49,6 +54,43 @@ struct Manifest {
     reference: ManifestReference,
     files: Vec<ManifestFile>,
     fixtures: Vec<ManifestFixture>,
+    #[serde(default)]
+    tokenizer: Option<TokenizerSpec>,
+    #[serde(default)]
+    ascii_runs: Option<AsciiRunsSpec>,
+    #[serde(default)]
+    unicode_tables: BTreeMap<String, UnicodeTableSpec>,
+    #[serde(default)]
+    unicode_sparse: BTreeMap<String, UnicodeSparseSpec>,
+}
+
+/// Gate D's segment count (`tokenizer.jsonl`).
+#[derive(Deserialize)]
+struct TokenizerSpec {
+    segments: usize,
+}
+
+/// Gate D's ASCII cross-product count (`ascii_runs.jsonl`).
+#[derive(Deserialize)]
+struct AsciiRunsSpec {
+    runs: usize,
+}
+
+/// One exhaustive Unicode table: fixed-width records, one per code point.
+#[derive(Deserialize)]
+struct UnicodeTableSpec {
+    path: String,
+    magic: String,
+    record_bytes: usize,
+    codepoints: usize,
+}
+
+/// One sparse Unicode table: only the code points whose result is not identity.
+#[derive(Deserialize)]
+struct UnicodeSparseSpec {
+    path: String,
+    magic: String,
+    records: usize,
 }
 
 /// Identity of the reference source set the goldens were exported from (§7.1).
@@ -64,7 +106,10 @@ struct ManifestReference {
 struct ManifestFile {
     path: String,
     sha256: String,
-    lines: usize,
+    #[serde(default)]
+    lines: Option<usize>,
+    #[serde(default)]
+    records: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -114,6 +159,7 @@ struct Options {
     report: PathBuf,
     filter: Option<String>,
     reference: PathBuf,
+    fixtures: Option<Vec<String>>,
 }
 
 impl Default for Options {
@@ -125,6 +171,7 @@ impl Default for Options {
             report: PathBuf::from("report.json"),
             filter: None,
             reference: PathBuf::from(DEFAULT_REFERENCE),
+            fixtures: None,
         }
     }
 }
@@ -146,6 +193,15 @@ impl Options {
                 "--report" => options.report = PathBuf::from(value),
                 "--filter" => options.filter = Some(value),
                 "--reference" => options.reference = PathBuf::from(value),
+                "--fixtures" => {
+                    options.fixtures = Some(
+                        value
+                            .split(',')
+                            .map(|fixture| fixture.trim().to_owned())
+                            .filter(|fixture| !fixture.is_empty())
+                            .collect(),
+                    )
+                }
                 other => return Err(format!("unknown argument {other}")),
             }
             index += 2;
@@ -193,8 +249,9 @@ pub fn verify(args: &[String]) -> ExitCode {
 }
 
 pub fn usage() -> &'static str {
-    "usage: sag2-cli verify --gate A --golden golden/ [--reference <scripts>] \
-     [--index-cache <dir>] [--filter <substring>] [--report report.json]"
+    "usage: sag2-cli verify --gate A|D --golden golden/ [--fixtures tokenizer] \
+     [--reference <scripts>] [--index-cache <dir>] [--filter <substring>] \
+     [--report report.json]"
 }
 
 /// The toolchain values this build certifies for the reference environment.
@@ -245,13 +302,18 @@ fn verify_reference(reference: &ManifestReference, dir: &Path) -> Result<(), Str
 }
 
 fn run(options: &Options) -> Result<ExitCode, String> {
-    if !options.gate.eq_ignore_ascii_case("A") {
-        return Err(format!(
-            "gate {} is not implemented in P0; only gate A has goldens",
-            options.gate
-        ));
+    match options.gate.to_ascii_uppercase().as_str() {
+        "A" => run_gate_a(options),
+        "D" => run_gate_d(options),
+        other => Err(format!(
+            "gate {other} is not implemented; only gates A and D have goldens"
+        )),
     }
+}
 
+/// Manifest self-consistency and the certified-toolchain checks shared by every
+/// gate (design §1.0 rule 2, §7.1).
+fn preflight(options: &Options) -> Result<Manifest, String> {
     let manifest_path = options.golden.join("manifest.json");
     let manifest_text = fs::read_to_string(&manifest_path)
         .map_err(|error| format!("cannot read {}: {error}", manifest_path.display()))?;
@@ -304,22 +366,45 @@ fn run(options: &Options) -> Result<ExitCode, String> {
 
     // Design §7.1: the golden must name the exact reference source set.
     verify_reference(&manifest.reference, &options.reference)?;
+    Ok(manifest)
+}
 
-    for file in &manifest.files {
+/// Verify the manifest's hash (and, for JSONL, line count) for the files one
+/// gate actually reads.
+fn verify_manifest_files(
+    options: &Options,
+    manifest: &Manifest,
+    required: &[&str],
+) -> Result<(), String> {
+    for name in required {
+        let file = manifest
+            .files
+            .iter()
+            .find(|file| file.path == *name)
+            .ok_or_else(|| format!("manifest does not list {name}"))?;
         let path = options.golden.join(&file.path);
         let bytes =
             fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
         if sha256_hex(&bytes) != file.sha256 {
             return Err(format!("{} does not match the manifest sha256", file.path));
         }
-        let lines = bytes.iter().filter(|byte| **byte == b'\n').count();
-        if lines != file.lines {
-            return Err(format!(
-                "{} has {lines} lines, manifest says {}",
-                file.path, file.lines
-            ));
+        if let Some(expected_lines) = file.lines {
+            let lines = bytes.iter().filter(|byte| **byte == b'\n').count();
+            if lines != expected_lines {
+                return Err(format!(
+                    "{} has {lines} lines, manifest says {expected_lines}",
+                    file.path
+                ));
+            }
         }
     }
+    Ok(())
+}
+
+fn run_gate_a(options: &Options) -> Result<ExitCode, String> {
+    let manifest = preflight(options)?;
+    let runtime_sqlite = sag2_index::sqlite_version();
+    verify_manifest_files(options, &manifest, &["retrieve.jsonl", "index_dump.jsonl"])?;
 
     let signatures = dump_signatures(options)?;
     for fixture in &manifest.fixtures {
@@ -482,6 +567,486 @@ fn run(options: &Options) -> Result<ExitCode, String> {
     } else {
         ExitCode::from(2)
     })
+}
+
+/// Gate D `tokenizer`: segment sequences, exhaustive Unicode tables and the
+/// ASCII cross product (design §4.4).  `token_positions_diff` must be exactly
+/// zero - a tolerance is not allowed here.
+fn run_gate_d(options: &Options) -> Result<ExitCode, String> {
+    let fixtures = options
+        .fixtures
+        .clone()
+        .unwrap_or_else(|| vec!["tokenizer".to_owned()]);
+    for fixture in &fixtures {
+        if fixture != "tokenizer" {
+            return Err(format!(
+                "gate D fixture {fixture} is not implemented; only 'tokenizer' has goldens"
+            ));
+        }
+    }
+
+    let manifest = preflight(options)?;
+    verify_manifest_files(
+        options,
+        &manifest,
+        &[
+            "tokenizer.jsonl",
+            "ascii_runs.jsonl",
+            "unicode_lower.bin.gz",
+            "unicode_casefold.bin.gz",
+            "unicode_combining.bin.gz",
+            "unicode_categories.bin.gz",
+            "unicode_nfkd.bin.gz",
+            "unicode_nfkc.bin.gz",
+            "unicode_compose.bin.gz",
+        ],
+    )?;
+
+    let mut failures: Vec<Failure> = Vec::new();
+    let segments = compare_token_lines(&options.golden.join("tokenizer.jsonl"), &mut failures)?;
+    let expected_segments = manifest
+        .tokenizer
+        .as_ref()
+        .ok_or_else(|| "manifest has no tokenizer section".to_owned())?
+        .segments;
+    if segments.total != expected_segments {
+        return Err(format!(
+            "golden inconsistency: tokenizer.jsonl holds {} segments, manifest says {}",
+            segments.total, expected_segments
+        ));
+    }
+    let runs = compare_token_lines(&options.golden.join("ascii_runs.jsonl"), &mut failures)?;
+    let expected_runs = manifest
+        .ascii_runs
+        .as_ref()
+        .ok_or_else(|| "manifest has no ascii_runs section".to_owned())?
+        .runs;
+    if runs.total != expected_runs {
+        return Err(format!(
+            "golden inconsistency: ascii_runs.jsonl holds {} runs, manifest says {}",
+            runs.total, expected_runs
+        ));
+    }
+
+    let mut tables: BTreeMap<String, serde_json::Value> = BTreeMap::new();
+    let mut codepoints_checked = 0_usize;
+    let mut codepoint_diffs = 0_usize;
+    for spec in manifest.unicode_tables.values() {
+        let file = manifest
+            .files
+            .iter()
+            .find(|file| file.path == spec.path)
+            .ok_or_else(|| format!("manifest does not list {}", spec.path))?;
+        if file.records != Some(spec.codepoints) {
+            return Err(format!(
+                "golden inconsistency: {} records disagree with the unicode table spec",
+                spec.path
+            ));
+        }
+    }
+    for name in ["lower", "casefold", "combining", "categories"] {
+        let spec = manifest
+            .unicode_tables
+            .get(name)
+            .ok_or_else(|| format!("manifest has no unicode table {name}"))?;
+        let path = options.golden.join(&spec.path);
+        let bytes = fs::read(&path)
+            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        let data = gunzip(&path, &bytes)?;
+        let counts = gate_d_table(name, spec, &data, &mut failures)?;
+        codepoints_checked += counts.codepoints;
+        codepoint_diffs += counts.diffs;
+        tables.insert(
+            name.to_owned(),
+            serde_json::json!({"codepoints": counts.codepoints, "diffs": counts.diffs}),
+        );
+    }
+
+    let nfkc = manifest
+        .unicode_sparse
+        .get("nfkc")
+        .ok_or_else(|| "manifest has no sparse nfkc table".to_owned())?;
+    let nfkc_path = options.golden.join(&nfkc.path);
+    let nfkc_bytes = fs::read(&nfkc_path)
+        .map_err(|error| format!("cannot read {}: {error}", nfkc_path.display()))?;
+    let nfkc_data = gunzip(&nfkc_path, &nfkc_bytes)?;
+    let nfkc_counts = gate_d_sparse_table("nfkc", nfkc, &nfkc_data, &mut failures)?;
+    codepoints_checked += nfkc_counts.codepoints;
+    codepoint_diffs += nfkc_counts.diffs;
+    tables.insert(
+        "nfkc".to_owned(),
+        serde_json::json!({"codepoints": nfkc_counts.codepoints, "diffs": nfkc_counts.diffs}),
+    );
+
+    println!(
+        "{:<12} {:>9} {:>9} {:>10} {:>6}",
+        "fixture", "segments", "equal", "positions", "diff"
+    );
+    println!(
+        "{:<12} {:>9} {:>9} {:>10} {:>6}",
+        "tokenizer", segments.total, segments.equal, segments.positions, segments.diff
+    );
+    println!(
+        "{:<12} {:>9} {:>9} {:>10} {:>6}",
+        "ascii_runs", runs.total, runs.equal, runs.positions, runs.diff
+    );
+    println!(
+        "unicode: {} tables, {} code points, {} diffs",
+        tables.len(),
+        codepoints_checked,
+        codepoint_diffs
+    );
+    println!(
+        "gate D (tokenizer): {}/{} segments, {}/{} ascii runs, \
+         token_positions_diff={}, codepoint_diffs={}",
+        segments.equal, segments.total, runs.equal, runs.total, segments.diff, codepoint_diffs
+    );
+    for failure in failures.iter().take(10) {
+        println!(
+            "  {} {}: expected {}, got {}",
+            failure.case_id, failure.path, failure.expected, failure.actual
+        );
+    }
+
+    let passed = failures.is_empty()
+        && segments.diff == 0
+        && segments.equal == segments.total
+        && runs.diff == 0
+        && runs.equal == runs.total
+        && codepoint_diffs == 0;
+    let report = serde_json::json!({
+        "golden": {
+            "dir": options.golden.display().to_string(),
+            "generated_by": format!("export_golden.py@{}", manifest.generator_version),
+            "python": manifest.python,
+            "sqlite": manifest.sqlite,
+            "runtime_sqlite": sag2_index::sqlite_version(),
+            "reference": {
+                "dir": options.reference.display().to_string(),
+                "commit": manifest.reference.commit,
+            },
+        },
+        "toolchain": {
+            "sqlite_allowlist": SQLITE_ALLOWLIST,
+            "jieba": manifest.jieba,
+            "pyuca": manifest.pyuca,
+            "unicode": manifest.unicode,
+        },
+        "tolerances": {"level": "S", "f64": "bits", "ids": "exact"},
+        "gates": {"D": {
+            "fixtures": fixtures,
+            "segments_total": segments.total,
+            "segments_equal": segments.equal,
+            "token_positions_total": segments.positions,
+            "token_positions_diff": segments.diff,
+            "ascii_runs_total": runs.total,
+            "ascii_runs_equal": runs.equal,
+            "ascii_run_positions_diff": runs.diff,
+            "codepoints_checked": codepoints_checked,
+            "codepoint_diffs": codepoint_diffs,
+            "tables": tables,
+        }},
+        "excluded_fields": [],
+        "excluded_checks": ["db_physical_bytes"],
+        "failures": failures,
+        "ulp_flips": [],
+        "unsupported": [],
+    });
+    write_report(&options.report, &report);
+    Ok(if passed {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(2)
+    })
+}
+
+#[derive(Deserialize)]
+struct TokenLine {
+    #[serde(default)]
+    segment_id: Option<String>,
+    text: String,
+    tokens: Vec<String>,
+}
+
+#[derive(Default)]
+struct TokenCounts {
+    total: usize,
+    equal: usize,
+    positions: usize,
+    diff: usize,
+}
+
+/// Compare one JSONL token golden against `sag2_core::tokenize`.  The first
+/// differing token per segment is reported with its position.
+fn compare_token_lines(path: &Path, failures: &mut Vec<Failure>) -> Result<TokenCounts, String> {
+    let text =
+        fs::read_to_string(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let mut counts = TokenCounts::default();
+    for (line_index, line) in text.lines().enumerate() {
+        let entry: TokenLine = serde_json::from_str(line)
+            .map_err(|error| format!("{}:{}: {error}", path.display(), line_index + 1))?;
+        let case_id = entry
+            .segment_id
+            .clone()
+            .unwrap_or_else(|| format!("{}:{}", path.display(), line_index + 1));
+        let actual = sag2_core::tokenize(&entry.text);
+        counts.total += 1;
+        let positions = entry.tokens.len().max(actual.len());
+        counts.positions += positions;
+        let mut mismatches = 0_usize;
+        let mut first: Option<(usize, String, String)> = None;
+        for position in 0..positions {
+            let expected = entry.tokens.get(position);
+            let got = actual.get(position);
+            if expected == got {
+                continue;
+            }
+            mismatches += 1;
+            if first.is_none() {
+                first = Some((
+                    position,
+                    expected
+                        .map(|token| format!("{token:?}"))
+                        .unwrap_or_else(|| "<missing>".to_owned()),
+                    got.map(|token| format!("{token:?}"))
+                        .unwrap_or_else(|| "<missing>".to_owned()),
+                ));
+            }
+        }
+        if mismatches == 0 {
+            counts.equal += 1;
+        } else {
+            counts.diff += mismatches;
+            if failures.len() < MAX_FAILURES {
+                let (position, expected, got) = first.expect("mismatch position");
+                failures.push(Failure {
+                    case_id,
+                    path: format!("tokens[{position}]"),
+                    expected,
+                    actual: got,
+                    delta: None,
+                });
+            }
+        }
+    }
+    Ok(counts)
+}
+
+fn gunzip(path: &Path, compressed: &[u8]) -> Result<Vec<u8>, String> {
+    use std::io::Read as _;
+    let mut data = Vec::new();
+    flate2::read::GzDecoder::new(compressed)
+        .read_to_end(&mut data)
+        .map_err(|error| format!("cannot decompress {}: {error}", path.display()))?;
+    Ok(data)
+}
+
+#[derive(Default)]
+struct TableCounts {
+    codepoints: usize,
+    diffs: usize,
+}
+
+/// Compare one exhaustive table against `sag2_core`.  Lone surrogates are not
+/// scalar values, so the golden's identity record is asserted instead.
+fn gate_d_table(
+    name: &str,
+    spec: &UnicodeTableSpec,
+    data: &[u8],
+    failures: &mut Vec<Failure>,
+) -> Result<TableCounts, String> {
+    if data.len() < 8 || &data[..8] != spec.magic.as_bytes() {
+        return Err(format!("{} does not start with the manifest magic", spec.path));
+    }
+    let expected_len = 8 + spec.codepoints * spec.record_bytes;
+    if data.len() != expected_len {
+        return Err(format!(
+            "{} holds {} bytes, manifest layout says {expected_len}",
+            spec.path,
+            data.len()
+        ));
+    }
+    let mut counts = TableCounts::default();
+    for cp in 0..spec.codepoints {
+        counts.codepoints += 1;
+        let scalar = cp as u32;
+        let base = 8 + cp * spec.record_bytes;
+        let surrogate = (0xD800..=0xDFFF).contains(&cp);
+        let (expected, actual) = match name {
+            "lower" | "casefold" => {
+                let length = data[base + 4] as usize;
+                let mapped: Vec<u32> = (0..length)
+                    .map(|index| {
+                        let at = base + 5 + index * 4;
+                        u32::from_le_bytes(data[at..at + 4].try_into().expect("mapping slot"))
+                    })
+                    .collect();
+                if surrogate {
+                    let identity = mapped == [scalar];
+                    if !identity {
+                        counts.diffs += 1;
+                        push_table_failure(failures, name, cp, format!("{mapped:?}"), "<surrogate>".to_owned());
+                    }
+                    continue;
+                }
+                let character = char::from_u32(scalar).expect("scalar value");
+                let produced: Vec<u32> = if name == "lower" {
+                    sag2_core::lower(&character.to_string())
+                } else {
+                    sag2_core::casefold(&character.to_string())
+                }
+                .chars()
+                .map(|mapped| mapped as u32)
+                .collect();
+                (format!("{mapped:?}"), format!("{produced:?}"))
+            }
+            "combining" => {
+                let class = data[base + 4];
+                if surrogate {
+                    if class != 0 {
+                        counts.diffs += 1;
+                        push_table_failure(failures, name, cp, class.to_string(), "<surrogate>".to_owned());
+                    }
+                    continue;
+                }
+                (
+                    class.to_string(),
+                    sag2_core::combining_class(scalar).to_string(),
+                )
+            }
+            "categories" => {
+                let mask = data[base + 4];
+                if surrogate {
+                    if mask != 0 {
+                        counts.diffs += 1;
+                        push_table_failure(failures, name, cp, mask.to_string(), "<surrogate>".to_owned());
+                    }
+                    continue;
+                }
+                let mut actual = 0_u8;
+                if sag2_core::is_letter(scalar) {
+                    actual |= 0b0001;
+                }
+                if sag2_core::is_number(scalar) {
+                    actual |= 0b0010;
+                }
+                if sag2_core::is_uppercase(scalar) {
+                    actual |= 0b0100;
+                }
+                if sag2_core::is_mark(scalar) {
+                    actual |= 0b1000;
+                }
+                (mask.to_string(), actual.to_string())
+            }
+            other => return Err(format!("unknown unicode table {other}")),
+        };
+        if expected != actual {
+            counts.diffs += 1;
+            push_table_failure(failures, name, cp, expected, actual);
+        }
+    }
+    Ok(counts)
+}
+
+/// Compare one sparse table (`cp:u32le, len:u8, cps`), treating missing code
+/// points as identity.  Used for the exhaustive NFKC check.
+fn gate_d_sparse_table(
+    name: &str,
+    spec: &UnicodeSparseSpec,
+    data: &[u8],
+    failures: &mut Vec<Failure>,
+) -> Result<TableCounts, String> {
+    if data.len() < 13 || &data[..8] != spec.magic.as_bytes() {
+        return Err(format!(
+            "{} does not start with the manifest magic",
+            spec.path
+        ));
+    }
+    let count = u32::from_le_bytes(data[8..12].try_into().expect("sparse count")) as usize;
+    let width = data[12] as usize;
+    let stride = 5 + 4 * width;
+    let expected_len = 13 + count * stride;
+    if count != spec.records || data.len() != expected_len {
+        return Err(format!(
+            "{} holds {} records / {} bytes, manifest says {} records with {stride}-byte stride",
+            spec.path,
+            count,
+            data.len(),
+            spec.records
+        ));
+    }
+    let records = &data[13..];
+    let mut counts = TableCounts::default();
+    for cp in 0..0x11_0000_usize {
+        if (0xD800..=0xDFFF).contains(&cp) {
+            continue;
+        }
+        counts.codepoints += 1;
+        // Binary search the sparse record for this code point.
+        let mut low = 0_usize;
+        let mut high = count;
+        let mut mapped: Option<(usize, usize)> = None;
+        while low < high {
+            let middle = (low + high) / 2;
+            let base = middle * stride;
+            let found = u32::from_le_bytes(
+                records[base..base + 4]
+                    .try_into()
+                    .expect("sparse record cp"),
+            );
+            match found.cmp(&(cp as u32)) {
+                std::cmp::Ordering::Less => low = middle + 1,
+                std::cmp::Ordering::Greater => high = middle,
+                std::cmp::Ordering::Equal => {
+                    mapped = Some((base, records[base + 4] as usize));
+                    break;
+                }
+            }
+        }
+        let expected: Vec<u32> = match mapped {
+            Some((base, length)) => (0..length)
+                .map(|index| {
+                    let at = base + 5 + index * 4;
+                    u32::from_le_bytes(records[at..at + 4].try_into().expect("sparse cps"))
+                })
+                .collect(),
+            None => vec![cp as u32],
+        };
+        let character = char::from_u32(cp as u32).expect("scalar value");
+        let actual: Vec<u32> = sag2_core::nfkc(&character.to_string())
+            .chars()
+            .map(|mapped| mapped as u32)
+            .collect();
+        if expected != actual {
+            counts.diffs += 1;
+            push_table_failure(
+                failures,
+                name,
+                cp,
+                format!("{expected:?}"),
+                format!("{actual:?}"),
+            );
+        }
+    }
+    Ok(counts)
+}
+
+fn push_table_failure(
+    failures: &mut Vec<Failure>,
+    table: &str,
+    cp: usize,
+    expected: String,
+    actual: String,
+) {
+    if failures.len() < MAX_FAILURES {
+        failures.push(Failure {
+            case_id: format!("unicode/{table}"),
+            path: format!("U+{cp:04X}"),
+            expected,
+            actual,
+            delta: None,
+        });
+    }
 }
 
 /// `failures` and `ulp_flips` both make the gate fail (design §1.1).

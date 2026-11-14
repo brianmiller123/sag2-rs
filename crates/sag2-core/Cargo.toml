@@ -1,0 +1,15 @@
+[package]
+name = "sag2-core"
+description = "SAG2 text core: the §4 tokenizer and the Unicode tables it needs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# `default-features = false` drops the crate's bundled dictionary; the
+# certified jieba 0.42.1 `dict.txt` is the only dictionary this port loads
+# (design §4.3).
+jieba-rs = { version = "0.7.4", default-features = false }
+
+[build-dependencies]
+flate2 = "1.1"

@@ -1,10 +1,11 @@
 {
-  "generator_version": "0.2.0",
+  "generator_version": "0.3.0",
   "python": "3.12.11",
   "sqlite": "3.50.4",
   "jieba": "0.42.1",
   "pyuca": "9.0.0",
   "unicode": "15.0.0",
+  "regex": "2026.11.9",
   "corpus_sha256": "8e8d1a5b067532b3b6b89909bf742fcf5052d7ef3d5e8dfb46b3b18733e8f9ea",
   "reference": {
     "sag2_py_sha256": "28cbaf87278412ee1bd9baf9613a07de7f1b908b8de9aaad9903c5a96d29877a",
@@ -22,8 +23,160 @@
       "path": "index_dump.jsonl",
       "sha256": "d0e9279b875db9f46e894864fa27b0dbbd0cb308451a409db45ec8afc7cc53da",
       "lines": 2805
+    },
+    {
+      "path": "tokenizer.jsonl",
+      "sha256": "43e26f899601ff7afed26086e5776db56c21bfcc70946cdaf10b0612648a5793",
+      "lines": 8561
+    },
+    {
+      "path": "ascii_runs.jsonl",
+      "sha256": "2764017d83a4fe129d98c20cc564329a355789b90ae6fe994d257ebaa33b8204",
+      "lines": 311852
+    },
+    {
+      "path": "unicode_lower.bin.gz",
+      "sha256": "c2eea883d68b67a3dbb2295e24f0737b1a0fc54413473dfe586392fb83b8f0cc",
+      "records": 1114112,
+      "record_bytes": 17,
+      "uncompressed_bytes": 18939912,
+      "gzip_bytes": 4335755
+    },
+    {
+      "path": "unicode_casefold.bin.gz",
+      "sha256": "6ae5d6a5025353b776d3b6a8d440bfb981bc7125dc7cb7928755452dc0c1f8e5",
+      "records": 1114112,
+      "record_bytes": 17,
+      "uncompressed_bytes": 18939912,
+      "gzip_bytes": 4335989
+    },
+    {
+      "path": "unicode_combining.bin.gz",
+      "sha256": "23a989bc40855a57932b19024144618951cb94eb9d0687ef7c601ede6192aa8a",
+      "records": 1114112,
+      "record_bytes": 5,
+      "uncompressed_bytes": 5570568,
+      "gzip_bytes": 1680980
+    },
+    {
+      "path": "unicode_categories.bin.gz",
+      "sha256": "ecbf5714634d03944639e17edb22e00fe8f1c5605c404efe19065287e23b41c2",
+      "records": 1114112,
+      "record_bytes": 5,
+      "uncompressed_bytes": 5570568,
+      "gzip_bytes": 1682875
+    },
+    {
+      "path": "unicode_nfkd.bin.gz",
+      "sha256": "f9deb0e71c5caec269e51772ad7b86d94bb7dec5eec6ea8912f00ba05a478d17",
+      "records": 5857,
+      "gzip_bytes": 30430
+    },
+    {
+      "path": "unicode_nfkc.bin.gz",
+      "sha256": "f287216f083fbc118e32998ed0ef6164f9ccad69d686d8f117dcb8f70f3da9cb",
+      "records": 4928,
+      "gzip_bytes": 25244
+    },
+    {
+      "path": "unicode_compose.bin.gz",
+      "sha256": "2d8bee1e0561143f2dffccfb26d9228ab751bfdf2efe869c4d775945fa8bb0ba",
+      "records": 941,
+      "gzip_bytes": 4137
     }
   ],
+  "tokenizer": {
+    "segments": 8561,
+    "golden": "tokenizer.jsonl"
+  },
+  "ascii_runs": {
+    "runs": 311852,
+    "golden": "ascii_runs.jsonl",
+    "pair_count": 20000,
+    "pair_seed": 20261114,
+    "pool": "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789%._-"
+  },
+  "unicode_tables": {
+    "lower": {
+      "path": "unicode_lower.bin.gz",
+      "magic": "SAG2LOWR",
+      "record_bytes": 17,
+      "fields": [
+        "cp:u32le",
+        "len:u8",
+        "cps:[u32le;3]"
+      ],
+      "codepoints": 1114112
+    },
+    "casefold": {
+      "path": "unicode_casefold.bin.gz",
+      "magic": "SAG2CASE",
+      "record_bytes": 17,
+      "fields": [
+        "cp:u32le",
+        "len:u8",
+        "cps:[u32le;3]"
+      ],
+      "codepoints": 1114112
+    },
+    "combining": {
+      "path": "unicode_combining.bin.gz",
+      "magic": "SAG2COMB",
+      "record_bytes": 5,
+      "fields": [
+        "cp:u32le",
+        "combining_class:u8"
+      ],
+      "codepoints": 1114112
+    },
+    "categories": {
+      "path": "unicode_categories.bin.gz",
+      "magic": "SAG2CATE",
+      "record_bytes": 5,
+      "fields": [
+        "cp:u32le",
+        "mask:u8 (1<<0 L, 1<<1 N, 1<<2 Lu, 1<<3 M)"
+      ],
+      "codepoints": 1114112
+    }
+  },
+  "unicode_sparse": {
+    "nfkd": {
+      "path": "unicode_nfkd.bin.gz",
+      "magic": "SAG2NFKD",
+      "fields": [
+        "cp:u32le",
+        "len:u8",
+        "cps:[u32le;width]"
+      ],
+      "header": "count:u32le, width:u8",
+      "records": 5857,
+      "width": 18
+    },
+    "nfkc": {
+      "path": "unicode_nfkc.bin.gz",
+      "magic": "SAG2NFKC",
+      "fields": [
+        "cp:u32le",
+        "len:u8",
+        "cps:[u32le;width]"
+      ],
+      "header": "count:u32le, width:u8",
+      "records": 4928,
+      "width": 18
+    },
+    "compose": {
+      "path": "unicode_compose.bin.gz",
+      "magic": "SAG2COMP",
+      "fields": [
+        "a:u32le",
+        "b:u32le",
+        "composite:u32le"
+      ],
+      "header": "count:u32le",
+      "records": 941
+    }
+  },
   "fixtures": [
     {
       "fixture": "C0",

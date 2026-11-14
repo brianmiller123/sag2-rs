@@ -43,7 +43,10 @@ if sys.version_info < (3, 12):  # pragma: no cover - exercised by the refusal te
     raise SystemExit(1)
 
 import argparse
+import gzip
 import hashlib
+import io
+import itertools
 import json
 import os
 import random
@@ -54,6 +57,8 @@ import subprocess
 import tempfile
 import unicodedata
 from pathlib import Path
+
+import regex
 
 # Never leave bytecode (or any other artefact) inside the read-only reference
 # checkout (design §7.1).
@@ -73,7 +78,7 @@ if os.environ.get("PYTHONHASHSEED") != "0":
     )
 
 DEFAULT_REFERENCE = Path("../SAG-Benchmark/sag2/scripts")
-GENERATOR_VERSION = "0.2.0"
+GENERATOR_VERSION = "0.3.0"
 
 # The reference modules whose identity the manifest records (design §7.1).
 REFERENCE_FILES = {
@@ -430,6 +435,245 @@ def export_fixture(fixture, sag2, work_dir):
         index.close()
 
 
+# --------------------------------------------------------------------------
+# Gate D (tokenizer) - design §4.4: frozen tokenizer lines, every corpus
+# segment, exhaustive per-codepoint tables and the ASCII-run cross product.
+# --------------------------------------------------------------------------
+
+# `[a-zA-Z0-9%._-]` - the connected-ASCII alphabet of design §4.2.
+ASCII_RUN_POOL = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789%._-"
+ASCII_RUN_PAIR_COUNT = 20_000
+ASCII_RUN_SEED = 20261114
+CODEPOINTS = 0x110000
+# Lone surrogates are not Unicode scalar values; `str.encode("utf-8")` (and
+# Rust's `char`) refuse them, so the golden never samples them.
+SCALARS = [cp for cp in range(CODEPOINTS) if not 0xD800 <= cp <= 0xDFFF]
+
+# Fixed-width binary layouts.  Every file starts with an 8-byte magic tag and
+# then carries exactly one record per Unicode scalar value (0..=0x10FFFF), so a
+# reader can index record `cp` directly at `8 + cp * RECORD_BYTES`.
+UNICODE_TABLES = {
+    "lower": {
+        "magic": b"SAG2LOWR",
+        "record_bytes": 17,  # cp:u32le, len:u8, cps:[u32le;3] (zero padded)
+        "fields": ["cp:u32le", "len:u8", "cps:[u32le;3]"],
+        "path": "unicode_lower.bin.gz",
+    },
+    "casefold": {
+        "magic": b"SAG2CASE",
+        "record_bytes": 17,
+        "fields": ["cp:u32le", "len:u8", "cps:[u32le;3]"],
+        "path": "unicode_casefold.bin.gz",
+    },
+    "combining": {
+        "magic": b"SAG2COMB",
+        "record_bytes": 5,  # cp:u32le, class:u8
+        "fields": ["cp:u32le", "combining_class:u8"],
+        "path": "unicode_combining.bin.gz",
+    },
+    "categories": {
+        "magic": b"SAG2CATE",
+        "record_bytes": 5,  # cp:u32le, mask:u8 (bit0 L, bit1 N, bit2 Lu, bit3 M)
+        "fields": ["cp:u32le", "mask:u8 (1<<0 L, 1<<1 N, 1<<2 Lu, 1<<3 M)"],
+        "path": "unicode_categories.bin.gz",
+    },
+}
+
+CATEGORY_PATTERNS = (
+    (0b0001, regex.compile(r"\p{L}")),
+    (0b0010, regex.compile(r"\p{N}")),
+    (0b0100, regex.compile(r"\p{Lu}")),
+    (0b1000, regex.compile(r"\p{M}")),
+)
+
+
+# Sparse, variable-width tables (NFKD/NFKC mappings and the canonical
+# composition pairs).  `nfkd`/`nfkc` carry `u32 count, u8 width` after their
+# magic tag and then `count` records of `cp:u32le, len:u8, cps:[u32le;width]`.
+# `compose` carries `u32 count` and then `count` records of
+# `a:u32le, b:u32le, composite:u32le`, sorted by `(a, b)`.
+SPARSE_UNICODE_TABLES = {
+    "nfkd": {
+        "magic": b"SAG2NFKD",
+        "path": "unicode_nfkd.bin.gz",
+        "fields": ["cp:u32le", "len:u8", "cps:[u32le;width]"],
+        "header": "count:u32le, width:u8",
+    },
+    "nfkc": {
+        "magic": b"SAG2NFKC",
+        "path": "unicode_nfkc.bin.gz",
+        "fields": ["cp:u32le", "len:u8", "cps:[u32le;width]"],
+        "header": "count:u32le, width:u8",
+    },
+    "compose": {
+        "magic": b"SAG2COMP",
+        "path": "unicode_compose.bin.gz",
+        "fields": ["a:u32le", "b:u32le", "composite:u32le"],
+        "header": "count:u32le",
+    },
+}
+
+HANGUL_FIRST = 0xAC00
+HANGUL_LAST = 0xD7A3
+
+
+def _sparse_mapping(transform):
+    """Non-identity single-codepoint results, Hangul excluded (it is algorithmic)."""
+    records = []
+    width = 0
+    for cp in range(CODEPOINTS):
+        if 0xD800 <= cp <= 0xDFFF or HANGUL_FIRST <= cp <= HANGUL_LAST:
+            continue
+        mapped = transform(chr(cp))
+        if mapped == chr(cp):
+            continue
+        records.append((cp, mapped))
+        width = max(width, len(mapped))
+    return records, width
+
+
+def _sparse_mapping_bytes(magic, records, width):
+    buffer = bytearray(magic)
+    buffer += struct.pack("<IB", len(records), width)
+    for cp, mapped in records:
+        buffer += struct.pack("<IB", cp, len(mapped))
+        buffer += b"".join(struct.pack("<I", ord(c)) for c in mapped.ljust(width, "\0"))
+    return bytes(buffer)
+
+
+def _compose_pairs():
+    """Canonical composition pairs that Python's NFC actually applies."""
+    pairs = []
+    for cp in range(CODEPOINTS):
+        if 0xD800 <= cp <= 0xDFFF or HANGUL_FIRST <= cp <= HANGUL_LAST:
+            continue
+        decomposition = unicodedata.decomposition(chr(cp))
+        if not decomposition or decomposition.startswith("<"):
+            continue
+        parts = [int(part, 16) for part in decomposition.split()]
+        if len(parts) != 2:
+            continue
+        left, right = parts
+        if unicodedata.normalize("NFC", chr(left) + chr(right)) == chr(cp):
+            pairs.append((left, right, cp))
+    pairs.sort()
+    return pairs
+
+
+def export_sparse_unicode_tables():
+    nfkd, nfkd_width = _sparse_mapping(lambda char: unicodedata.normalize("NFKD", char))
+    nfkc, nfkc_width = _sparse_mapping(lambda char: unicodedata.normalize("NFKC", char))
+    pairs = _compose_pairs()
+    blobs = {
+        "nfkd": _sparse_mapping_bytes(b"SAG2NFKD", nfkd, nfkd_width),
+        "nfkc": _sparse_mapping_bytes(b"SAG2NFKC", nfkc, nfkc_width),
+    }
+    buffer = bytearray(b"SAG2COMP")
+    buffer += struct.pack("<I", len(pairs))
+    for left, right, composite in pairs:
+        buffer += struct.pack("<III", left, right, composite)
+    blobs["compose"] = bytes(buffer)
+    counts = {
+        "nfkd": {"records": len(nfkd), "width": nfkd_width},
+        "nfkc": {"records": len(nfkc), "width": nfkc_width},
+        "compose": {"records": len(pairs)},
+    }
+    metadata = {
+        name: {
+            "path": SPARSE_UNICODE_TABLES[name]["path"],
+            "magic": SPARSE_UNICODE_TABLES[name]["magic"].decode(),
+            "fields": SPARSE_UNICODE_TABLES[name]["fields"],
+            "header": SPARSE_UNICODE_TABLES[name]["header"],
+            **counts[name],
+        }
+        for name in SPARSE_UNICODE_TABLES
+    }
+    return {name: _gzip_bytes(blob) for name, blob in blobs.items()}, metadata
+
+
+def _gzip_bytes(data: bytes) -> bytes:
+    """Deterministic gzip (mtime 0) so re-exports stay byte-identical."""
+    buffer = io.BytesIO()
+    with gzip.GzipFile(fileobj=buffer, mode="wb", mtime=0) as handle:
+        handle.write(data)
+    return buffer.getvalue()
+
+
+def fixture_segments(fixture, rows):
+    """Every corpus title/text plus every chunk content, in a stable order."""
+    segments = []
+    for index, document in enumerate(fixture.corpus):
+        segments.append((f"{fixture.name}/title/{index}", document.get("title", "")))
+        segments.append((f"{fixture.name}/text/{index}", document.get("text", "")))
+    for row in rows:
+        segments.append((f"{fixture.name}/chunk/{row['id']}/content", row["content"]))
+    return segments
+
+
+def export_tokenizer(reference, fixture_segments_by_name, sag2):
+    """`tokenizer.jsonl`: segment id, normalised text and the reference tokens."""
+    segments = []
+    for index, entry in enumerate(reference["tokenizer"]):
+        tokens = sag2.tokenize(entry["text"])
+        if tokens != entry["tokens"]:
+            raise SystemExit(
+                f"frozen tokenizer line {index} disagrees with the reference implementation"
+            )
+        segments.append((f"C0/tokenizer/{index}", entry["text"], tokens))
+    for name, entries in fixture_segments_by_name.items():
+        for segment_id, text in entries:
+            segments.append((segment_id, text, sag2.tokenize(text)))
+    lines = [
+        {"segment_id": segment_id, "text": text, "tokens": tokens}
+        for segment_id, text, tokens in segments
+    ]
+    return "".join(json.dumps(line, ensure_ascii=False) + "\n" for line in lines), len(lines)
+
+
+def export_unicode_tables():
+    """Exhaustive per-codepoint lower/casefold/combining/category results."""
+    buffers = {name: bytearray(spec["magic"]) for name, spec in UNICODE_TABLES.items()}
+    max_lower = max_casefold = 0
+    for cp in range(CODEPOINTS):
+        char = chr(cp)
+        low = char.lower()
+        fold = char.casefold()
+        max_lower = max(max_lower, len(low))
+        max_casefold = max(max_casefold, len(fold))
+        if len(low) > 3 or len(fold) > 3:
+            raise SystemExit(f"U+{cp:04X}: mapping wider than the fixed-width layout")
+        for name, value in (("lower", low), ("casefold", fold)):
+            buffer = buffers[name]
+            buffer += struct.pack("<IB", cp, len(value))
+            buffer += b"".join(struct.pack("<I", ord(c)) for c in value.ljust(3, "\0"))
+        buffers["combining"] += struct.pack("<IB", cp, unicodedata.combining(char))
+        mask = 0
+        for bit, pattern in CATEGORY_PATTERNS:
+            if pattern.match(char):
+                mask |= bit
+        buffers["categories"] += struct.pack("<IB", cp, mask)
+    for name, spec in UNICODE_TABLES.items():
+        expected = 8 + CODEPOINTS * spec["record_bytes"]
+        if len(buffers[name]) != expected:
+            raise SystemExit(f"{name} table has {len(buffers[name])} bytes, want {expected}")
+    return {name: _gzip_bytes(bytes(buffer)) for name, buffer in buffers.items()}
+
+
+def export_ascii_runs(sag2):
+    """`ascii_runs.jsonl`: the ASCII alphabet cross product + combining pairs."""
+    runs = []
+    for width in (2, 3):
+        for combination in itertools.product(ASCII_RUN_POOL, repeat=width):
+            runs.append("".join(combination))
+    marks = [cp for cp in range(CODEPOINTS) if unicodedata.combining(chr(cp))]
+    rng = random.Random(ASCII_RUN_SEED)
+    for _ in range(ASCII_RUN_PAIR_COUNT):
+        cp = SCALARS[rng.randrange(len(SCALARS))]
+        runs.append(chr(cp) + chr(marks[rng.randrange(len(marks))]))
+    lines = [{"text": text, "tokens": sag2.tokenize(text)} for text in runs]
+    return "".join(json.dumps(line, ensure_ascii=False) + "\n" for line in lines), len(lines)
+
+
 def reference_provenance(reference_dir):
     """Identify the exact reference source set the goldens came from."""
     provenance = {}
@@ -452,7 +696,16 @@ def reference_provenance(reference_dir):
     return provenance
 
 
-def build_manifest(fixtures, stats, files, reference):
+def build_manifest(
+    fixtures,
+    stats,
+    files,
+    reference,
+    tokenizer,
+    ascii_runs,
+    unicode_tables,
+    sparse_unicode,
+):
     corpus_digest = hashlib.sha256()
     for fixture in fixtures:
         corpus_digest.update(
@@ -465,9 +718,14 @@ def build_manifest(fixtures, stats, files, reference):
         "jieba": stats["jieba"],
         "pyuca": stats["pyuca"],
         "unicode": stats["unicode"],
+        "regex": stats["regex"],
         "corpus_sha256": corpus_digest.hexdigest(),
         "reference": reference,
         "files": files,
+        "tokenizer": tokenizer,
+        "ascii_runs": ascii_runs,
+        "unicode_tables": unicode_tables,
+        "unicode_sparse": sparse_unicode,
         "fixtures": [
             {
                 "fixture": entry["fixture"],
@@ -523,8 +781,10 @@ def main(argv=None):
     work_dir.mkdir(parents=True)
     try:
         retrieve_lines, dump_lines, fixture_stats = [], [], []
+        segments_by_fixture = {}
         for fixture in fixtures:
             db_path, signature, cases, rows = export_fixture(fixture, sag2, work_dir)
+            segments_by_fixture[fixture.name] = fixture_segments(fixture, rows)
             fixture_stats.append(
                 {
                     "fixture": fixture.name,
@@ -572,22 +832,75 @@ def main(argv=None):
         dump_text = "".join(
             json.dumps(line, ensure_ascii=False) + "\n" for line in dump_lines
         )
+        tokenizer_text, tokenizer_lines = export_tokenizer(
+            reference, segments_by_fixture, sag2
+        )
+        ascii_text, ascii_lines = export_ascii_runs(sag2)
+        unicode_blobs = export_unicode_tables()
+        sparse_blobs, sparse_metadata = export_sparse_unicode_tables()
+
         files = [
             {"path": "retrieve.jsonl", "sha256": _sha256_bytes(retrieve_text.encode()),
              "lines": len(retrieve_lines)},
             {"path": "index_dump.jsonl", "sha256": _sha256_bytes(dump_text.encode()),
              "lines": len(dump_lines)},
+            {"path": "tokenizer.jsonl", "sha256": _sha256_bytes(tokenizer_text.encode()),
+             "lines": tokenizer_lines},
+            {"path": "ascii_runs.jsonl", "sha256": _sha256_bytes(ascii_text.encode()),
+             "lines": ascii_lines},
         ]
+        for name, spec in UNICODE_TABLES.items():
+            blob = unicode_blobs[name]
+            files.append(
+                {
+                    "path": spec["path"],
+                    "sha256": _sha256_bytes(blob),
+                    "records": CODEPOINTS,
+                    "record_bytes": spec["record_bytes"],
+                    "uncompressed_bytes": 8 + CODEPOINTS * spec["record_bytes"],
+                    "gzip_bytes": len(blob),
+                }
+            )
+        for name, spec in SPARSE_UNICODE_TABLES.items():
+            blob = sparse_blobs[name]
+            files.append(
+                {
+                    "path": spec["path"],
+                    "sha256": _sha256_bytes(blob),
+                    "records": sparse_metadata[name]["records"],
+                    "gzip_bytes": len(blob),
+                }
+            )
         manifest = build_manifest(
             fixtures,
             {
                 "jieba": jieba.__version__,
                 "pyuca": pyuca.Collator.UCA_VERSION,
                 "unicode": unicodedata.unidata_version,
+                "regex": regex.__version__,
                 "fixtures": fixture_stats,
             },
             files,
             provenance,
+            {"segments": tokenizer_lines, "golden": "tokenizer.jsonl"},
+            {
+                "runs": ascii_lines,
+                "golden": "ascii_runs.jsonl",
+                "pair_count": ASCII_RUN_PAIR_COUNT,
+                "pair_seed": ASCII_RUN_SEED,
+                "pool": ASCII_RUN_POOL,
+            },
+            {
+                name: {
+                    "path": spec["path"],
+                    "magic": spec["magic"].decode(),
+                    "record_bytes": spec["record_bytes"],
+                    "fields": spec["fields"],
+                    "codepoints": CODEPOINTS,
+                }
+                for name, spec in UNICODE_TABLES.items()
+            },
+            sparse_metadata,
         )
 
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -597,12 +910,21 @@ def main(argv=None):
             shutil.copyfile(work_dir / entry["index"], index_dir / entry["index"])
         (out_dir / "retrieve.jsonl").write_text(retrieve_text)
         (out_dir / "index_dump.jsonl").write_text(dump_text)
+        (out_dir / "tokenizer.jsonl").write_text(tokenizer_text)
+        (out_dir / "ascii_runs.jsonl").write_text(ascii_text)
+        for name, spec in UNICODE_TABLES.items():
+            (out_dir / spec["path"]).write_bytes(unicode_blobs[name])
+        for name, spec in SPARSE_UNICODE_TABLES.items():
+            (out_dir / spec["path"]).write_bytes(sparse_blobs[name])
         (out_dir / "manifest.json").write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
         )
         print(
-            f"wrote {len(retrieve_lines)} retrieve cases, {len(dump_lines)} index rows "
-            f"and {len(fixture_stats)} indexes to {out_dir}"
+            f"wrote {len(retrieve_lines)} retrieve cases, {len(dump_lines)} index rows, "
+            f"{tokenizer_lines} tokenizer segments, {ascii_lines} ASCII runs, "
+            f"{len(UNICODE_TABLES)} dense + {len(SPARSE_UNICODE_TABLES)} sparse unicode "
+            f"tables and {len(fixture_stats)} indexes "
+            f"to {out_dir}"
         )
     finally:
         shutil.rmtree(staging, ignore_errors=True)
