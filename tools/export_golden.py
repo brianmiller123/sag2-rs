@@ -2,10 +2,12 @@
 """Export the Gate A golden fixtures for the Rust port of SAG2 (design §1.1, §7.2).
 
 The exporter imports the reference implementation **read-only** and records for
-every Gate A case the ordered chunk ids, the ordered document ids and the raw
-``f64`` bit pattern of every score.  Scores are stored as
-``struct.pack('<d', score).hex()`` so the comparison never round-trips through a
-decimal representation (design §1.0: layer S uses ``eq_f64_bits``).
+every Gate A case the ordered chunk ids, the ordered document ids, the raw
+``f64`` bit pattern of every score and the complete ``chunks`` row of every
+returned hit (title/heading/content/spans/characters/source_id, design §1.1).
+Scores are stored as ``struct.pack('<d', score).hex()`` so the comparison never
+round-trips through a decimal representation (design §1.0: layer S uses
+``eq_f64_bits``).
 
 Requires CPython >= 3.12.  Python 3.12 is the first release whose ``sum()``
 uses Neumaier compensated summation; the pruning bound in
@@ -16,14 +18,16 @@ writes nothing.
 Outputs (all under ``--out``, default ``golden/``):
 
 ``retrieve.jsonl``
-    one Gate A case per line
+    one Gate A case per line, with every hit's §1.1 fields in rank order
 ``index_dump.jsonl``
-    the ``chunks`` rows and the ``metadata.signature`` of every fixture index
+    every ``chunks`` row (``SELECT *``) and the ``metadata.signature`` of every
+    fixture index
 ``indexes/<fixture>.sqlite``
     the Python-built index each case runs against (Gate A runs on these)
 ``manifest.json``
-    generator/python/sqlite/jieba/pyuca/unicode versions, corpus digest, file
-    digests and the fixture -> index mapping
+    generator/python/sqlite/jieba/pyuca/unicode versions, the reference source
+    digests and commit, corpus digest, file digests and the fixture -> index
+    mapping
 """
 
 from __future__ import annotations
@@ -46,6 +50,7 @@ import random
 import shutil
 import sqlite3
 import struct
+import subprocess
 import tempfile
 import unicodedata
 from pathlib import Path
@@ -67,8 +72,15 @@ if os.environ.get("PYTHONHASHSEED") != "0":
         {**os.environ, "PYTHONHASHSEED": "0"},
     )
 
-DEFAULT_REFERENCE = Path("/home/pop/AI/code/sag2/SAG-Benchmark/sag2/scripts")
-GENERATOR_VERSION = "0.1.0"
+DEFAULT_REFERENCE = Path("../SAG-Benchmark/sag2/scripts")
+GENERATOR_VERSION = "0.2.0"
+
+# The reference modules whose identity the manifest records (design §7.1).
+REFERENCE_FILES = {
+    "sag2_py_sha256": "sag2.py",
+    "sag2_rank_py_sha256": "sag2_rank.py",
+    "chunking_py_sha256": "chunking.py",
+}
 
 # Placeholder used by the reference tests for synthetic corpora
 # (tests/test_sag2.py:74 ``sag2.CorpusIndex(..., "fixture")``).
@@ -380,33 +392,67 @@ def export_fixture(fixture, sag2, work_dir):
                         "ids": [],
                         "document_ids": [],
                         "scores_bits": [],
+                        "hits": [],
                     }
                 )
                 cases.append(case)
                 continue
+            hits = [
+                {
+                    "id": hit["id"],
+                    "document_id": hit["document_id"],
+                    "title": hit["title"],
+                    "heading": hit["heading"],
+                    "content": hit["content"],
+                    "spans": hit["spans"],
+                    "characters": hit["characters"],
+                    "source_id": hit["source_id"],
+                    "score_bits": _hex_bits(hit["score"]),
+                }
+                for hit in hits
+            ]
             case.update(
                 {
                     "error": None,
                     "ids": [hit["id"] for hit in hits],
                     "document_ids": [hit["document_id"] for hit in hits],
-                    "scores_bits": [_hex_bits(hit["score"]) for hit in hits],
+                    "scores_bits": [hit["score_bits"] for hit in hits],
+                    "hits": hits,
                 }
             )
             cases.append(case)
         signature = index.db.execute("SELECT signature FROM metadata").fetchone()[0]
         rows = [
-            dict(row)
-            for row in index.db.execute(
-                "SELECT id, document_id, heading, spans, characters, source_id "
-                "FROM chunks ORDER BY id"
-            )
+            dict(row) for row in index.db.execute("SELECT * FROM chunks ORDER BY id")
         ]
         return db_path, signature, cases, rows
     finally:
         index.close()
 
 
-def build_manifest(fixtures, stats, files):
+def reference_provenance(reference_dir):
+    """Identify the exact reference source set the goldens came from."""
+    provenance = {}
+    for key, name in REFERENCE_FILES.items():
+        path = reference_dir / name
+        if not path.is_file():
+            raise SystemExit(f"reference {path} is missing; cannot record golden provenance")
+        provenance[key] = _sha256_bytes(path.read_bytes())
+    result = subprocess.run(
+        ["git", "-C", str(reference_dir), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        raise SystemExit(
+            f"cannot determine the reference commit under {reference_dir}: "
+            f"{result.stderr.strip()}"
+        )
+    provenance["commit"] = result.stdout.strip()
+    return provenance
+
+
+def build_manifest(fixtures, stats, files, reference):
     corpus_digest = hashlib.sha256()
     for fixture in fixtures:
         corpus_digest.update(
@@ -420,6 +466,7 @@ def build_manifest(fixtures, stats, files):
         "pyuca": stats["pyuca"],
         "unicode": stats["unicode"],
         "corpus_sha256": corpus_digest.hexdigest(),
+        "reference": reference,
         "files": files,
         "fixtures": [
             {
@@ -459,6 +506,7 @@ def main(argv=None):
     import sag2  # noqa: E402
 
     reference = json.loads((reference_dir.parent / "tests" / "sag2_reference.json").read_text())
+    provenance = reference_provenance(reference_dir)
 
     fixtures = [
         fixture_c0(reference, sag2),
@@ -500,6 +548,7 @@ def main(argv=None):
                     "ids": case["ids"],
                     "document_ids": case["document_ids"],
                     "scores_bits": case["scores_bits"],
+                    "hits": case["hits"],
                 }
                 if case["error"] is not None:
                     line["error"] = case["error"]
@@ -538,6 +587,7 @@ def main(argv=None):
                 "fixtures": fixture_stats,
             },
             files,
+            provenance,
         )
 
         out_dir.mkdir(parents=True, exist_ok=True)

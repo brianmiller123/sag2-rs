@@ -29,30 +29,71 @@ pub const DEFAULT_CHUNK_CHARS: usize = 2200;
 /// `rust_index_metadata.format_version` this build reads and writes.
 pub const FORMAT_VERSION: i64 = 1;
 
+/// How this build certifies one `rust_index_metadata` value (design §3.3).
+///
+/// A field is either certified or explicitly owned by a later plan.  The
+/// `PendingBuild` variant is visible in the type on purpose: forgetting to
+/// certify a field is a compile-time edit, and an index that carries the key
+/// is rejected rather than silently accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VersionCheck {
+    /// This build certifies the exact value an index must carry.
+    Certified(&'static str),
+    /// The value belongs to a component a later plan writes; until then any
+    /// index that carries the key is rejected.
+    PendingBuild,
+}
+
+impl VersionCheck {
+    /// The certified value, if this build has one.
+    pub fn certified(self) -> Option<&'static str> {
+        match self {
+            VersionCheck::Certified(value) => Some(value),
+            VersionCheck::PendingBuild => None,
+        }
+    }
+}
+
 /// The `rust_index_metadata` keys whose values must match the running build.
 #[derive(Debug, Clone, Copy)]
 pub struct RuntimeVersions {
-    /// Tokenizer identity; `None` until `sag2-core` owns the tokenizer (P1).
-    pub tokenizer_version: Option<&'static str>,
-    /// Embedded jieba dictionary digest; `None` until P1.
-    pub jieba_dict_sha256: Option<&'static str>,
+    /// Tokenizer identity; P1 owns the tokenizer.
+    pub tokenizer_version: VersionCheck,
+    /// Embedded jieba dictionary digest; P1 owns the tokenizer.
+    pub jieba_dict_sha256: VersionCheck,
     /// `unicodedata.unidata_version` of the reference interpreter.
-    pub unicode_version: &'static str,
+    pub unicode_version: VersionCheck,
     /// `pyuca` UCA version.
-    pub uca_version: &'static str,
+    pub uca_version: VersionCheck,
+    /// Digest of the UCA key tables; P2 owns the collation.
+    pub uca_keys_sha256: VersionCheck,
+    /// SQLite version this build links (the vendored amalgamation).
+    pub sqlite_version: VersionCheck,
+    /// Digest of the vendored `sag_rank.c`; P1 publishes the build digest.
+    pub sag_rank_sha256: VersionCheck,
+    /// `sag2-index`'s own version, the troubleshooting anchor.
+    pub sag2_rs_version: VersionCheck,
     /// `CHUNK_POLICY`.
-    pub chunk_policy_version: &'static str,
+    pub chunk_policy_version: VersionCheck,
 }
+
+/// Message recorded when an index carries a key this build cannot certify yet.
+pub const PENDING_BUILD_RUNTIME: &str = "<pending P1 build>";
 
 /// The contract this build certifies (design §3.3).
 pub const RUNTIME_VERSIONS: RuntimeVersions = RuntimeVersions {
-    // P1 owns the tokenizer and its dictionary, so this build cannot certify
-    // either value yet; the two checks activate when those constants exist.
-    tokenizer_version: None,
-    jieba_dict_sha256: None,
-    unicode_version: "15.0.0",
-    uca_version: "9.0.0",
-    chunk_policy_version: CHUNK_POLICY,
+    // P1 owns the tokenizer, its dictionary, the build digest and the UCA
+    // tables; the values are declared here so the gap is in the type, not in a
+    // silently skipped check.
+    tokenizer_version: VersionCheck::PendingBuild,
+    jieba_dict_sha256: VersionCheck::PendingBuild,
+    unicode_version: VersionCheck::Certified("15.0.0"),
+    uca_version: VersionCheck::Certified("9.0.0"),
+    uca_keys_sha256: VersionCheck::PendingBuild,
+    sqlite_version: VersionCheck::Certified("3.50.2"),
+    sag_rank_sha256: VersionCheck::PendingBuild,
+    sag2_rs_version: VersionCheck::Certified(env!("CARGO_PKG_VERSION")),
+    chunk_policy_version: VersionCheck::Certified(CHUNK_POLICY),
 };
 
 /// How hard an open may try to make the index match the corpus.
@@ -307,24 +348,35 @@ fn check_versions(
             supported: FORMAT_VERSION,
         });
     }
-    let checks = [
+    // Design §3.3: the v1 key set is fixed.  Design §3.2 rule 4 only makes
+    // *unknown* keys ignorable; a required key that is absent is a rejection.
+    let checks: [(&'static str, VersionCheck); 9] = [
         ("tokenizer_version", runtime.tokenizer_version),
+        ("chunk_policy_version", runtime.chunk_policy_version),
         ("jieba_dict_sha256", runtime.jieba_dict_sha256),
-        ("uca_version", Some(runtime.uca_version)),
-        ("unicode_version", Some(runtime.unicode_version)),
-        ("chunk_policy_version", Some(runtime.chunk_policy_version)),
+        ("unicode_version", runtime.unicode_version),
+        ("uca_version", runtime.uca_version),
+        ("uca_keys_sha256", runtime.uca_keys_sha256),
+        ("sqlite_version", runtime.sqlite_version),
+        ("sag_rank_sha256", runtime.sag_rank_sha256),
+        ("sag2_rs_version", runtime.sag2_rs_version),
     ];
-    for (field, expected) in checks {
-        let Some(expected) = expected else { continue };
-        if let Some(found) = metadata.get(field) {
-            if found != expected {
-                return Err(OpenError::IncompatibleIndex {
-                    field,
-                    index: found.clone(),
-                    runtime: expected.to_owned(),
-                });
-            }
-        }
+    for (field, check) in checks {
+        let stored = metadata
+            .get(field)
+            .ok_or(OpenError::MissingVersionKey(field))?;
+        let runtime_value = match check {
+            VersionCheck::Certified(expected) if stored == expected => continue,
+            VersionCheck::Certified(expected) => expected,
+            // An index that carries a value this build cannot certify is
+            // refused: accepting it would launder an unknown provenance.
+            VersionCheck::PendingBuild => PENDING_BUILD_RUNTIME,
+        };
+        return Err(OpenError::IncompatibleIndex {
+            field,
+            index: stored.clone(),
+            runtime: runtime_value.to_owned(),
+        });
     }
     Ok(())
 }
@@ -340,8 +392,9 @@ pub fn inspect(path: &Path) -> Result<ExistingIndex, OpenError> {
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<Result<_, _>>()?;
 
-    let has_index_tables =
-        ["chunks", "chunk_fts", "source_files"].iter().any(|name| tables.contains(*name));
+    let has_index_tables = ["chunks", "chunk_fts", "source_files"]
+        .iter()
+        .any(|name| tables.contains(*name));
     let has_metadata_row = if tables.contains("metadata") {
         db.query_row("SELECT EXISTS(SELECT 1 FROM metadata)", [], |row| {
             row.get::<_, bool>(0)
@@ -350,8 +403,10 @@ pub fn inspect(path: &Path) -> Result<ExistingIndex, OpenError> {
         false
     };
     let signature: Option<String> = if has_metadata_row {
-        db.query_row("SELECT signature FROM metadata LIMIT 1", [], |row| row.get(0))
-            .optional()?
+        db.query_row("SELECT signature FROM metadata LIMIT 1", [], |row| {
+            row.get(0)
+        })
+        .optional()?
     } else {
         None
     };
@@ -384,7 +439,11 @@ pub fn open(
     options: &IndexOptions,
     fingerprint: &str,
 ) -> Result<(CorpusIndex, OpenOutcome), OpenError> {
-    let expected = signature(fingerprint, options.chunk_chars, options.source_dir.as_deref());
+    let expected = signature(
+        fingerprint,
+        options.chunk_chars,
+        options.source_dir.as_deref(),
+    );
     let existing = inspect(path)?;
     match decide(options.rebuild, &existing, &expected, &RUNTIME_VERSIONS) {
         Decision::Reject(error) => Err(error),
@@ -460,19 +519,37 @@ mod tests {
 
     use super::{
         decide, Decision, ExistingIndex, OpenError, RebuildPolicy, RebuildReason, RuntimeVersions,
-        FORMAT_VERSION,
+        VersionCheck, FORMAT_VERSION, PENDING_BUILD_RUNTIME, RUNTIME_VERSIONS,
     };
 
-    const EXPECTED: &str = "[\"corpus\",2200,5,null,\"desktop-sentences-v1\",\"plain-text-default\"]";
+    const EXPECTED: &str =
+        "[\"corpus\",2200,5,null,\"desktop-sentences-v1\",\"plain-text-default\"]";
     const OTHER: &str = "[\"other\",2200,5,null,\"desktop-sentences-v1\",\"plain-text-default\"]";
 
     const RUNTIME: RuntimeVersions = RuntimeVersions {
-        tokenizer_version: Some("tokera-1"),
-        jieba_dict_sha256: Some("dict-1"),
-        unicode_version: "15.0.0",
-        uca_version: "9.0.0",
-        chunk_policy_version: "desktop-sentences-v1",
+        tokenizer_version: VersionCheck::Certified("tokera-1"),
+        jieba_dict_sha256: VersionCheck::Certified("dict-1"),
+        unicode_version: VersionCheck::Certified("15.0.0"),
+        uca_version: VersionCheck::Certified("9.0.0"),
+        uca_keys_sha256: VersionCheck::Certified("uca-1"),
+        sqlite_version: VersionCheck::Certified("3.50.2"),
+        sag_rank_sha256: VersionCheck::Certified("rank-1"),
+        sag2_rs_version: VersionCheck::Certified("0.1.0"),
+        chunk_policy_version: VersionCheck::Certified("desktop-sentences-v1"),
     };
+
+    /// The §3.3 v1 key set in the order `check_versions` requires it.
+    const V1_KEYS: [&str; 9] = [
+        "tokenizer_version",
+        "chunk_policy_version",
+        "jieba_dict_sha256",
+        "unicode_version",
+        "uca_version",
+        "uca_keys_sha256",
+        "sqlite_version",
+        "sag_rank_sha256",
+        "sag2_rs_version",
+    ];
 
     fn existing(signature: Option<&str>, rust: Option<BTreeMap<String, String>>) -> ExistingIndex {
         ExistingIndex {
@@ -495,10 +572,14 @@ mod tests {
         rust_metadata(&[
             ("format_version", "1"),
             ("tokenizer_version", "tokera-1"),
-            ("jieba_dict_sha256", "dict-1"),
-            ("uca_version", "9.0.0"),
-            ("unicode_version", "15.0.0"),
             ("chunk_policy_version", "desktop-sentences-v1"),
+            ("jieba_dict_sha256", "dict-1"),
+            ("unicode_version", "15.0.0"),
+            ("uca_version", "9.0.0"),
+            ("uca_keys_sha256", "uca-1"),
+            ("sqlite_version", "3.50.2"),
+            ("sag_rank_sha256", "rank-1"),
+            ("sag2_rs_version", "0.1.0"),
         ])
     }
 
@@ -652,22 +733,96 @@ mod tests {
     }
 
     #[test]
-    fn missing_format_version_is_rejected() {
-        let rust = existing(Some(EXPECTED), Some(rust_metadata(&[])));
-        assert!(matches!(
-            rejection(decide(RebuildPolicy::Strict, &rust, EXPECTED, &RUNTIME)),
-            OpenError::MissingVersionKey("format_version")
-        ));
+    fn missing_required_version_keys_are_rejected() {
+        for key in std::iter::once("format_version").chain(V1_KEYS) {
+            let mut metadata = current_metadata();
+            metadata.remove(key);
+            let rust = existing(Some(EXPECTED), Some(metadata));
+            for policy in [
+                RebuildPolicy::Strict,
+                RebuildPolicy::OnCorpusChange,
+                RebuildPolicy::Always,
+            ] {
+                match rejection(decide(policy, &rust, EXPECTED, &RUNTIME)) {
+                    OpenError::MissingVersionKey(field) => assert_eq!(field, key),
+                    other => panic!("{key}: unexpected {other}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pending_build_versions_reject_a_rust_built_index() {
+        let rust = existing(Some(EXPECTED), Some(current_metadata()));
+        for policy in [
+            RebuildPolicy::Strict,
+            RebuildPolicy::OnCorpusChange,
+            RebuildPolicy::Always,
+        ] {
+            match rejection(decide(policy, &rust, EXPECTED, &RUNTIME_VERSIONS)) {
+                OpenError::IncompatibleIndex { field, runtime, .. } => {
+                    assert_eq!(field, "tokenizer_version");
+                    assert_eq!(runtime, PENDING_BUILD_RUNTIME);
+                }
+                other => panic!("unexpected {other}"),
+            }
+        }
+    }
+
+    /// The build must certify everything except the P1/P2-owned values; this
+    /// list has to reach zero before P1's Gate D.
+    #[test]
+    fn pending_build_fields_are_exactly_the_pipeline_owned_ones() {
+        let fields = [
+            ("tokenizer_version", RUNTIME_VERSIONS.tokenizer_version),
+            (
+                "chunk_policy_version",
+                RUNTIME_VERSIONS.chunk_policy_version,
+            ),
+            ("jieba_dict_sha256", RUNTIME_VERSIONS.jieba_dict_sha256),
+            ("unicode_version", RUNTIME_VERSIONS.unicode_version),
+            ("uca_version", RUNTIME_VERSIONS.uca_version),
+            ("uca_keys_sha256", RUNTIME_VERSIONS.uca_keys_sha256),
+            ("sqlite_version", RUNTIME_VERSIONS.sqlite_version),
+            ("sag_rank_sha256", RUNTIME_VERSIONS.sag_rank_sha256),
+            ("sag2_rs_version", RUNTIME_VERSIONS.sag2_rs_version),
+        ];
+        let pending: Vec<&str> = fields
+            .iter()
+            .filter(|(_, check)| check.certified().is_none())
+            .map(|(field, _)| *field)
+            .collect();
+        assert_eq!(
+            pending,
+            [
+                "tokenizer_version",
+                "jieba_dict_sha256",
+                "uca_keys_sha256",
+                "sag_rank_sha256"
+            ]
+        );
+    }
+
+    #[test]
+    fn certified_sqlite_version_matches_the_bundled_amalgamation() {
+        assert_eq!(
+            RUNTIME_VERSIONS.sqlite_version.certified(),
+            Some(crate::sqlite_version())
+        );
     }
 
     #[test]
     fn incompatible_version_is_rejected_by_every_policy() {
         for (key, value) in [
             ("tokenizer_version", "tokera-2"),
-            ("jieba_dict_sha256", "dict-2"),
-            ("uca_version", "10.0.0"),
-            ("unicode_version", "16.0.0"),
             ("chunk_policy_version", "desktop-sentences-v2"),
+            ("jieba_dict_sha256", "dict-2"),
+            ("unicode_version", "16.0.0"),
+            ("uca_version", "10.0.0"),
+            ("uca_keys_sha256", "uca-2"),
+            ("sqlite_version", "3.50.4"),
+            ("sag_rank_sha256", "rank-2"),
+            ("sag2_rs_version", "0.2.0"),
         ] {
             let mut metadata = current_metadata();
             metadata.insert(key.to_owned(), value.to_owned());

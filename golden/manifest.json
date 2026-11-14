@@ -1,20 +1,26 @@
 {
-  "generator_version": "0.1.0",
+  "generator_version": "0.2.0",
   "python": "3.12.11",
   "sqlite": "3.50.4",
   "jieba": "0.42.1",
   "pyuca": "9.0.0",
   "unicode": "15.0.0",
   "corpus_sha256": "8e8d1a5b067532b3b6b89909bf742fcf5052d7ef3d5e8dfb46b3b18733e8f9ea",
+  "reference": {
+    "sag2_py_sha256": "28cbaf87278412ee1bd9baf9613a07de7f1b908b8de9aaad9903c5a96d29877a",
+    "sag2_rank_py_sha256": "b8cd1d497f8be697cf0880348e3f06ae9f93d59b464965f1ecf2e2307d871cbd",
+    "chunking_py_sha256": "92f21e430fbdcf4c590129ad99a77a79060b56a758e057c8ee0a1b12229702cf",
+    "commit": "bb7f82751ba1576219f9d9ebd021128603d130c3"
+  },
   "files": [
     {
       "path": "retrieve.jsonl",
-      "sha256": "bf2b50a5f99b6cebc42247fe63886ca336e9cf257030092f97bf0cdad2a57858",
+      "sha256": "8503b13108195b78bed9f8218646fb9798d36965759eed4334aebff9194ecea8",
       "lines": 221
     },
     {
       "path": "index_dump.jsonl",
-      "sha256": "8d50de73fdf6fbe55a4d3ebb88391a4872c005d329062b6de3470d179d25337c",
+      "sha256": "d0e9279b875db9f46e894864fa27b0dbbd0cb308451a409db45ec8afc7cc53da",
       "lines": 2805
     }
   ],

@@ -1,8 +1,12 @@
 //! `sag2-cli verify --gate A`: replay the golden Gate A cases (design §1.1, §7.3).
 //!
-//! Comparison uses only the §1.0 tolerance functions: `eq_ids` on the ordered id
-//! sequences and `eq_f64_bits` on the scores.  Exit codes follow §1.0:
-//! `0` passed, `2` a comparison failed, `3` the tooling/data cannot be used.
+//! Comparison uses only the §1.0 tolerance functions: the ordered hit rows are
+//! compared field by field (`eq_ids` on `id`/`document_id`, `eq_str` on the
+//! §1.1 materialisation fields, `eq_f64_bits` on the scores).  Exit codes follow
+//! §1.0: `0` passed, `2` a comparison failed, `3` the tooling/data cannot be
+//! used.  A gate run outside the certified toolchain, or against a reference
+//! checkout that is not the one the goldens came from, compares nothing and
+//! exits `3` (design §1.0 rule 2, §7.1).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -14,10 +18,19 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Generator version this verifier understands.
-const GENERATOR_VERSION: &str = "0.1.0";
+const GENERATOR_VERSION: &str = "0.2.0";
 
 /// Minimum interpreter the goldens may come from (design §11 divergence D5).
 const REQUIRED_PYTHON: (u64, u64) = (3, 12);
+
+/// SQLite versions Gate A accepts (design §1.0 layer S: 3.50.2 vs 3.50.4).
+const SQLITE_ALLOWLIST: [&str; 2] = ["3.50.2", "3.50.4"];
+
+/// The reference environment's `jieba`; the goldens must come from it.
+const CERTIFIED_JIEBA: &str = "0.42.1";
+
+/// The design's documented sibling checkout of the reference implementation.
+const DEFAULT_REFERENCE: &str = "../SAG-Benchmark/sag2/scripts";
 
 /// `eq_f64(a, b) := |a-b| <= 1e-12 * max(1.0, |a|, |b|)` (design §1.0).
 const RELATIVE_TOLERANCE: f64 = 1e-12;
@@ -30,8 +43,21 @@ struct Manifest {
     generator_version: String,
     python: String,
     sqlite: String,
+    jieba: String,
+    pyuca: String,
+    unicode: String,
+    reference: ManifestReference,
     files: Vec<ManifestFile>,
     fixtures: Vec<ManifestFixture>,
+}
+
+/// Identity of the reference source set the goldens were exported from (§7.1).
+#[derive(Deserialize)]
+struct ManifestReference {
+    sag2_py_sha256: String,
+    sag2_rank_py_sha256: String,
+    chunking_py_sha256: String,
+    commit: String,
 }
 
 #[derive(Deserialize)]
@@ -61,8 +87,24 @@ struct Case {
     ids: Vec<i64>,
     document_ids: Vec<i64>,
     scores_bits: Vec<String>,
+    /// The §1.1 materialisation fields, in ranked order.
+    hits: Vec<HitGolden>,
     #[serde(default)]
     error: Option<String>,
+}
+
+/// One expected hit: every field design §1.1 compares, in serialised form.
+#[derive(Deserialize)]
+struct HitGolden {
+    id: i64,
+    document_id: i64,
+    title: String,
+    heading: String,
+    content: String,
+    spans: String,
+    characters: i64,
+    source_id: String,
+    score_bits: String,
 }
 
 struct Options {
@@ -71,6 +113,7 @@ struct Options {
     cache: PathBuf,
     report: PathBuf,
     filter: Option<String>,
+    reference: PathBuf,
 }
 
 impl Default for Options {
@@ -81,6 +124,7 @@ impl Default for Options {
             cache: std::env::temp_dir().join("sag2-verify-cache"),
             report: PathBuf::from("report.json"),
             filter: None,
+            reference: PathBuf::from(DEFAULT_REFERENCE),
         }
     }
 }
@@ -101,6 +145,7 @@ impl Options {
                 "--index-cache" => options.cache = PathBuf::from(value),
                 "--report" => options.report = PathBuf::from(value),
                 "--filter" => options.filter = Some(value),
+                "--reference" => options.reference = PathBuf::from(value),
                 other => return Err(format!("unknown argument {other}")),
             }
             index += 2;
@@ -112,7 +157,7 @@ impl Options {
 #[derive(Serialize)]
 struct Failure {
     case_id: String,
-    path: &'static str,
+    path: String,
     expected: String,
     actual: String,
     delta: Option<f64>,
@@ -148,8 +193,55 @@ pub fn verify(args: &[String]) -> ExitCode {
 }
 
 pub fn usage() -> &'static str {
-    "usage: sag2-cli verify --gate A --golden golden/ [--index-cache <dir>] \
-     [--filter <substring>] [--report report.json]"
+    "usage: sag2-cli verify --gate A --golden golden/ [--reference <scripts>] \
+     [--index-cache <dir>] [--filter <substring>] [--report report.json]"
+}
+
+/// The toolchain values this build certifies for the reference environment.
+struct Toolchain {
+    jieba: &'static str,
+    uca: &'static str,
+    unicode: &'static str,
+}
+
+fn certified_toolchain() -> Result<Toolchain, String> {
+    let uca = sag2_index::RUNTIME_VERSIONS
+        .uca_version
+        .certified()
+        .ok_or_else(|| "unsupported: this build does not certify uca_version".to_owned())?;
+    let unicode = sag2_index::RUNTIME_VERSIONS
+        .unicode_version
+        .certified()
+        .ok_or_else(|| "unsupported: this build does not certify unicode_version".to_owned())?;
+    Ok(Toolchain {
+        jieba: CERTIFIED_JIEBA,
+        uca,
+        unicode,
+    })
+}
+
+/// Design §7.1: recompute the reference digests the manifest claims.
+fn verify_reference(reference: &ManifestReference, dir: &Path) -> Result<(), String> {
+    for (name, expected) in [
+        ("sag2.py", &reference.sag2_py_sha256),
+        ("sag2_rank.py", &reference.sag2_rank_py_sha256),
+        ("chunking.py", &reference.chunking_py_sha256),
+    ] {
+        let path = dir.join(name);
+        let bytes = fs::read(&path).map_err(|error| {
+            format!(
+                "unsupported: cannot read reference {name} at {} (pass --reference): {error}",
+                path.display()
+            )
+        })?;
+        if sha256_hex(&bytes) != *expected {
+            return Err(format!(
+                "unsupported: reference {name} at {} does not match the golden manifest",
+                path.display()
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn run(options: &Options) -> Result<ExitCode, String> {
@@ -180,9 +272,43 @@ fn run(options: &Options) -> Result<ExitCode, String> {
         ));
     }
 
+    // Design §1.0 rule 2: outside the certified environment the gate compares
+    // nothing.  The SQLite allowlist is the measured layer-S pair; jieba/UCA/
+    // Unicode must be the reference toolchain the goldens were exported with.
+    let runtime_sqlite = sag2_index::sqlite_version();
+    if !SQLITE_ALLOWLIST.contains(&manifest.sqlite.as_str())
+        || !SQLITE_ALLOWLIST.contains(&runtime_sqlite)
+    {
+        return Err(format!(
+            "unsupported: sqlite {} (golden) / {runtime_sqlite} (runtime) is outside the \
+             allowlist {SQLITE_ALLOWLIST:?}",
+            manifest.sqlite
+        ));
+    }
+    let toolchain = certified_toolchain()?;
+    if manifest.jieba != toolchain.jieba
+        || manifest.pyuca != toolchain.uca
+        || manifest.unicode != toolchain.unicode
+    {
+        return Err(format!(
+            "unsupported: golden toolchain jieba {} / pyuca {} / unicode {} differs from the \
+             certified {}/{}/{}",
+            manifest.jieba,
+            manifest.pyuca,
+            manifest.unicode,
+            toolchain.jieba,
+            toolchain.uca,
+            toolchain.unicode
+        ));
+    }
+
+    // Design §7.1: the golden must name the exact reference source set.
+    verify_reference(&manifest.reference, &options.reference)?;
+
     for file in &manifest.files {
         let path = options.golden.join(&file.path);
-        let bytes = fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        let bytes =
+            fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
         if sha256_hex(&bytes) != file.sha256 {
             return Err(format!("{} does not match the manifest sha256", file.path));
         }
@@ -225,10 +351,13 @@ fn run(options: &Options) -> Result<ExitCode, String> {
             continue;
         }
         let source = options.golden.join("indexes").join(&fixture.index);
-        let bytes =
-            fs::read(&source).map_err(|error| format!("cannot read {}: {error}", source.display()))?;
+        let bytes = fs::read(&source)
+            .map_err(|error| format!("cannot read {}: {error}", source.display()))?;
         if sha256_hex(&bytes) != fixture.index_sha256 {
-            return Err(format!("{} does not match the manifest sha256", fixture.index));
+            return Err(format!(
+                "{} does not match the manifest sha256",
+                fixture.index
+            ));
         }
         fs::create_dir_all(&options.cache)
             .map_err(|error| format!("cannot create {}: {error}", options.cache.display()))?;
@@ -257,7 +386,12 @@ fn run(options: &Options) -> Result<ExitCode, String> {
             .get(&case.fixture)
             .ok_or_else(|| format!("fixture {} was not opened", case.fixture))?;
         let excluded: BTreeSet<i64> = case.excluded.iter().copied().collect();
-        let hits = index.retrieve(&case.expression, &excluded, case.limit, case.term.as_deref());
+        let hits = index.retrieve(
+            &case.expression,
+            &excluded,
+            case.limit,
+            case.term.as_deref(),
+        );
         let before = failures.len();
         check(case, hits, &mut failures, &mut ulp_flips);
         let entry = per_fixture.entry(case.fixture.clone()).or_insert((0, 0));
@@ -267,7 +401,10 @@ fn run(options: &Options) -> Result<ExitCode, String> {
         }
     }
 
-    println!("{:<12} {:>7} {:>7} {:>7}", "fixture", "cases", "passed", "failed");
+    println!(
+        "{:<12} {:>7} {:>7} {:>7}",
+        "fixture", "cases", "passed", "failed"
+    );
     for (fixture, (total, passed)) in &per_fixture {
         println!(
             "{:<12} {:>7} {:>7} {:>7}",
@@ -277,7 +414,10 @@ fn run(options: &Options) -> Result<ExitCode, String> {
             total - passed
         );
     }
-    let passed = per_fixture.values().map(|(_, passed)| passed).sum::<usize>();
+    let passed = per_fixture
+        .values()
+        .map(|(_, passed)| passed)
+        .sum::<usize>();
     println!(
         "gate A: {} cases, {} passed, {} failed, {} ulp_flips",
         cases.len(),
@@ -301,23 +441,23 @@ fn run(options: &Options) -> Result<ExitCode, String> {
         }
     }
 
-    let sqlite_note = if manifest.sqlite != sag2_index::sqlite_version() {
-        format!(
-            "golden sqlite {} vs runtime {}: scores still compared bit-exactly \
-             (measured identical); ulp_flips guard is active",
-            manifest.sqlite,
-            sag2_index::sqlite_version()
-        )
-    } else {
-        String::new()
-    };
     let report = serde_json::json!({
         "golden": {
             "dir": options.golden.display().to_string(),
             "generated_by": format!("export_golden.py@{}", manifest.generator_version),
             "python": manifest.python,
             "sqlite": manifest.sqlite,
-            "runtime_sqlite": sag2_index::sqlite_version(),
+            "runtime_sqlite": runtime_sqlite,
+            "reference": {
+                "dir": options.reference.display().to_string(),
+                "commit": manifest.reference.commit,
+            },
+        },
+        "toolchain": {
+            "sqlite_allowlist": SQLITE_ALLOWLIST,
+            "jieba": manifest.jieba,
+            "pyuca": manifest.pyuca,
+            "unicode": manifest.unicode,
         },
         "tolerances": {"level": "S", "f64": "bits", "ids": "exact"},
         "gates": {"A": {
@@ -329,7 +469,6 @@ fn run(options: &Options) -> Result<ExitCode, String> {
                 serde_json::json!({"fixture": fixture, "cases": total, "passed": passed})
             }).collect::<Vec<_>>(),
         }},
-        "notes": if sqlite_note.is_empty() { vec![] } else { vec![sqlite_note] },
         "excluded_fields": [],
         "excluded_checks": ["db_physical_bytes"],
         "failures": failures,
@@ -360,7 +499,14 @@ fn check(
     let hits = match (hits, &case.error) {
         (Err(_), Some(_)) => return,
         (Err(error), None) => {
-            push_failure(failures, case, "retrieve", "results".into(), format!("error: {error}"), None);
+            push_failure(
+                failures,
+                case,
+                "retrieve",
+                "results".into(),
+                format!("error: {error}"),
+                None,
+            );
             return;
         }
         (Ok(hits), Some(_)) => {
@@ -377,75 +523,182 @@ fn check(
         (Ok(hits), None) => hits,
     };
 
-    let ids: Vec<i64> = hits.iter().map(|hit| hit.id).collect();
-    if ids != case.ids {
-        push_failure(failures, case, "ids", format!("{:?}", case.ids), format!("{ids:?}"), None);
-    }
-    let document_ids: Vec<i64> = hits.iter().map(|hit| hit.document_id).collect();
-    if document_ids != case.document_ids {
-        push_failure(
-            failures,
-            case,
-            "document_ids",
-            format!("{:?}", case.document_ids),
-            format!("{document_ids:?}"),
-            None,
-        );
-    }
-    if hits.len() != case.scores_bits.len() {
+    if hits.len() != case.hits.len() {
         push_failure(
             failures,
             case,
             "length",
-            format!("{} scores", case.scores_bits.len()),
+            format!("{} hits", case.hits.len()),
             format!("{} hits", hits.len()),
             None,
         );
     }
-    for (index, expected_hex) in case.scores_bits.iter().enumerate() {
-        if index >= hits.len() {
+    for (position, expected) in case.hits.iter().enumerate() {
+        let Some(actual) = hits.get(position) else {
             break;
-        }
-        let Some(expected) = bits_to_f64(expected_hex) else {
+        };
+        let field = |name: &str| format!("hits[{position}].{name}");
+        if actual.id != expected.id {
             push_failure(
                 failures,
                 case,
-                "scores_bits",
-                expected_hex.clone(),
+                field("id"),
+                expected.id.to_string(),
+                actual.id.to_string(),
+                None,
+            );
+        }
+        if actual.document_id != expected.document_id {
+            push_failure(
+                failures,
+                case,
+                field("document_id"),
+                expected.document_id.to_string(),
+                actual.document_id.to_string(),
+                None,
+            );
+        }
+        compare_text(
+            failures,
+            case,
+            &field("title"),
+            &expected.title,
+            &actual.title,
+        );
+        compare_text(
+            failures,
+            case,
+            &field("heading"),
+            &expected.heading,
+            &actual.heading,
+        );
+        compare_text(
+            failures,
+            case,
+            &field("content"),
+            &expected.content,
+            &actual.content,
+        );
+        compare_text(
+            failures,
+            case,
+            &field("spans"),
+            &expected.spans,
+            &serialise_spans(&actual.spans),
+        );
+        if i64::from(actual.characters) != expected.characters {
+            push_failure(
+                failures,
+                case,
+                field("characters"),
+                expected.characters.to_string(),
+                actual.characters.to_string(),
+                None,
+            );
+        }
+        compare_text(
+            failures,
+            case,
+            &field("source_id"),
+            &expected.source_id,
+            &actual.source_id,
+        );
+
+        let Some(score) = bits_to_f64(&expected.score_bits) else {
+            push_failure(
+                failures,
+                case,
+                field("score_bits"),
+                expected.score_bits.clone(),
                 "unparseable golden bits".into(),
                 None,
             );
             continue;
         };
-        let actual = hits[index].score;
-        if actual.to_bits() == expected.to_bits() {
+        if actual.score.to_bits() == score.to_bits() {
             continue;
         }
-        let delta = actual - expected;
+        let delta = actual.score - score;
         push_failure(
             failures,
             case,
-            "scores",
-            format!("{expected_hex} ({expected:e})"),
-            format!("{:016x} ({actual:e})", actual.to_bits()),
+            field("score"),
+            format!("{} ({score:e})", expected.score_bits),
+            format!("{:016x} ({:e})", actual.score.to_bits(), actual.score),
             Some(delta),
         );
-        if within_tolerance(expected, actual) {
+        if within_tolerance(score, actual.score) {
             ulp_flips.push(serde_json::json!({
                 "case_id": case.case_id,
-                "position": index,
-                "expected": expected_hex,
-                "actual": format!("{:016x}", actual.to_bits()),
+                "position": position,
+                "expected": expected.score_bits,
+                "actual": format!("{:016x}", actual.score.to_bits()),
                 "delta": delta,
             }));
         }
     }
 }
 
+/// `eq_str` (design §1.0): the serialised form must match byte for byte.
+fn compare_text(
+    failures: &mut Vec<Failure>,
+    case: &Case,
+    path: &str,
+    expected: &str,
+    actual: &str,
+) {
+    if expected == actual {
+        return;
+    }
+    push_failure(
+        failures,
+        case,
+        path,
+        display_text(expected),
+        display_text(actual),
+        None,
+    );
+}
+
+/// Keep a report readable: full strings can be a whole chunk.
+fn display_text(text: &str) -> String {
+    const LIMIT: usize = 60;
+    let mut chars = text.chars();
+    let shortened: String = chars.by_ref().take(LIMIT).collect();
+    if chars.next().is_none() {
+        format!("{shortened:?}")
+    } else {
+        format!(
+            "{shortened:?}… ({} bytes, sha256 {})",
+            text.len(),
+            &sha256_hex(text.as_bytes())[..12]
+        )
+    }
+}
+
+/// The compact JSON the reference stores in `chunks.spans`
+/// (`sag2.py:302` `compact_json(spans)`).
+fn serialise_spans(spans: &[(u64, u64)]) -> String {
+    let mut text = String::with_capacity(spans.len() * 12 + 2);
+    text.push('[');
+    for (position, (start, end)) in spans.iter().enumerate() {
+        if position > 0 {
+            text.push(',');
+        }
+        text.push('[');
+        text.push_str(&start.to_string());
+        text.push(',');
+        text.push_str(&end.to_string());
+        text.push(']');
+    }
+    text.push(']');
+    text
+}
+
 fn push_failure(
     failures: &mut Vec<Failure>,
     case: &Case,
-    path: &'static str,
+    path: impl Into<String>,
     expected: String,
     actual: String,
     delta: Option<f64>,
@@ -453,7 +706,7 @@ fn push_failure(
     if failures.len() < MAX_FAILURES {
         failures.push(Failure {
             case_id: case.case_id.clone(),
-            path,
+            path: path.into(),
             expected,
             actual,
             delta,
@@ -480,7 +733,8 @@ fn bits_to_f64(hex: &str) -> Option<f64> {
 
 fn dump_signatures(options: &Options) -> Result<BTreeMap<String, String>, String> {
     let path = options.golden.join("index_dump.jsonl");
-    let text = fs::read_to_string(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let text = fs::read_to_string(&path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     let mut signatures = BTreeMap::new();
     for line in text.lines() {
         let value: serde_json::Value =
@@ -500,24 +754,44 @@ fn dump_signatures(options: &Options) -> Result<BTreeMap<String, String>, String
 
 fn read_cases(options: &Options) -> Result<Vec<Case>, String> {
     let path = options.golden.join("retrieve.jsonl");
-    let text = fs::read_to_string(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let text = fs::read_to_string(&path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     let mut cases = Vec::new();
     for line in text.lines() {
         let case: Case =
             serde_json::from_str(line).map_err(|error| format!("{}: {error}", path.display()))?;
-        if case.error.is_none()
-            && (case.ids.len() != case.document_ids.len()
-                || case.ids.len() != case.scores_bits.len())
-        {
-            return Err(format!(
-                "{}: case {} has inconsistent golden arrays",
-                path.display(),
-                case.case_id
-            ));
-        }
+        validate_case(&path, &case)?;
         cases.push(case);
     }
     Ok(cases)
+}
+
+/// The golden carries both ordered projections and the per-hit fields; they
+/// must agree, or the golden itself is broken (exit 3, not a gate failure).
+fn validate_case(path: &Path, case: &Case) -> Result<(), String> {
+    let broken = |detail: String| format!("{}: case {} {detail}", path.display(), case.case_id);
+    if case.ids.len() != case.hits.len()
+        || case.document_ids.len() != case.hits.len()
+        || case.scores_bits.len() != case.hits.len()
+    {
+        return Err(broken("has inconsistent golden arrays".to_owned()));
+    }
+    for (position, hit) in case.hits.iter().enumerate() {
+        if hit.id != case.ids[position] {
+            return Err(broken(format!("hit {position} id disagrees with ids")));
+        }
+        if hit.document_id != case.document_ids[position] {
+            return Err(broken(format!(
+                "hit {position} document_id disagrees with document_ids"
+            )));
+        }
+        if hit.score_bits != case.scores_bits[position] {
+            return Err(broken(format!(
+                "hit {position} score_bits disagrees with scores_bits"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn parse_version(text: &str) -> Option<(u64, u64)> {
@@ -547,5 +821,138 @@ fn write_report(path: &Path, report: &serde_json::Value) {
     };
     if let Err(error) = fs::write(path, rendered + "\n") {
         eprintln!("verify: cannot write {}: {error}", path.display());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{check, display_text, serialise_spans, Case, Failure, HitGolden};
+    use sag2_index::Hit;
+
+    fn bits(value: f64) -> String {
+        value
+            .to_le_bytes()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+
+    fn golden_hit() -> HitGolden {
+        HitGolden {
+            id: 1,
+            document_id: 1,
+            title: "Anchor".to_owned(),
+            heading: "".to_owned(),
+            content: "body".to_owned(),
+            spans: "[[0,4]]".to_owned(),
+            characters: 4,
+            source_id: "0".to_owned(),
+            score_bits: bits(-1.5),
+        }
+    }
+
+    fn hit() -> Hit {
+        Hit {
+            id: 1,
+            document_id: 1,
+            title: "Anchor".to_owned(),
+            heading: "".to_owned(),
+            content: "body".to_owned(),
+            full_doc: Some("body".to_owned()),
+            spans: vec![(0, 4)],
+            characters: 4,
+            source_id: "0".to_owned(),
+            score: -1.5,
+        }
+    }
+
+    fn case(hits: Vec<HitGolden>) -> Case {
+        Case {
+            case_id: "C0/test".to_owned(),
+            fixture: "C0".to_owned(),
+            expression: "\"anchor\"".to_owned(),
+            excluded: Vec::new(),
+            limit: 7,
+            term: None,
+            ids: hits.iter().map(|hit| hit.id).collect(),
+            document_ids: hits.iter().map(|hit| hit.document_id).collect(),
+            scores_bits: hits.iter().map(|hit| hit.score_bits.clone()).collect(),
+            hits,
+            error: None,
+        }
+    }
+
+    fn failures_for(expected: Case, actual: Vec<Hit>) -> Vec<Failure> {
+        let mut failures = Vec::new();
+        let mut ulp_flips = Vec::new();
+        check(&expected, Ok(actual), &mut failures, &mut ulp_flips);
+        assert!(ulp_flips.is_empty());
+        failures
+    }
+
+    #[test]
+    fn matching_materialised_fields_pass() {
+        assert!(failures_for(case(vec![golden_hit()]), vec![hit()]).is_empty());
+    }
+
+    #[test]
+    fn content_difference_fails_on_the_content_field() {
+        let mut expected = golden_hit();
+        expected.content = "other body".to_owned();
+        let failures = failures_for(case(vec![expected]), vec![hit()]);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].path, "hits[0].content");
+    }
+
+    #[test]
+    fn title_difference_fails_on_the_title_field() {
+        let mut expected = golden_hit();
+        expected.title = "Elsewhere".to_owned();
+        let failures = failures_for(case(vec![expected]), vec![hit()]);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].path, "hits[0].title");
+    }
+
+    #[test]
+    fn spans_difference_fails_on_the_spans_field() {
+        let mut expected = golden_hit();
+        expected.spans = "[[0,5]]".to_owned();
+        let failures = failures_for(case(vec![expected]), vec![hit()]);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].path, "hits[0].spans");
+    }
+
+    #[test]
+    fn characters_difference_fails_on_the_characters_field() {
+        let mut expected = golden_hit();
+        expected.characters = 5;
+        let failures = failures_for(case(vec![expected]), vec![hit()]);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].path, "hits[0].characters");
+    }
+
+    #[test]
+    fn score_bit_difference_fails_on_the_score_field() {
+        let mut expected = golden_hit();
+        expected.score_bits = bits(-1.25);
+        let failures = failures_for(case(vec![expected]), vec![hit()]);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].path, "hits[0].score");
+        assert!(failures[0].delta.is_some());
+    }
+
+    #[test]
+    fn spans_serialise_like_the_reference_compact_json() {
+        assert_eq!(serialise_spans(&[(0, 4)]), "[[0,4]]");
+        assert_eq!(serialise_spans(&[(0, 4), (6, 9)]), "[[0,4],[6,9]]");
+        assert_eq!(serialise_spans(&[]), "[]");
+    }
+
+    #[test]
+    fn long_content_is_shortened_in_the_report_only() {
+        let text = "x".repeat(500);
+        let rendered = display_text(&text);
+        assert!(rendered.contains("500 bytes"));
+        assert!(rendered.len() < text.len());
     }
 }

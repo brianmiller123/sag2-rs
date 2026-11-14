@@ -23,8 +23,8 @@ use sag2_json::{compact_json, Value};
 
 pub use open::{
     decide, inspect, open, open_readonly, Decision, ExistingIndex, IndexOptions, OpenAction,
-    OpenError, OpenOutcome, RebuildPolicy, RebuildReason, RuntimeVersions, DEFAULT_CHUNK_CHARS,
-    FORMAT_VERSION, RUNTIME_VERSIONS,
+    OpenError, OpenOutcome, RebuildPolicy, RebuildReason, RuntimeVersions, VersionCheck,
+    DEFAULT_CHUNK_CHARS, FORMAT_VERSION, PENDING_BUILD_RUNTIME, RUNTIME_VERSIONS,
 };
 pub use pool::{QueryOptions, QUERY_CACHE_ENTRIES, QUERY_WORKERS};
 pub use retrieve::{Hit, QueryError};
