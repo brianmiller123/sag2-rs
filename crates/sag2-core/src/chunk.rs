@@ -12,12 +12,15 @@
 /// `chunking.py:6` `DEFAULT_CHUNK_CHARS`.
 pub const DEFAULT_CHUNK_CHARS: usize = 2200;
 
-/// `chunking.py:8-13` `CODE_SUFFIXES`.
-const CODE_SUFFIXES: [&str; 40] = [
+/// `chunking.py:8-13` `CODE_SUFFIXES`, all 45 entries in reference order.
+///
+/// `tools/export_golden.py` re-parses this literal and refuses to export when
+/// it drifts from `chunking.CODE_SUFFIXES`.
+const CODE_SUFFIXES: [&str; 45] = [
     ".rs", ".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".go", ".java", ".c", ".h", ".cpp",
     ".hpp", ".cc", ".cs", ".rb", ".php", ".swift", ".kt", ".kts", ".scala", ".sh", ".bash", ".zsh",
     ".ps1", ".sql", ".html", ".htm", ".css", ".scss", ".vue", ".svelte", ".r", ".lua", ".dart",
-    ".json", ".jsonc", ".yaml", ".yml",
+    ".json", ".jsonc", ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf", ".xml",
 ];
 
 /// `chunking.py:14` `CLOSERS` (the characters that may follow a period).
@@ -339,7 +342,7 @@ fn sentence_ranges(
         let boundary = if code {
             character == '\n'
         } else {
-            matches!(character, '。' | '！' | '？' | '!')
+            matches!(character, '。' | '！' | '？' | '!' | '?')
                 || (character == '.'
                     && (position + 1 == end
                         || is_space(characters[position + 1])
@@ -352,7 +355,7 @@ fn sentence_ranges(
         if !code {
             while position < end
                 && (is_space(characters[position])
-                    || matches!(characters[position], '。' | '！' | '？' | '!')
+                    || matches!(characters[position], '。' | '！' | '？' | '!' | '?')
                     || CLOSERS.contains(&characters[position]))
             {
                 position += 1;

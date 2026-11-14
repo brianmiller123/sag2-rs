@@ -28,9 +28,12 @@ Outputs (all under ``--out``, default ``golden/``):
     every fixture document, the desktop reference cases and the
     ``tests/test_chunking.py`` scenarios with heading, spans and content
 ``index_expected.jsonl``
-    per fixture: ``metadata.signature``, every ``chunks`` row, the
-    ``chunk_fts`` vocabulary per column, ``index_statistics`` and the
+    per fixture: the ``sqlite_master`` schema, ``metadata.signature``, every
+    ``chunks`` row, every ``chunk_fts`` row, the 24 ``(rowid, bm25)`` probes,
+    the ``chunk_fts`` vocabulary per column, ``index_statistics`` and the
     ``rust_index_metadata`` key set (Gate D's Rust-vs-Python baseline)
+``sources/<fixture>/``
+    the source tree of a ``source_dir`` fixture (``content=''``)
 ``manifest.json``
     generator/python/sqlite/jieba/pyuca/unicode versions, the reference source
     digests and commit, corpus digest, file digests and the fixture -> index
@@ -57,6 +60,7 @@ import itertools
 import json
 import os
 import random
+import re
 import shutil
 import sqlite3
 import struct
@@ -85,7 +89,7 @@ if os.environ.get("PYTHONHASHSEED") != "0":
     )
 
 DEFAULT_REFERENCE = Path("../SAG-Benchmark/sag2/scripts")
-GENERATOR_VERSION = "0.4.0"
+GENERATOR_VERSION = "0.5.0"
 
 # Design §3.3: the v1 `rust_index_metadata` key set.  A Rust-built index must
 # carry exactly these keys; the values are compared against the runtime.
@@ -149,12 +153,27 @@ def _grid(case_prefix, expression, limits=(1, 7, 100), terms=(None,), excluded=(
 class Fixture:
     """One corpus + the Gate A cases that run against its index."""
 
-    def __init__(self, name, fingerprint, corpus, chunk_chars, case_builder):
+    def __init__(
+        self,
+        name,
+        fingerprint,
+        corpus,
+        chunk_chars,
+        case_builder,
+        probes=(),
+        source_relative=None,
+    ):
         self.name = name
         self.fingerprint = fingerprint
         self.corpus = corpus
         self.chunk_chars = chunk_chars
         self.case_builder = case_builder
+        # `(expression, term)` pairs replayed by Gate D4 (design §1.4).
+        self.probes = list(probes)
+        # Relative path of the checked-in source tree; non-`None` builds in
+        # `source_dir` mode (`content=''`, `start_char`/`end_char`).
+        self.source_relative = source_relative
+        self.source_dir = None
 
     def spec_digest_input(self):
         return {
@@ -162,6 +181,7 @@ class Fixture:
             "fingerprint": self.fingerprint,
             "chunk_chars": self.chunk_chars,
             "corpus": self.corpus,
+            "source_dir": self.source_relative,
         }
 
 
@@ -172,16 +192,16 @@ class Fixture:
 
 def fixture_c0(reference, sag2):
     corpus = reference["corpus"]
+    exprs = [
+        (f"query/{index}", sag2.match_query(case["query"]))
+        for index, case in enumerate(reference["cases"])
+    ]
+    exprs += [
+        ("literal/pair", '"alice paul" OR "bob smith"'),
+        ("column/title", 'title : "anchor"'),
+    ]
 
     def cases(_db):
-        exprs = [
-            (f"query/{index}", sag2.match_query(case["query"]))
-            for index, case in enumerate(reference["cases"])
-        ]
-        exprs += [
-            ("literal/pair", '"alice paul" OR "bob smith"'),
-            ("column/title", 'title : "anchor"'),
-        ]
         out = []
         for label, expression in exprs:
             out += _grid(f"C0/{label}", expression, terms=(None, "bridge"))
@@ -212,7 +232,13 @@ def fixture_c0(reference, sag2):
         )
         return out
 
-    return Fixture("C0", C0_FINGERPRINT, corpus, 2200, cases)
+    # Gate D4 (design §1.4): 12 probes, every C0 expression in its plain and
+    # its `term`-qualified form.  "alice" is a corpus term, so the qualified
+    # probes bind non-empty row sets (an empty probe asserts almost nothing).
+    probes = [
+        (expression, term) for _, expression in exprs for term in (None, "alice")
+    ]
+    return Fixture("C0", C0_FINGERPRINT, corpus, 2200, cases, probes=probes)
 
 
 # --------------------------------------------------------------------------
@@ -382,7 +408,10 @@ def fixture_c5(sag2):
             )
         return out
 
-    return Fixture("C5", "unicode", corpus, 10000, cases)
+    # Gate D4: 12 of the 16 C5 query expressions (design §1.4 counts C0 12 +
+    # C5 12 = 24 probes).
+    probes = [(sag2.match_query(query), None) for query in C5_QUERIES[:12]]
+    return Fixture("C5", "unicode", corpus, 10000, cases, probes=probes)
 
 
 def _matching_ids(db, expression):
@@ -397,10 +426,14 @@ def _matching_ids(db, expression):
 
 
 def export_fixture(fixture, sag2, work_dir):
-    """Build the fixture index, run every case, return (db_path, cases, rows)."""
+    """Build the fixture index, run every case, return its Gate A/D payload."""
     db_path = work_dir / f"{fixture.name}.sqlite"
     index = sag2.CorpusIndex(
-        db_path, fixture.corpus, fixture.fingerprint, chunk_chars=fixture.chunk_chars
+        db_path,
+        fixture.corpus,
+        fixture.fingerprint,
+        chunk_chars=fixture.chunk_chars,
+        source_dir=fixture.source_dir,
     )
     try:
         specs = fixture.case_builder(index.db)
@@ -448,14 +481,77 @@ def export_fixture(fixture, sag2, work_dir):
                 }
             )
             cases.append(case)
-        signature = index.db.execute("SELECT signature FROM metadata").fetchone()[0]
+        expectation = index_expectation(fixture, index, sag2)
         rows = [
             dict(row) for row in index.db.execute("SELECT * FROM chunks ORDER BY id")
         ]
-        expectation = index_expectation(fixture, index)
-        return db_path, signature, cases, rows, expectation
+        return db_path, cases, rows, expectation
     finally:
         index.close()
+
+
+# --------------------------------------------------------------------------
+# C6 - `source_dir` mode (design §1.4 sample corpora): contentless FTS5
+#      (`content=''`), `start_char`/`end_char` instead of `content`/`full_doc`,
+#      the `source_files` provenance table and a statistics corpus read back
+#      from it.  The source tree is exported to `golden/sources/C6-source`
+#      because `sag2.py:203` reads the text from the tree, not from the corpus
+#      row (F-005).
+# --------------------------------------------------------------------------
+
+C6_CHUNK_CHARS = 512
+C6_SOURCE_RELATIVE = "sources/C6-source"
+C6_GUIDE = (
+    "# Release gate\n\n"
+    "Does the gate compare spans? Yes, and it compares them byte for byte. "
+    "Is the answer short? No, the gate compares whole rows.\n\n"
+    "## Evidence\n" + "The gate replays every probe against the rebuilt index. " * 12
+)
+C6_NOTES = "\n".join(
+    f"Why does line {line} matter? Because the source tree is the corpus."
+    for line in range(1, 25)
+)
+C6_TOML = "\n".join(
+    ["[build]", 'target = "release"', "jobs = 8", "[gate]", 'fixture = "C6-source"']
+)
+
+
+def fixture_c6(sag2):
+    documents = [
+        ("Release gate", "guide.md", C6_GUIDE),
+        ("Field notes", "notes.txt", C6_NOTES),
+        ("Build settings", "config.toml", C6_TOML),
+        # Same stripped title and content as `guide.md`: the build dedups it
+        # before writing `source_files` or the statistics corpus
+        # (`sag2.py:269-290`).
+        ("Release gate", "guide-copy.md", C6_GUIDE),
+    ]
+    corpus = [
+        {
+            "title": title,
+            "text": text,
+            "path": path,
+            "sha256": _sha256_bytes(text.encode("utf-8")),
+        }
+        for title, path, text in documents
+    ]
+
+    def cases(_db):
+        return []
+
+    return Fixture(
+        "C6-source",
+        "source",
+        corpus,
+        C6_CHUNK_CHARS,
+        cases,
+        source_relative=C6_SOURCE_RELATIVE,
+    )
+
+
+def probe_expressions(fixtures):
+    """The design §1.4 D4 probe count (C0 12 + C5 12)."""
+    return sum(len(fixture.probes) for fixture in fixtures)
 
 
 # --------------------------------------------------------------------------
@@ -545,12 +641,40 @@ def export_chunk_cases(fixtures, reference_dir, sag2):
     first = "完整条件" * 100 + "。"
     long = "超长句子" * 150 + "。"
     last = "只有满足上述条件才能发布。"
+    # F-001: `?` is a prose sentence boundary (`chunking.py:29-39`).  This
+    # document is far longer than the chunk target and mixes the three shapes
+    # the greedy skip handles: `?` + space, `?` + closer and `?` + no space.
+    questions = (
+        "# Gate review\n\n"
+        "Why does the gate compare spans? Because spans are the chunk contract. "
+        'Does it compare bytes? "Yes", byte for byte. '
+        "Is the answer short?No, the gate compares whole rows.\n\n"
+        + "Does every probe replay the ranking SQL? It does, row for row. " * 20
+    )
+    # F-002: `.toml` is one of the 45 `CODE_SUFFIXES`, so this document is
+    # chunked on newlines (code mode), not as prose.
+    toml_lines = ["[build]", 'target = "release"', "jobs = 8", "", "[gate]"]
+    toml_lines += [f'check_{index} = "the gate keeps the binding"' for index in range(45)]
     scenarios = [
         (
             "chunking/long-sentence-overlap",
             "# 发布指南\n## 生产环境\n" + first + long + last,
             None,
             None,
+            512,
+        ),
+        (
+            "chunking/prose-question-boundary",
+            questions,
+            "guide.md",
+            "guide.md",
+            512,
+        ),
+        (
+            "chunking/code-suffix-toml",
+            "\n".join(toml_lines) + "\n",
+            "config.toml",
+            "config.toml",
             512,
         ),
         (
@@ -605,19 +729,90 @@ def export_chunk_cases(fixtures, reference_dir, sag2):
 
 
 # --------------------------------------------------------------------------
-# Gate D (index) - design §1.4 D1-D3: the signature, every `chunks` row, the
-# `chunk_fts` vocabulary per column, the cached statistics and the provenance
-# key set.  The reference index itself is the P0 `indexes/<fixture>.sqlite`.
+# Gate D (index) - design §1.4 D1-D4: the schema, the signature, every
+# `chunks` row, every `chunk_fts` row, the 24 `(rowid, bm25)` probes, the
+# per-column vocabulary, the cached statistics and the provenance key set.  The
+# reference index itself is the P0 `indexes/<fixture>.sqlite`.
 # --------------------------------------------------------------------------
 
 
-def index_expectation(fixture, index):
+def _normalise_sql(sql):
+    """Design §1.4 D1 compares `sqlite_master.sql` with whitespace normalised."""
+    return None if sql is None else " ".join(sql.split())
+
+
+def _normalise_source_signature(fixture, signature, sag2):
+    """Record the source-dir slot relative to the golden, not the temp tree.
+
+    `sag2.py:203` signs `source_dir.resolve()`, so a `source_dir` build's
+    signature carries the exporter's temporary absolute path.  The golden must
+    stay reproducible across machines, so the slot records the exported
+    relative tree; the verifier rebuilds the absolute form from its own
+    resolution (F-007).
+    """
+    if fixture.source_relative is None:
+        return signature
+    fields = json.loads(signature)
+    if fields[3] != str(fixture.source_dir):
+        raise SystemExit(
+            f"{fixture.name}: signature source_dir {fields[3]!r} is not the "
+            f"build tree {str(fixture.source_dir)!r}"
+        )
+    fields[3] = fixture.source_relative
+    return sag2.compact_json(fields)
+
+
+def index_expectation(fixture, index, sag2):
     """Everything Gate D compares about a Python-built index."""
     metadata_rows = index.db.execute("SELECT COUNT(*) FROM metadata").fetchone()[0]
-    signature = index.db.execute("SELECT signature FROM metadata").fetchone()[0]
+    signature = _normalise_source_signature(
+        fixture,
+        index.db.execute("SELECT signature FROM metadata").fetchone()[0],
+        sag2,
+    )
     chunks = [
         dict(row) for row in index.db.execute("SELECT * FROM chunks ORDER BY id")
     ]
+    schema = [
+        {"type": kind, "name": name, "sql": _normalise_sql(sql)}
+        for kind, name, sql in index.db.execute(
+            "SELECT type,name,sql FROM sqlite_master "
+            "WHERE name NOT LIKE 'sqlite_%' AND name <> 'rust_index_metadata' "
+            "ORDER BY name"
+        )
+    ]
+    # D3: under `content=''` FTS5 stores no column values, so `body` is
+    # dropped and the term binding is left to D4 (design §1.4 D3).
+    fts_columns = (
+        ("rowid", "title", "heading")
+        if fixture.source_dir is not None
+        else ("rowid", "title", "heading", "body")
+    )
+    fts_rows = [
+        list(row)
+        for row in index.db.execute(
+            f"SELECT {','.join(fts_columns)} FROM chunk_fts ORDER BY rowid"
+        )
+    ]
+    limit = index.db.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+    probes = []
+    for expression, term in fixture.probes:
+        query = (
+            f"({expression}) AND {sag2.quote_term(term)}"
+            if term is not None
+            else expression
+        )
+        # The reference path, not a re-typed SQL string: `retrieve` is the
+        # Gate A entry point and ranks through `sag_bm25` (`sag2.py:477-521`).
+        hits = index.retrieve(expression, set(), limit, term)
+        probes.append(
+            {
+                "expression": expression,
+                "query": query,
+                "limit": limit,
+                "rows": [[hit["id"], _hex_bits(hit["score"])] for hit in hits],
+            }
+        )
     index.db.execute(
         "CREATE VIRTUAL TABLE IF NOT EXISTS temp.vocab "
         "USING fts5vocab(main,chunk_fts,'col')"
@@ -646,9 +841,15 @@ def index_expectation(fixture, index):
         "chunk_chars": fixture.chunk_chars,
         "metadata_rows": metadata_rows,
         "signature": signature,
+        "source_dir": fixture.source_relative,
+        "schema": schema,
         "chunks": chunks,
+        "fts_rows": fts_rows,
         "fts_vocabulary": vocabulary,
-        "statistics_signature": statistics_rows[0][0],
+        "probes": probes,
+        "statistics_signature": _normalise_source_signature(
+            fixture, statistics_rows[0][0], sag2
+        ),
         "statistics": statistics_rows[0][1],
         "rust_index_metadata_keys": RUST_INDEX_METADATA_KEYS,
     }
@@ -824,6 +1025,11 @@ def fixture_segments(fixture, rows):
     for index, document in enumerate(fixture.corpus):
         segments.append((f"{fixture.name}/title/{index}", document.get("title", "")))
         segments.append((f"{fixture.name}/text/{index}", document.get("text", "")))
+    if fixture.source_dir is not None:
+        # A contentless index stores `start_char`/`end_char`, not `content`
+        # (`sag2.py:236-252`).  The chunk text is a span slice of the corpus
+        # text already covered by the `text` segment above.
+        return segments
     for row in rows:
         segments.append((f"{fixture.name}/chunk/{row['id']}/content", row["content"]))
     return segments
@@ -965,9 +1171,41 @@ def build_manifest(
     }
 
 
+def verify_code_suffixes(chunking):
+    """Refuse to export when the Rust `CODE_SUFFIXES` drifts from the reference.
+
+    `chunk.rs` picks the code chunking mode from this table, so a missing entry
+    silently turns a code/config document into prose (F-002).  The check parses
+    the literal out of the Rust source and compares the *set* with
+    `chunking.CODE_SUFFIXES`.
+    """
+    rust_source = (
+        Path(__file__).resolve().parent.parent
+        / "crates"
+        / "sag2-core"
+        / "src"
+        / "chunk.rs"
+    ).read_text()
+    match = re.search(
+        r"CODE_SUFFIXES: \[&str; (\d+)\] = \[(.*?)\];", rust_source, re.S
+    )
+    if match is None:
+        raise SystemExit(f"cannot find the CODE_SUFFIXES literal in {rust_source}")
+    entries = re.findall(r'"(\.[^"]+)"', match.group(2))
+    declared = int(match.group(1))
+    reference = sorted(chunking.CODE_SUFFIXES)
+    if declared != len(entries) or sorted(entries) != reference:
+        missing = sorted(set(reference) - set(entries))
+        extra = sorted(set(entries) - set(reference))
+        raise SystemExit(
+            f"chunk.rs CODE_SUFFIXES drifts from chunking.py: declared {declared}, "
+            f"found {len(entries)} entries, missing {missing}, extra {extra}"
+        )
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--all", action="store_true", help="export every fixture (C0-C3, C5)")
+    parser.add_argument("--all", action="store_true", help="export every fixture (C0-C3, C5, C6)")
     parser.add_argument("--out", type=Path, default=Path("golden"), help="output directory")
     parser.add_argument(
         "--reference",
@@ -988,6 +1226,8 @@ def main(argv=None):
 
     reference = json.loads((reference_dir.parent / "tests" / "sag2_reference.json").read_text())
     provenance = reference_provenance(reference_dir)
+    import chunking  # noqa: E402 - the reference `CODE_SUFFIXES` literal
+    verify_code_suffixes(chunking)
 
     fixtures = [
         fixture_c0(reference, sag2),
@@ -996,6 +1236,7 @@ def main(argv=None):
         fixture_c2(sag2),
         fixture_c3(sag2),
         fixture_c5(sag2),
+        fixture_c6(sag2),
     ]
 
     out_dir = args.out
@@ -1003,20 +1244,36 @@ def main(argv=None):
     work_dir = staging / "indexes"
     work_dir.mkdir(parents=True)
     try:
+        # `source_dir` fixtures read their text from a tree, so materialise it
+        # before the build (and copy it next to the golden afterwards).
+        for fixture in fixtures:
+            if fixture.source_relative is None:
+                continue
+            fixture.source_dir = staging / fixture.source_relative
+            for document in fixture.corpus:
+                target = fixture.source_dir / document["path"]
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(document["text"].encode("utf-8"))
+
         retrieve_lines, dump_lines, fixture_stats = [], [], []
         index_expectations = []
         segments_by_fixture = {}
         for fixture in fixtures:
-            db_path, signature, cases, rows, expectation = export_fixture(
-                fixture, sag2, work_dir
-            )
+            db_path, cases, rows, expectation = export_fixture(fixture, sag2, work_dir)
+            signature = expectation["signature"]
             index_expectations.append(expectation)
             segments_by_fixture[fixture.name] = fixture_segments(fixture, rows)
+            # A `source_dir` index embeds the absolute build tree in its
+            # metadata and statistics rows, so its bytes are not reproducible
+            # and it is not shipped as a reference index.
+            shipped = fixture.source_relative is None
             fixture_stats.append(
                 {
                     "fixture": fixture.name,
                     "index": db_path.name,
-                    "index_sha256": _sha256_bytes(db_path.read_bytes()),
+                    "index_sha256": (
+                        _sha256_bytes(db_path.read_bytes()) if shipped else None
+                    ),
                     "chunks": len(rows),
                     "cases": len(cases),
                     "passed": sum(1 for case in cases if case["error"] is None),
@@ -1151,6 +1408,7 @@ def main(argv=None):
             },
             {
                 "fixtures": len(index_expectations),
+                "probes": probe_expressions(fixtures),
                 "golden": "index_expected.jsonl",
             },
         )
@@ -1158,8 +1416,18 @@ def main(argv=None):
         out_dir.mkdir(parents=True, exist_ok=True)
         index_dir = out_dir / "indexes"
         index_dir.mkdir(exist_ok=True)
-        for entry in fixture_stats:
-            shutil.copyfile(work_dir / entry["index"], index_dir / entry["index"])
+        for entry, fixture in zip(fixture_stats, fixtures):
+            if entry["index_sha256"] is not None:
+                shutil.copyfile(work_dir / entry["index"], index_dir / entry["index"])
+            else:
+                (index_dir / entry["index"]).unlink(missing_ok=True)
+            if fixture.source_relative is not None:
+                shutil.rmtree(out_dir / fixture.source_relative, ignore_errors=True)
+                shutil.copytree(
+                    staging / fixture.source_relative,
+                    out_dir / fixture.source_relative,
+                    dirs_exist_ok=True,
+                )
         (out_dir / "retrieve.jsonl").write_text(retrieve_text)
         (out_dir / "index_dump.jsonl").write_text(dump_text)
         (out_dir / "tokenizer.jsonl").write_text(tokenizer_text)

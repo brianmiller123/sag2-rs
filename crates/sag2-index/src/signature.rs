@@ -7,7 +7,7 @@
 //! what [`sag2_json::compact_json`] produces, which is why the type lives here
 //! rather than in `sag2-core`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use sag2_json::{compact_json, Value};
 
@@ -28,13 +28,19 @@ const FIELDS: [&str; 6] = [
 ];
 
 /// Build the corpus signature for `fingerprint`, `chunk_chars` and `source_dir`.
+///
+/// `sag2.py:203` stores `source_dir.resolve()` and signs *that*, so a relative
+/// `--source-dir` must not produce a foreign signature: the path is made
+/// absolute (and symlink-resolved when the directory exists) before it is
+/// embedded.  `Path::resolve` in `pathlib` never fails on a missing tail, so
+/// the lexical fallback mirrors it.
 pub fn signature(fingerprint: &str, chunk_chars: usize, source_dir: Option<&Path>) -> String {
     let mut fields = vec![
         Value::Str(fingerprint.to_owned()),
         Value::Int(chunk_chars as i64),
         Value::Int(INDEX_SCHEMA),
         match source_dir {
-            Some(path) => Value::Str(path.to_string_lossy().into_owned()),
+            Some(path) => Value::Str(resolve(path).to_string_lossy().into_owned()),
             None => Value::Null,
         },
         Value::Str(CHUNK_POLICY.to_owned()),
@@ -43,6 +49,20 @@ pub fn signature(fingerprint: &str, chunk_chars: usize, source_dir: Option<&Path
         fields.push(Value::Str("plain-text-default".to_owned()));
     }
     compact_json(&Value::Array(fields))
+}
+
+/// `Path.resolve()` (`pathlib`): absolute, symlinks resolved where they exist.
+fn resolve(path: &Path) -> PathBuf {
+    if let Ok(resolved) = std::fs::canonicalize(path) {
+        return resolved;
+    }
+    if path.is_absolute() {
+        return path.to_owned();
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(path),
+        Err(_) => path.to_owned(),
+    }
 }
 
 /// Name the first signature field that differs between `expected` and `stored`.
@@ -85,6 +105,19 @@ mod tests {
             string,
             "[\"fix\",2200,5,\"/tmp/corpus\",\"desktop-sentences-v1\"]"
         );
+    }
+
+    #[test]
+    fn relative_source_dir_is_signed_as_an_absolute_path() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let absolute = std::fs::canonicalize(directory.path()).expect("canonicalize");
+        let signed = signature("fix", 2200, Some(directory.path()));
+        let expected = format!(
+            "[\"fix\",2200,5,\"{}\",\"desktop-sentences-v1\"]",
+            absolute.to_string_lossy()
+        );
+        assert_eq!(signed, expected);
+        assert_eq!(signature("fix", 2200, Some(&absolute)), expected);
     }
 
     #[test]

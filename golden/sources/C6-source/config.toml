@@ -1,0 +1,5 @@
+[build]
+target = "release"
+jobs = 8
+[gate]
+fixture = "C6-source"

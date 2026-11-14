@@ -22,7 +22,7 @@ fn reference(digest: &str) -> Value {
 
 fn write_manifest(dir: &Path, sqlite: &str, reference: Option<Value>) {
     let mut manifest = json!({
-        "generator_version": "0.4.0",
+        "generator_version": "0.5.0",
         "python": "3.12.11",
         "sqlite": sqlite,
         "jieba": "0.42.1",

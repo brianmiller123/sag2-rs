@@ -244,8 +244,11 @@ impl Reader {
 }
 
 /// `load_rank_extension` (`sag2.py:424-425`) for one connection.
+///
+/// Public so a caller holding its own read-only connection (Gate D's index
+/// comparison) can run the reference `sag_bm25` SQL.
 #[allow(unsafe_code)]
-fn register_rank(db: &Connection) -> Result<(), OpenError> {
+pub fn register_rank(db: &Connection) -> Result<(), OpenError> {
     // SAFETY: the handle is valid for as long as `db` is alive, and
     // `sag_register_rank` only prepares one statement on that connection.
     let handle = unsafe { db.handle() } as *mut sag2_rank_sys::sqlite3;

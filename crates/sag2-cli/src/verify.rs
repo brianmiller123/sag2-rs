@@ -5,26 +5,32 @@
 //! frozen reference lines, every corpus segment, the ASCII cross product and
 //! the exhaustive per-code-point Unicode tables.
 //!
+//! Gate D `index` implements design §1.4's sub-checks: D1 (`sqlite_master`
+//! name/type/sql, whitespace-normalised), D2 (signature and statistics), D3
+//! (every `chunks` row and every `chunk_fts` row) and D4 (24 `(rowid, bm25)`
+//! probes replayed with the reference ranking SQL).
+//!
 //! Comparison uses only the §1.0 tolerance functions: the ordered hit rows are
 //! compared field by field (`eq_ids` on `id`/`document_id`, `eq_str` on the
-//! §1.1 materialisation fields, `eq_f64_bits` on the scores).  Exit codes follow
-//! §1.0: `0` passed, `2` a comparison failed, `3` the tooling/data cannot be
-//! used.  A gate run outside the certified toolchain, or against a reference
-//! checkout that is not the one the goldens came from, compares nothing and
-//! exits `3` (design §1.0 rule 2, §7.1).
+//! §1.1 materialisation fields, `eq_f64_bits` on the scores and on
+//! `diversity_idf`).  Exit codes follow §1.0: `0` passed, `2` a comparison
+//! failed, `3` the tooling/data cannot be used.  A gate run outside the
+//! certified toolchain, or against a reference checkout that is not the one
+//! the goldens came from, compares nothing and exits `3` (design §1.0 rule 2,
+//! §7.1).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use rusqlite::{Connection, OpenFlags};
+use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use sag2_index::{open_readonly, CorpusIndex, QueryError, QueryOptions};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Generator version this verifier understands.
-const GENERATOR_VERSION: &str = "0.4.0";
+const GENERATOR_VERSION: &str = "0.5.0";
 
 /// Minimum interpreter the goldens may come from (design §11 divergence D5).
 const REQUIRED_PYTHON: (u64, u64) = (3, 12);
@@ -80,6 +86,8 @@ struct ChunksSpec {
 #[derive(Deserialize)]
 struct IndexExpectedSpec {
     fixtures: usize,
+    /// Design §1.4 D4 probe count (24).
+    probes: usize,
 }
 
 /// Gate D's segment count (`tokenizer.jsonl`).
@@ -134,7 +142,10 @@ struct ManifestFile {
 struct ManifestFixture {
     fixture: String,
     index: String,
-    index_sha256: String,
+    /// `null` for a `source_dir` fixture: its bytes embed the absolute build
+    /// tree, so no reference index is shipped.
+    #[serde(default)]
+    index_sha256: Option<String>,
     chunks: usize,
     signature: String,
 }
@@ -453,7 +464,13 @@ fn run_gate_a(options: &Options) -> Result<ExitCode, String> {
         let source = options.golden.join("indexes").join(&fixture.index);
         let bytes = fs::read(&source)
             .map_err(|error| format!("cannot read {}: {error}", source.display()))?;
-        if sha256_hex(&bytes) != fixture.index_sha256 {
+        let Some(expected_digest) = &fixture.index_sha256 else {
+            return Err(format!(
+                "{} is used by Gate A but has no manifest sha256",
+                fixture.index
+            ));
+        };
+        if sha256_hex(&bytes) != *expected_digest {
             return Err(format!(
                 "{} does not match the manifest sha256",
                 fixture.index
@@ -754,22 +771,65 @@ struct IndexGolden {
     chunk_chars: usize,
     metadata_rows: usize,
     signature: String,
+    /// Relative source tree when the fixture was built in `source_dir` mode
+    /// (`content=''` + `start_char`/`end_char` + `source_files`).
+    #[serde(default)]
+    source_dir: Option<String>,
+    /// D1: `SELECT type,name,sql FROM sqlite_master` (whitespace-normalised).
+    schema: Vec<SchemaGolden>,
     chunks: Vec<ChunkRowGolden>,
+    /// D3: every `chunk_fts` row; `[rowid,title,heading,body]`, or
+    /// `[rowid,title,heading]` under `content=''` (design §1.4 D3).
+    fts_rows: Vec<Vec<serde_json::Value>>,
     fts_vocabulary: BTreeMap<String, Vec<(String, i64)>>,
+    /// D4: `(rowid, bm25)` rows of the reference ranking SQL.
+    probes: Vec<ProbeGolden>,
     statistics_signature: String,
     statistics: String,
     rust_index_metadata_keys: Vec<String>,
 }
 
-/// `SELECT * FROM chunks` in column order (`sag2.py:236-245`).
+/// One `sqlite_master` entry (design §1.4 D1).
+#[derive(Deserialize, PartialEq, Eq)]
+struct SchemaGolden {
+    #[serde(rename = "type")]
+    kind: String,
+    name: String,
+    sql: Option<String>,
+}
+
+/// One D4 probe: the reference `MATCH` expression and its ranked rows.
+#[derive(Deserialize)]
+struct ProbeGolden {
+    /// The expression whose `sag_stats` blob the ranking SQL is bound to
+    /// (`sag2.py:487-492`).
+    expression: String,
+    /// The expression the ranking SQL actually matches, i.e. `expression`
+    /// composed with `term` exactly as `sag2.py:484` does.
+    query: String,
+    limit: usize,
+    /// `(rowid, bm25 bits as little-endian hex)`, ordered by `(score, rowid)`.
+    rows: Vec<(i64, String)>,
+}
+
+/// `SELECT * FROM chunks` in column order (`sag2.py:236-252`).
+///
+/// The materialised schema stores `content`/`full_doc`; the `source_dir`
+/// schema stores `start_char`/`end_char`.  Exactly one pair is present.
 #[derive(Deserialize)]
 struct ChunkRowGolden {
     id: i64,
     document_id: i64,
     title: String,
     heading: String,
-    content: String,
-    full_doc: String,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    full_doc: Option<String>,
+    #[serde(default)]
+    start_char: Option<i64>,
+    #[serde(default)]
+    end_char: Option<i64>,
     spans: String,
     characters: i64,
     source_id: String,
@@ -970,6 +1030,15 @@ fn gate_d_index(
         )
         .into());
     }
+    let probes: usize = goldens.iter().map(|golden| golden.probes.len()).sum();
+    if probes != spec.probes {
+        return Err(format!(
+            "golden inconsistency: index_expected.jsonl holds {probes} D4 probes, \
+             manifest says {}",
+            spec.probes
+        )
+        .into());
+    }
     for golden in &goldens {
         let fixture = manifest
             .fixtures
@@ -1008,6 +1077,7 @@ fn gate_d_index(
         }
     };
     let expected_metadata = expected_rust_metadata();
+    let mut subchecks = SubChecks::default();
     let mut fixtures_equal = 0_usize;
     let mut fixtures_total = 0_usize;
     for golden in &goldens {
@@ -1027,6 +1097,20 @@ fn gate_d_index(
             gate.push(&golden.fixture, "corpus", "at least one document", "none");
             continue;
         }
+        // `source_dir` fixtures are built against the checked-in source tree
+        // (`golden/sources/<fixture>`), so the contentless branch, the
+        // `start_char`/`end_char` layout and `source_files` are gate-covered
+        // (design §1.4 sample corpora, F-005).
+        let source_dir = match golden.source_dir.as_deref() {
+            None => None,
+            Some(relative) => {
+                let path = options.golden.join(relative);
+                let resolved = fs::canonicalize(&path).map_err(|error| {
+                    format!("cannot resolve source tree {}: {error}", path.display())
+                })?;
+                Some(resolved)
+            }
+        };
         let path = directory.join(&golden.index);
         let opened = sag2_index::CorpusIndex::open(
             &path,
@@ -1034,7 +1118,7 @@ fn gate_d_index(
             &golden.fingerprint,
             sag2_index::IndexOptions {
                 chunk_chars: golden.chunk_chars,
-                source_dir: None,
+                source_dir: source_dir.clone(),
                 rebuild: sag2_index::RebuildPolicy::Always,
             },
         );
@@ -1042,6 +1126,15 @@ fn gate_d_index(
             Ok((index, outcome)) => {
                 drop(index);
                 outcome
+            }
+            // The P0 reader refuses the contentless `chunks` layout
+            // (`OpenError::SourceDirUnsupported`) *after* the build wrote the
+            // file; Gate D compares that file, so the refusal is expected.
+            Err(sag2_index::OpenError::SourceDirUnsupported) if source_dir.is_some() => {
+                sag2_index::OpenOutcome {
+                    action: sag2_index::OpenAction::Built,
+                    rebuilt: None,
+                }
             }
             Err(error) => {
                 gate.push(
@@ -1063,11 +1156,15 @@ fn gate_d_index(
         }
         let db = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
             .map_err(|error| format!("cannot reopen {}: {error}", path.display()))?;
+        sag2_index::register_rank(&db)
+            .map_err(|error| format!("cannot register the rank extension: {error}"))?;
         compare_index(
             &db,
             golden,
+            source_dir.as_deref(),
             &expected_metadata,
             &golden.rust_index_metadata_keys,
+            &mut subchecks,
             &mut gate,
         )?;
         if gate.diffs == before {
@@ -1085,9 +1182,35 @@ fn gate_d_index(
         fixtures_equal,
         fixtures_total - fixtures_equal
     );
+    println!(
+        "sub-checks: D1 {} fixtures / {} sqlite_master rows, D3 {} fixtures / {} chunk_fts rows, \
+         D4 {} fixtures / {} probes / {} ranked rows",
+        subchecks.d1_fixtures,
+        subchecks.d1_entries,
+        subchecks.d3_fixtures,
+        subchecks.d3_rows,
+        subchecks.d4_fixtures,
+        subchecks.d4_probes,
+        subchecks.d4_rows
+    );
     Ok(serde_json::json!({
         "fixtures": fixtures_total,
         "fixtures_equal": fixtures_equal,
+        "subchecks": {
+            "D1_sqlite_master": {
+                "fixtures": subchecks.d1_fixtures,
+                "rows": subchecks.d1_entries,
+            },
+            "D3_chunk_fts_rows": {
+                "fixtures": subchecks.d3_fixtures,
+                "rows": subchecks.d3_rows,
+            },
+            "D4_probes": {
+                "fixtures": subchecks.d4_fixtures,
+                "probes": subchecks.d4_probes,
+                "ranked_rows": subchecks.d4_rows,
+            },
+        },
         "passed": gate.diffs == 0,
     }))
 }
@@ -1139,15 +1262,113 @@ fn expected_rust_metadata() -> BTreeMap<&'static str, &'static str> {
     .collect()
 }
 
-/// Compare a Rust-built index with the Python build.
+/// Counts of the D1/D3/D4 sub-checks, so the gate report shows they ran.
+#[derive(Default)]
+struct SubChecks {
+    d1_fixtures: usize,
+    d1_entries: usize,
+    d3_fixtures: usize,
+    d3_rows: usize,
+    d4_fixtures: usize,
+    d4_probes: usize,
+    d4_rows: usize,
+}
+
+/// A `sqlite_master` row reduced to what design §1.4 D1 compares.
+type NormalisedSchema = Vec<(String, String, Option<String>)>;
+
+/// Design §1.4 D1: `sqlite_master.sql` is compared after whitespace
+/// normalisation (runs of whitespace collapse to one space, ends trimmed) so
+/// that a reformatted `CREATE` statement is not a schema difference.
+fn normalise_sql(sql: &str) -> String {
+    sql.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn normalised_schema(entries: &[SchemaGolden]) -> NormalisedSchema {
+    entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.kind.clone(),
+                entry.name.clone(),
+                entry.sql.as_deref().map(normalise_sql),
+            )
+        })
+        .collect()
+}
+
+fn describe_schema_entry(entry: Option<&(String, String, Option<String>)>) -> String {
+    match entry {
+        None => "<missing>".to_owned(),
+        Some((kind, name, sql)) => format!("{kind} {name}: {}", sql.as_deref().unwrap_or("<null>")),
+    }
+}
+
+/// Compare a Rust-built index with the Python build (design §1.4 D1-D4).
+///
+/// `source_dir` is the resolved source tree for a contentless fixture, `None`
+/// for a materialised one.  A golden fixture's signatures carry the
+/// machine-independent *relative* source path; the expected forms are rebuilt
+/// here from the path this run actually resolved (F-007).
 fn compare_index(
     db: &Connection,
     golden: &IndexGolden,
+    source_dir: Option<&Path>,
     expected_metadata: &BTreeMap<&'static str, &'static str>,
     golden_keys: &[String],
+    subchecks: &mut SubChecks,
     gate: &mut GateFailures<'_>,
 ) -> Result<(), GateError> {
     let fixture = golden.fixture.as_str();
+    let signed = |stored: &str| match source_dir {
+        None => stored.to_owned(),
+        Some(path) => sag2_index::signature(&golden.fingerprint, golden.chunk_chars, Some(path)),
+    };
+    subchecks.d1_fixtures += 1;
+    subchecks.d3_fixtures += 1;
+    subchecks.d4_fixtures += 1;
+
+    // D1 — every `sqlite_master` row (name, type, normalised sql) except
+    // SQLite's internals and `rust_index_metadata`, which design §3.2 adds on
+    // the Rust side only (its key set is compared below).
+    {
+        let mut statement = db.prepare(
+            "SELECT type,name,sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' \
+             AND name <> 'rust_index_metadata' ORDER BY name",
+        )?;
+        let actual: NormalisedSchema = normalised_schema(
+            &statement
+                .query_map([], |row| {
+                    Ok(SchemaGolden {
+                        kind: row.get(0)?,
+                        name: row.get(1)?,
+                        sql: row.get(2)?,
+                    })
+                })?
+                .collect::<Result<Vec<_>, _>>()?,
+        );
+        let expected = normalised_schema(&golden.schema);
+        subchecks.d1_entries += actual.len();
+        if actual != expected {
+            let at = expected
+                .iter()
+                .zip(&actual)
+                .position(|(left, right)| left != right)
+                .unwrap_or(expected.len().min(actual.len()));
+            let name = expected
+                .get(at)
+                .or_else(|| actual.get(at))
+                .map(|entry| entry.1.clone())
+                .unwrap_or_else(|| "<missing>".to_owned());
+            gate.push(
+                fixture,
+                format!("sqlite_master/{name}"),
+                describe_schema_entry(expected.get(at)),
+                describe_schema_entry(actual.get(at)),
+            );
+        }
+    }
+
     let metadata_rows: i64 = db.query_row("SELECT COUNT(*) FROM metadata", [], |row| row.get(0))?;
     if metadata_rows != golden.metadata_rows as i64 {
         gate.push(
@@ -1160,19 +1381,21 @@ fn compare_index(
     let signature: String = db.query_row("SELECT signature FROM metadata LIMIT 1", [], |row| {
         row.get(0)
     })?;
-    if signature != golden.signature {
-        gate.push(
-            fixture,
-            "metadata/signature",
-            golden.signature.clone(),
-            signature,
-        );
+    let expected_signature = signed(&golden.signature);
+    if signature != expected_signature {
+        gate.push(fixture, "metadata/signature", expected_signature, signature);
     }
 
-    let mut statement = db.prepare(
+    // D3 (first half) — every `chunks` row, in the schema variant the fixture
+    // declares (`sag2.py:236-252`).
+    let contentless = source_dir.is_some();
+    let mut statement = db.prepare(if contentless {
+        "SELECT id,document_id,title,heading,start_char,end_char,spans,characters,source_id \
+         FROM chunks ORDER BY id"
+    } else {
         "SELECT id,document_id,title,heading,content,full_doc,spans,characters,source_id \
-         FROM chunks ORDER BY id",
-    )?;
+         FROM chunks ORDER BY id"
+    })?;
     let mut rows = statement.query([])?;
     let mut position = 0_usize;
     while let Some(row) = rows.next()? {
@@ -1181,8 +1404,10 @@ fn compare_index(
             document_id: row.get(1)?,
             title: row.get(2)?,
             heading: row.get(3)?,
-            content: row.get(4)?,
-            full_doc: row.get(5)?,
+            content: (!contentless).then(|| row.get(4)).transpose()?,
+            full_doc: (!contentless).then(|| row.get(5)).transpose()?,
+            start_char: contentless.then(|| row.get(4)).transpose()?,
+            end_char: contentless.then(|| row.get(5)).transpose()?,
             spans: row.get(6)?,
             characters: row.get(7)?,
             source_id: row.get(8)?,
@@ -1208,6 +1433,97 @@ fn compare_index(
     }
     drop(rows);
     drop(statement);
+
+    // D3 (second half) — every `chunk_fts` row.  Under `content=''` FTS5
+    // stores no column values, so the design drops `body` and leaves the term
+    // binding to D4.
+    {
+        let mut statement = db.prepare(if contentless {
+            "SELECT rowid,title,heading FROM chunk_fts ORDER BY rowid"
+        } else {
+            "SELECT rowid,title,heading,body FROM chunk_fts ORDER BY rowid"
+        })?;
+        let mut rows = statement.query([])?;
+        let mut position = 0_usize;
+        let width = if contentless { 3 } else { 4 };
+        while let Some(row) = rows.next()? {
+            let mut actual = vec![serde_json::Value::from(row.get::<_, i64>(0)?)];
+            for column in 1..width {
+                actual.push(match row.get::<_, Option<String>>(column)? {
+                    Some(text) => serde_json::Value::String(text),
+                    None => serde_json::Value::Null,
+                });
+            }
+            subchecks.d3_rows += 1;
+            match golden.fts_rows.get(position) {
+                Some(expected) if *expected == actual => {}
+                Some(expected) => gate.push(
+                    fixture,
+                    format!("chunk_fts[{position}]"),
+                    format!("{expected:?}"),
+                    format!("{actual:?}"),
+                ),
+                None => gate.push(
+                    fixture,
+                    format!("chunk_fts[{position}]"),
+                    "<missing>",
+                    format!("{actual:?}"),
+                ),
+            }
+            position += 1;
+        }
+        if position != golden.fts_rows.len() {
+            gate.push(
+                fixture,
+                "chunk_fts/length",
+                golden.fts_rows.len().to_string(),
+                position.to_string(),
+            );
+        }
+    }
+
+    // D4 — replay the ranking SQL for every probe and compare
+    // `(rowid, bm25 bits)` row for row (`sag2.py:484-492`).
+    for (probe_index, probe) in golden.probes.iter().enumerate() {
+        let blob: Option<Vec<u8>> = db
+            .query_row(sag2_index::SAG_STATS_SQL, [&probe.expression], |row| {
+                row.get(0)
+            })
+            .optional()?
+            .flatten();
+        let mut statement = db.prepare(sag2_index::BASE_SQL)?;
+        let actual: Vec<(i64, String)> = statement
+            .query_map(
+                rusqlite::params![
+                    blob.unwrap_or_default(),
+                    probe.query,
+                    "[]",
+                    probe.limit as i64
+                ],
+                |row| Ok((row.get::<_, i64>(0)?, hex_bits(row.get::<_, f64>(1)?))),
+            )?
+            .collect::<Result<_, _>>()?;
+        subchecks.d4_probes += 1;
+        subchecks.d4_rows += actual.len();
+        if actual != probe.rows {
+            let at = probe
+                .rows
+                .iter()
+                .zip(&actual)
+                .position(|(left, right)| left != right)
+                .unwrap_or(probe.rows.len().min(actual.len()));
+            gate.push(
+                fixture,
+                format!("probe[{probe_index}]/{}", probe.query),
+                format!(
+                    "{} rows, first difference at {at}: {:?}",
+                    probe.rows.len(),
+                    probe.rows.get(at)
+                ),
+                format!("{} rows: {:?}", actual.len(), actual.get(at)),
+            );
+        }
+    }
 
     db.execute(
         "CREATE VIRTUAL TABLE temp.vocab USING fts5vocab(main,chunk_fts,'col')",
@@ -1244,15 +1560,29 @@ fn compare_index(
         }
     }
 
+    // D2 — `index_statistics` holds exactly one row (F-008).
+    let statistics_rows: i64 =
+        db.query_row("SELECT COUNT(*) FROM index_statistics", [], |row| {
+            row.get(0)
+        })?;
+    if statistics_rows != 1 {
+        gate.push(
+            fixture,
+            "index_statistics/rows",
+            "1".to_owned(),
+            statistics_rows.to_string(),
+        );
+    }
+    let expected_statistics_signature = signed(&golden.statistics_signature);
     let (statistics_signature, statistics): (String, String) =
         db.query_row("SELECT signature, data FROM index_statistics", [], |row| {
             Ok((row.get(0)?, row.get(1)?))
         })?;
-    if statistics_signature != golden.statistics_signature {
+    if statistics_signature != expected_statistics_signature {
         gate.push(
             fixture,
             "index_statistics/signature",
-            golden.statistics_signature.clone(),
+            expected_statistics_signature,
             statistics_signature,
         );
     }
@@ -1331,8 +1661,6 @@ fn compare_chunk_row(
     for (name, left, right) in [
         ("title", &expected.title, &actual.title),
         ("heading", &expected.heading, &actual.heading),
-        ("content", &expected.content, &actual.content),
-        ("full_doc", &expected.full_doc, &actual.full_doc),
         ("spans", &expected.spans, &actual.spans),
         ("source_id", &expected.source_id, &actual.source_id),
     ] {
@@ -1345,13 +1673,50 @@ fn compare_chunk_row(
             );
         }
     }
-    if expected.characters != actual.characters {
-        gate.push(
-            fixture,
-            field("characters"),
-            expected.characters.to_string(),
-            actual.characters.to_string(),
-        );
+    for (name, left, right) in [
+        ("content", &expected.content, &actual.content),
+        ("full_doc", &expected.full_doc, &actual.full_doc),
+    ] {
+        if left != right {
+            gate.push(
+                fixture,
+                field(name),
+                display_option(left),
+                display_option(right),
+            );
+        }
+    }
+    for (name, left, right) in [
+        ("start_char", expected.start_char, actual.start_char),
+        ("end_char", expected.end_char, actual.end_char),
+        (
+            "characters",
+            Some(expected.characters),
+            Some(actual.characters),
+        ),
+    ] {
+        if left != right {
+            gate.push(
+                fixture,
+                field(name),
+                display_count(left),
+                display_count(right),
+            );
+        }
+    }
+}
+
+fn display_option(value: &Option<String>) -> String {
+    match value {
+        Some(text) => display_text(text),
+        None => "<null>".to_owned(),
+    }
+}
+
+fn display_count(value: Option<i64>) -> String {
+    match value {
+        Some(number) => number.to_string(),
+        None => "<null>".to_owned(),
     }
 }
 
@@ -1388,6 +1753,9 @@ fn compare_statistics(
     }
 }
 
+/// Compare `diversity_idf` at `eq_f64_bits` (design §1.4 D2: the values feed
+/// the DPP vector weights, so the strict layer applies; the report's
+/// `"f64": "bits"` claim is exactly what runs here).
 fn compare_float_map(
     fixture: &str,
     prefix: &str,
@@ -1407,10 +1775,13 @@ fn compare_float_map(
             expected.get(key).and_then(serde_json::Value::as_f64),
             actual.get(key).and_then(serde_json::Value::as_f64),
         ) {
-            (Some(left), Some(right)) if within_tolerance(left, right) => {}
-            (Some(left), Some(right)) => {
-                gate.push(fixture, path, format!("{left:?}"), format!("{right:?}"))
-            }
+            (Some(left), Some(right)) if left.to_bits() == right.to_bits() => {}
+            (Some(left), Some(right)) => gate.push(
+                fixture,
+                path,
+                format!("{left:?} (bits {:016x})", left.to_bits()),
+                format!("{right:?} (bits {:016x})", right.to_bits()),
+            ),
             _ => gate.push(
                 fixture,
                 path,
@@ -1561,6 +1932,10 @@ fn run_gate_d(options: &Options) -> Result<ExitCode, String> {
         "gates": {"D": {
             "fixtures": fixtures,
             "sections": sections,
+            "schema_exclusions": [
+                "rust_index_metadata (design §3.2 Rust-only provenance table; \
+                 D2 compares its key set and values)"
+            ],
         }},
         "excluded_fields": [],
         "excluded_checks": ["db_physical_bytes"],
@@ -2131,6 +2506,15 @@ fn bits_to_f64(hex: &str) -> Option<f64> {
         *byte = u8::from_str_radix(hex.get(index * 2..index * 2 + 2)?, 16).ok()?;
     }
     Some(f64::from_le_bytes(bytes))
+}
+
+/// `struct.pack('<d', value).hex()`: the golden's score representation.
+fn hex_bits(value: f64) -> String {
+    value
+        .to_le_bytes()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 fn dump_signatures(options: &Options) -> Result<BTreeMap<String, String>, String> {

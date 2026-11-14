@@ -312,14 +312,17 @@ fn load_statistics(
     )?;
 
     // `self.frequencies` is the FTS5 `body` document frequency
-    // (`sag2.py:348-352`).
+    // (`sag2.py:348-352`).  `fts5vocab` yields terms in segment order, which
+    // is an implementation detail; `ORDER BY term` pins the JSON key order so
+    // rebuilds stay byte-identical.
     tx.execute(
         "CREATE VIRTUAL TABLE temp.vocab USING fts5vocab(main,chunk_fts,'col')",
         [],
     )?;
     let mut frequencies = Object::new();
     {
-        let mut statement = tx.prepare("SELECT term, doc FROM temp.vocab WHERE col='body'")?;
+        let mut statement =
+            tx.prepare("SELECT term, doc FROM temp.vocab WHERE col='body' ORDER BY term")?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
             frequencies.insert(row.get::<_, String>(0)?, Value::Int(row.get::<_, i64>(1)?));

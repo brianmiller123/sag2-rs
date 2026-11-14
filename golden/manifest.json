@@ -1,12 +1,12 @@
 {
-  "generator_version": "0.4.0",
+  "generator_version": "0.5.0",
   "python": "3.12.11",
   "sqlite": "3.50.4",
   "jieba": "0.42.1",
   "pyuca": "9.0.0",
   "unicode": "15.0.0",
   "regex": "2026.11.9",
-  "corpus_sha256": "8e8d1a5b067532b3b6b89909bf742fcf5052d7ef3d5e8dfb46b3b18733e8f9ea",
+  "corpus_sha256": "99c780ebcbc0b3715eb4f50b902546be5b7b0aa6e1dd48354a0251a86776a7ba",
   "reference": {
     "sag2_py_sha256": "28cbaf87278412ee1bd9baf9613a07de7f1b908b8de9aaad9903c5a96d29877a",
     "sag2_rank_py_sha256": "b8cd1d497f8be697cf0880348e3f06ae9f93d59b464965f1ecf2e2307d871cbd",
@@ -21,13 +21,13 @@
     },
     {
       "path": "index_dump.jsonl",
-      "sha256": "d0e9279b875db9f46e894864fa27b0dbbd0cb308451a409db45ec8afc7cc53da",
-      "lines": 2805
+      "sha256": "f7662ddb933d9c28b99aaa49e6bcbb7100adc88edbf8cfbc5988d446003b1967",
+      "lines": 2814
     },
     {
       "path": "tokenizer.jsonl",
-      "sha256": "43e26f899601ff7afed26086e5776db56c21bfcc70946cdaf10b0612648a5793",
-      "lines": 8561
+      "sha256": "ba9532436a416b8ec2049f3fd809e2a0bf97eebc668f3f88ccbf461c7126e7b0",
+      "lines": 8569
     },
     {
       "path": "ascii_runs.jsonl",
@@ -36,13 +36,13 @@
     },
     {
       "path": "chunks.jsonl",
-      "sha256": "9668236d801365eafb59746e9f21e2bb6354bb3ae4df008b4e48732724c7e35f",
-      "lines": 2898
+      "sha256": "6a4d8a1b4f82901f191e907acea058d212e81b94e01b8cf7adfec4359ce57050",
+      "lines": 2904
     },
     {
       "path": "index_expected.jsonl",
-      "sha256": "4cc647c46f8cb13654b027ce029bcd7b46f3826acd15caa5fed0a048e9e73301",
-      "lines": 6
+      "sha256": "4e4543971824cb33060f07a181b36dcda38c8dbb02915fda57519a32914e1fca",
+      "lines": 7
     },
     {
       "path": "unicode_lower.bin.gz",
@@ -96,7 +96,7 @@
     }
   ],
   "tokenizer": {
-    "segments": 8561,
+    "segments": 8569,
     "golden": "tokenizer.jsonl"
   },
   "ascii_runs": {
@@ -188,13 +188,14 @@
     }
   },
   "chunks": {
-    "documents": 2898,
-    "chunks": 2934,
-    "scenarios": 19,
+    "documents": 2904,
+    "chunks": 2955,
+    "scenarios": 21,
     "golden": "chunks.jsonl"
   },
   "index_expected": {
-    "fixtures": 6,
+    "fixtures": 7,
+    "probes": 24,
     "golden": "index_expected.jsonl"
   },
   "fixtures": [
@@ -257,6 +258,16 @@
       "passed": 54,
       "errors": 0,
       "signature": "[\"unicode\",10000,5,null,\"desktop-sentences-v1\",\"plain-text-default\"]"
+    },
+    {
+      "fixture": "C6-source",
+      "index": "C6-source.sqlite",
+      "index_sha256": null,
+      "chunks": 8,
+      "cases": 0,
+      "passed": 0,
+      "errors": 0,
+      "signature": "[\"source\",512,5,\"sources/C6-source\",\"desktop-sentences-v1\"]"
     }
   ]
 }

@@ -10,7 +10,7 @@ use rusqlite::{params, Connection};
 use sag2_json::{compact_json, Value};
 
 /// The ranking query (`sag2.py:484-490`), byte for byte.
-pub(crate) const BASE_SQL: &str = concat!(
+pub const BASE_SQL: &str = concat!(
     "WITH top_hits AS MATERIALIZED (",
     "SELECT rowid,sag_bm25(chunk_fts,?,2,2,1) AS score FROM chunk_fts ",
     "WHERE chunk_fts MATCH ? ",
@@ -24,7 +24,7 @@ const PRUNE_REPLACEMENT: &str = "AND +rowid IN (SELECT rowid FROM chunk_fts WHER
                                  MATCH ?) ORDER BY score,rowid LIMIT ?)";
 
 /// The per-expression statistics blob (`sag2.py:487-492`).
-pub(crate) const SAG_STATS_SQL: &str =
+pub const SAG_STATS_SQL: &str =
     "SELECT sag_stats(chunk_fts) FROM chunk_fts WHERE chunk_fts MATCH ? LIMIT 1";
 
 const CHUNKS_SQL: &str = "SELECT id,document_id,title,heading,content,full_doc,spans,characters,\

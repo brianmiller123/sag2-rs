@@ -53,8 +53,13 @@ cargo run -p sag2-cli -- verify --gate D --fixtures tokenizer,chunks,index --gol
   row has no path) while a `null` `chunk_path` is `chunk_document`'s
   `document.md`.
 * `index` - builds every fixture with this crate and compares it against the
-  Python-built index: signature, every `chunks` row, the `chunk_fts` vocabulary
-  per column, `index_statistics.data` and the `rust_index_metadata` key set.
+  Python-built index: D1 `sqlite_master` (name/type/whitespace-normalised sql,
+  including the `content=''` flag and column order), D2 the signature and
+  `index_statistics.data`, D3 every `chunks` row and every `chunk_fts` row, and
+  D4 the 24 `(rowid, bm25)` probes replayed with the reference ranking SQL.  The
+  `C6-source` fixture is built in `source_dir` mode against
+  `golden/sources/C6-source`, so the contentless schema, `start_char`/`end_char`
+  and `source_files` are gate-covered too.
 
 `--index-dir <dir>` keeps the Rust-built indexes; replay Gate A against them by
 copying `golden/` aside, replacing `indexes/*.sqlite` with the built files and

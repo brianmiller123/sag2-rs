@@ -30,8 +30,8 @@ pub use open::{
     FORMAT_VERSION_STR, JIEBA_DICT_SHA256, RUNTIME_VERSIONS, SAG_RANK_SHA256, SQLITE_VERSION,
     TOKENIZER_VERSION, UCA_KEYS_SHA256, UCA_VERSION, UNICODE_VERSION,
 };
-pub use pool::{QueryOptions, QUERY_CACHE_ENTRIES, QUERY_WORKERS};
-pub use retrieve::{Hit, QueryError};
+pub use pool::{register_rank, QueryOptions, QUERY_CACHE_ENTRIES, QUERY_WORKERS};
+pub use retrieve::{Hit, QueryError, BASE_SQL, SAG_STATS_SQL};
 pub use sag2_core::DEFAULT_CHUNK_CHARS;
 pub use signature::{changed_field, signature, CHUNK_POLICY, INDEX_SCHEMA};
 pub use statistics::{Statistics, StatisticsError};
