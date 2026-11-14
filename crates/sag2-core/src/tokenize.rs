@@ -165,6 +165,35 @@ fn emit_block(block: &str, inside: bool, out: &mut Vec<String>) {
         out.extend(block.chars().map(|character| character.to_string()));
         return;
     }
+    // A block that mixes CJK and ASCII runs must be cut as one block: Python's
+    // `__cut_DAG` buffers consecutive single-character routes and runs
+    // `finalseg` over the whole buffer, so splitting at the script boundary
+    // changes the HMM input ("最多20个" is one word + "20" + "个" only when the
+    // digits stay in the buffer).
+    if block.chars().any(|character| matches!(class(character), Class::Cjk)) {
+        // Cut the block as one unit (the HMM buffer may span the script
+        // boundary), then hand every contiguous ASCII stretch to the patched
+        // `finalseg` model.  Python's finalseg splits a buffer at CJK runs and
+        // treats each ASCII stretch atomically (`sag2.py:45-48`), which is
+        // exactly `ascii_cut`; the DAG route inside an ASCII stretch cannot
+        // depend on the CJK text after it, so re-cutting the stretch is exact.
+        let mut ascii_run = String::new();
+        for word in JIEBA.cut(block, true) {
+            if word.chars().all(|character| class(character) == Class::Ascii) {
+                ascii_run.push_str(word);
+                continue;
+            }
+            if !ascii_run.is_empty() {
+                ascii_cut::cut_run(&ascii_run, out);
+                ascii_run.clear();
+            }
+            out.push(word.to_owned());
+        }
+        if !ascii_run.is_empty() {
+            ascii_cut::cut_run(&ascii_run, out);
+        }
+        return;
+    }
     // Keep dictionary words that straddle the ASCII/CJK split intact
     // (design §4.2: the only words that can cross the boundary).
     let mut segment_start = 0_usize;

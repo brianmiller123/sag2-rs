@@ -5,6 +5,7 @@ members = [
     "crates/sag2-core",
     "crates/sag2-rank-sys",
     "crates/sag2-index",
+    "crates/sag2",
     "crates/sag2-cli",
     "crates/sag2-linktest",
 ]

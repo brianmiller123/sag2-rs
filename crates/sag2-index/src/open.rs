@@ -111,6 +111,10 @@ pub enum RebuildPolicy {
 #[derive(Debug, Clone)]
 pub struct IndexOptions {
     pub chunk_chars: usize,
+    /// `index_workers` (`sag2.py:196`): documents are chunked and tokenised in
+    /// this many threads.  The inserted rows are byte-identical for every
+    /// value (design §2.5), so this is a throughput knob, not a format one.
+    pub index_workers: usize,
     pub source_dir: Option<PathBuf>,
     pub rebuild: RebuildPolicy,
 }
@@ -119,6 +123,7 @@ impl Default for IndexOptions {
     fn default() -> Self {
         IndexOptions {
             chunk_chars: DEFAULT_CHUNK_CHARS,
+            index_workers: 1,
             source_dir: None,
             rebuild: RebuildPolicy::Strict,
         }

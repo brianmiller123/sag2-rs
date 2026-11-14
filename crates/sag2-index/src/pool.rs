@@ -14,12 +14,13 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
+use sag2_core::quote_term;
 
 use crate::open::OpenError;
 use crate::py312;
 use crate::retrieve::{
-    decode_idfs, materialize, pruned_sql, quote_term, quoted_phrases, run_query, top_idf_indices,
-    Hit, QueryError, BASE_SQL, SAG_STATS_SQL,
+    decode_idfs, materialize, pruned_sql, quoted_phrases, run_query, top_idf_indices, Hit,
+    QueryError, BASE_SQL, SAG_STATS_SQL,
 };
 
 /// `sag2.py:35` `QUERY_WORKERS`.

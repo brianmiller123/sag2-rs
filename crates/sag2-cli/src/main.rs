@@ -1,7 +1,7 @@
 //! `sag2-cli` — command line entry points (design §2.1, §7.3).
 //!
-//! P2 ships one subcommand: `verify --gate A|B|D`, the replay half of the gate
-//! tooling.  Index/search/bench/dump arrive with the plans that give them
+//! P2 ships one subcommand: `verify --gate A|B|C|D`, the replay half of the
+//! gate tooling.  Index/search/bench/dump arrive with the plans that give them
 //! something to run.
 
 mod verify;

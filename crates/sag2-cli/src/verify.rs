@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Generator version this verifier understands.
-const GENERATOR_VERSION: &str = "0.7.1";
+const GENERATOR_VERSION: &str = "0.8.0";
 
 /// Minimum interpreter the goldens may come from (design §11 divergence D5).
 const REQUIRED_PYTHON: (u64, u64) = (3, 12);
@@ -83,6 +83,8 @@ struct Manifest {
     expansion: Option<ExpansionSpec>,
     #[serde(default)]
     freq: Option<FreqSpec>,
+    #[serde(default)]
+    search: Option<SearchSpec>,
 }
 
 /// Gate B's sort-key goldens (design §5.5).
@@ -469,8 +471,8 @@ pub fn verify(args: &[String]) -> ExitCode {
 }
 
 pub fn usage() -> &'static str {
-    "usage: sag2-cli verify --gate A|B|D --golden golden/ \
-     [--fixtures tokenizer,chunks,index,freq|sortkeys|expansion] [--reference <scripts>] \
+    "usage: sag2-cli verify --gate A|B|C|D --golden golden/ \
+     [--fixtures tokenizer,chunks,index,freq|sortkeys|expansion|search] [--reference <scripts>] \
      [--index-cache <dir>] [--index-dir <dir>] [--filter <substring>] \
      [--report report.json]"
 }
@@ -518,9 +520,10 @@ fn run(options: &Options) -> Result<ExitCode, String> {
     match options.gate.to_ascii_uppercase().as_str() {
         "A" => run_gate_a(options),
         "B" => run_gate_b(options),
+        "C" => run_gate_c(options),
         "D" => run_gate_d(options),
         other => Err(format!(
-            "gate {other} is not implemented; gates A, B and D have goldens"
+            "gate {other} is not implemented; gates A, B, C and D have goldens"
         )),
     }
 }
@@ -603,7 +606,14 @@ fn verify_manifest_files(
             return Err(format!("{} does not match the manifest sha256", file.path));
         }
         if let Some(expected_lines) = file.lines {
-            let lines = bytes.iter().filter(|byte| **byte == b'\n').count();
+            // A gzip-compressed JSONL golden is counted after decompression;
+            // the compressed byte stream has no meaningful newline count.
+            let data = if file.path.ends_with(".gz") {
+                gunzip(&path, &bytes)?
+            } else {
+                bytes.clone()
+            };
+            let lines = data.iter().filter(|byte| **byte == b'\n').count();
             if lines != expected_lines {
                 return Err(format!(
                     "{} has {lines} lines, manifest says {expected_lines}",
@@ -1358,6 +1368,7 @@ fn gate_d_index(
             &golden.fingerprint,
             sag2_index::IndexOptions {
                 chunk_chars: golden.chunk_chars,
+                index_workers: 1,
                 source_dir: source_dir.clone(),
                 rebuild: sag2_index::RebuildPolicy::Always,
             },
@@ -4182,6 +4193,725 @@ fn write_report(path: &Path, report: &serde_json::Value) {
     if let Err(error) = fs::write(path, rendered + "\n") {
         eprintln!("verify: cannot write {}: {error}", path.display());
     }
+}
+
+// ---------------------------------------------------------------------------
+// Gate C (search, design §1.3)
+// ---------------------------------------------------------------------------
+
+/// The manifest's Gate C section.
+#[derive(Deserialize)]
+struct SearchSpec {
+    cases: usize,
+    corpora: usize,
+    payloads: usize,
+    endpoint: String,
+    golden: String,
+    corpus_golden: String,
+}
+
+/// One `search_corpus.jsonl` line: the corpus and the index parameters a case
+/// runs against.
+#[derive(Deserialize)]
+struct SearchCorpus {
+    fixture: String,
+    fingerprint: String,
+    chunk_chars: usize,
+    corpus: Vec<SearchDocument>,
+}
+
+#[derive(Deserialize)]
+struct SearchDocument {
+    title: String,
+    text: String,
+    #[serde(default)]
+    path: Option<String>,
+    #[serde(default)]
+    idx: Option<String>,
+}
+
+/// The resolved `search_sag2` options a case ran with.
+#[derive(Deserialize)]
+struct SearchOptionsGolden {
+    candidate_k: usize,
+    seed_k: usize,
+    max_hops: u8,
+    expansion_term_limit: usize,
+}
+
+/// One `search.jsonl.gz` line.  C-1 compares `payloads`/`payloads_sha256`; C-2
+/// compares the result fields, which are kept as untyped JSON because they are
+/// compared field by field (`compare_json_exact`) rather than deserialised.
+#[derive(Deserialize)]
+struct SearchCase {
+    case_id: String,
+    fixture: String,
+    index_workers: usize,
+    query: String,
+    options: SearchOptionsGolden,
+    endpoint: String,
+    payloads: Vec<String>,
+    payloads_sha256: Vec<String>,
+    ranked_ids: Vec<i64>,
+    ranked_scores_bits: Vec<String>,
+    baseline_ids: Vec<i64>,
+    trace: serde_json::Value,
+    jev_usage: serde_json::Value,
+    algorithm: String,
+}
+
+fn read_search_cases(options: &Options, spec: &SearchSpec) -> Result<Vec<SearchCase>, String> {
+    let path = options.golden.join(&spec.golden);
+    let compressed = fs::read(&path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let data = gunzip(&path, &compressed)?;
+    let text = String::from_utf8(data)
+        .map_err(|error| format!("{} is not UTF-8: {error}", path.display()))?;
+    let mut cases = Vec::new();
+    for line in text.lines() {
+        let case: SearchCase =
+            serde_json::from_str(line).map_err(|error| format!("{}: {error}", path.display()))?;
+        if case.payloads.len() != case.payloads_sha256.len() {
+            return Err(format!(
+                "{}: case {} has {} payloads but {} digests",
+                path.display(),
+                case.case_id,
+                case.payloads.len(),
+                case.payloads_sha256.len()
+            ));
+        }
+        if case.ranked_ids.len() != case.ranked_scores_bits.len() {
+            return Err(format!(
+                "{}: case {} has {} ranked ids but {} scores",
+                path.display(),
+                case.case_id,
+                case.ranked_ids.len(),
+                case.ranked_scores_bits.len()
+            ));
+        }
+        if case.algorithm != "SAG2" {
+            return Err(format!(
+                "{}: case {} says algorithm {:?}, not SAG2",
+                path.display(),
+                case.case_id,
+                case.algorithm
+            ));
+        }
+        if !case.trace.is_array() || !case.jev_usage.is_object() {
+            return Err(format!(
+                "{}: case {} has a malformed trace or jev_usage",
+                path.display(),
+                case.case_id
+            ));
+        }
+        if case.endpoint != spec.endpoint {
+            return Err(format!(
+                "{}: case {} endpoints {:?} and {:?} disagree",
+                path.display(),
+                case.case_id,
+                case.endpoint,
+                spec.endpoint
+            ));
+        }
+        cases.push(case);
+    }
+    Ok(cases)
+}
+
+fn read_search_corpora(options: &Options, spec: &SearchSpec) -> Result<BTreeMap<String, SearchCorpus>, String> {
+    let path = options.golden.join(&spec.corpus_golden);
+    let text = fs::read_to_string(&path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let mut corpora = BTreeMap::new();
+    for line in text.lines() {
+        let corpus: SearchCorpus =
+            serde_json::from_str(line).map_err(|error| format!("{}: {error}", path.display()))?;
+        corpora.insert(corpus.fixture.clone(), corpus);
+    }
+    Ok(corpora)
+}
+
+/// `sag2.py:1036-1043` as the golden's C-2 shape.
+fn search_result_value(result: &sag2::SearchResult) -> serde_json::Value {
+    serde_json::json!({
+        "ranked_ids": result.candidates.iter().map(|c| c.hit.id).collect::<Vec<_>>(),
+        "ranked_scores_bits": result
+            .candidates
+            .iter()
+            .map(|c| hex_bits(c.jev_score))
+            .collect::<Vec<_>>(),
+        "baseline_ids": result.baseline.iter().map(|c| c.hit.id).collect::<Vec<_>>(),
+        "trace": result.trace.iter().map(trace_entry_value).collect::<Vec<_>>(),
+        "jev_usage": search_usage_value(&result.usage),
+        "algorithm": result.algorithm,
+    })
+}
+
+fn trace_entry_value(entry: &sag2::TraceEntry) -> serde_json::Value {
+    match entry {
+        sag2::TraceEntry::Retrieval(trace) => serde_json::json!({
+            "stage": trace.stage,
+            "hop": trace.hop,
+            "count": trace.count,
+            "candidate_document_ids": trace.candidate_document_ids,
+            "candidate_ids": trace.candidate_ids,
+            "terms": trace.terms,
+            "term_scores": trace.term_scores.iter().map(term_score_value).collect::<Vec<_>>(),
+            "expansion_queries": trace.expansion_queries.iter().map(expansion_query_value).collect::<Vec<_>>(),
+        }),
+        sag2::TraceEntry::Judge(trace) => serde_json::json!({
+            "stage": "jev",
+            "hop": trace.hop,
+            "count": trace.count,
+            "carried_seed_count": trace.carried_seed_count,
+            "protected_bm25_count": trace.protected_bm25_count,
+            "evidence_ids": trace.evidence_ids,
+            "scores": trace
+                .scores
+                .iter()
+                .map(|score| serde_json::json!({"id": score.id, "score_bits": hex_bits(score.score)}))
+                .collect::<Vec<_>>(),
+            "batches": trace.batches.iter().map(batch_value).collect::<Vec<_>>(),
+        }),
+    }
+}
+
+fn term_score_value(term: &sag2::ExpansionTerm) -> serde_json::Value {
+    let mut object = serde_json::Map::new();
+    object.insert("term".to_owned(), serde_json::json!(term.term));
+    object.insert("score_bits".to_owned(), serde_json::json!(hex_bits(term.score)));
+    object.insert(
+        "unweighted_score_bits".to_owned(),
+        serde_json::json!(hex_bits(term.unweighted_score)),
+    );
+    object.insert(
+        "seed_weight_bits".to_owned(),
+        serde_json::json!(hex_bits(term.seed_weight)),
+    );
+    object.insert(
+        "seed_jev_score_bits".to_owned(),
+        serde_json::json!(hex_bits(term.seed_jev_score)),
+    );
+    object.insert(
+        "term_frequency".to_owned(),
+        serde_json::json!(term.term_frequency),
+    );
+    object.insert(
+        "document_frequency".to_owned(),
+        serde_json::json!(term.document_frequency),
+    );
+    object.insert(
+        "query_context_score_bits".to_owned(),
+        serde_json::json!(hex_bits(term.query_context_score)),
+    );
+    object.insert(
+        "seed_document_id".to_owned(),
+        serde_json::json!(term.seed_document_id),
+    );
+    object.insert("kind".to_owned(), serde_json::json!(term.kind.as_str()));
+    if let Some(name) = &term.name {
+        object.insert("name".to_owned(), serde_json::json!(name));
+    }
+    serde_json::Value::Object(object)
+}
+
+fn expansion_query_value(query: &sag2::ExpansionQuery) -> serde_json::Value {
+    serde_json::json!({
+        "term": query.term,
+        "term_rank": query.term_rank,
+        "kind": query.kind.as_str(),
+        "match_expression": query.match_expression,
+        "ranking_expression": query.ranking_expression,
+        "retrieved_count": query.retrieved_count,
+        "selected": query
+            .selected
+            .iter()
+            .map(|selected| serde_json::json!({
+                "document_id": selected.document_id,
+                "bm25_rank": selected.bm25_rank,
+                "bm25_score_bits": hex_bits(selected.bm25_score),
+            }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn batch_value(batch: &sag2::BatchDetail) -> serde_json::Value {
+    serde_json::json!({
+        "candidate_count": batch.candidate_count,
+        "estimated_input_tokens": batch.estimated_input_tokens,
+        "request_attempts": batch.request_attempts,
+        "http_attempts": batch.http_attempts,
+        "failed_attempts": json_from_sag2(&sag2_json::Value::Object(batch.failed_attempts.clone())),
+        "input_tokens": batch.input_tokens,
+        "output_tokens": batch.output_tokens,
+        "model": batch.model,
+    })
+}
+
+fn search_usage_value(usage: &sag2::Usage) -> serde_json::Value {
+    let batches: Vec<serde_json::Value> = usage
+        .batches
+        .iter()
+        .map(|batch| {
+            let mut value = batch_value(&batch.detail);
+            value
+                .as_object_mut()
+                .expect("batch_value is an object")
+                .insert("hop".to_owned(), serde_json::json!(batch.hop));
+            value
+        })
+        .collect();
+    serde_json::json!({
+        "requests": usage.requests,
+        "judgments": usage.judgments,
+        "input_tokens": usage.input_tokens,
+        "output_tokens": usage.output_tokens,
+        "batches": batches,
+    })
+}
+
+fn json_from_sag2(value: &sag2_json::Value) -> serde_json::Value {
+    serde_json::from_str(&sag2_json::compact_json(value))
+        .expect("sag2-json output is valid JSON")
+}
+
+/// The first byte at which two payloads differ (the gate's failure evidence).
+fn first_byte_difference(expected: &[u8], actual: &[u8]) -> Option<usize> {
+    let common = expected.len().min(actual.len());
+    for offset in 0..common {
+        if expected[offset] != actual[offset] {
+            return Some(offset);
+        }
+    }
+    (expected.len() != actual.len()).then_some(common)
+}
+
+/// The JSON pointer of the first semantic difference, as design §1.3 asks for
+/// (`/questions/candidate_12`).  Byte comparison remains the gate; this only
+/// makes the failure readable.
+fn first_json_pointer(expected: &str, actual: &str) -> Option<String> {
+    let expected: serde_json::Value = serde_json::from_str(expected).ok()?;
+    let actual: serde_json::Value = serde_json::from_str(actual).ok()?;
+    pointer_difference("", &expected, &actual)
+}
+
+fn pointer_difference(
+    prefix: &str,
+    expected: &serde_json::Value,
+    actual: &serde_json::Value,
+) -> Option<String> {
+    if expected == actual {
+        return None;
+    }
+    match (expected, actual) {
+        (serde_json::Value::Object(expected), serde_json::Value::Object(actual)) => {
+            let mut keys: BTreeSet<&str> = expected.keys().map(String::as_str).collect();
+            keys.extend(actual.keys().map(String::as_str));
+            for key in keys {
+                let escaped = key.replace('~', "~0").replace('/', "~1");
+                let pointer = format!("{prefix}/{escaped}");
+                match (expected.get(key), actual.get(key)) {
+                    (Some(left), Some(right)) => {
+                        if let Some(found) = pointer_difference(&pointer, left, right) {
+                            return Some(found);
+                        }
+                    }
+                    _ => return Some(pointer),
+                }
+            }
+            None
+        }
+        (serde_json::Value::Array(expected), serde_json::Value::Array(actual)) => {
+            for position in 0..expected.len().max(actual.len()) {
+                let pointer = format!("{prefix}/{position}");
+                match (expected.get(position), actual.get(position)) {
+                    (Some(left), Some(right)) => {
+                        if let Some(found) = pointer_difference(&pointer, left, right) {
+                            return Some(found);
+                        }
+                    }
+                    _ => return Some(pointer),
+                }
+            }
+            None
+        }
+        _ => Some(prefix.to_owned()),
+    }
+}
+
+/// C-1: compare the payload count, every payload byte and every journal digest
+/// (`sag2.py:49`).  Returns `(payloads, equal bytes, equal digests, diffs)`.
+fn compare_payloads(
+    case: &SearchCase,
+    recorded: &[Vec<u8>],
+    failures: &mut Vec<Failure>,
+) -> (usize, usize, usize, usize) {
+    let prefix = |index: usize| format!("payloads[{index}]");
+    if recorded.len() != case.payloads.len() {
+        push_gate_failure(
+            failures,
+            &case.case_id,
+            "payloads.len",
+            case.payloads.len().to_string(),
+            recorded.len().to_string(),
+        );
+    }
+    let mut diffs = usize::from(recorded.len() != case.payloads.len());
+    let mut equal = 0_usize;
+    let mut digests_equal = 0_usize;
+    let compared = recorded.len().min(case.payloads.len());
+    for (index, actual) in recorded.iter().enumerate().take(compared) {
+        let expected = case.payloads[index].as_bytes();
+        if expected == actual {
+            equal += 1;
+        } else {
+            diffs += 1;
+            let offset = first_byte_difference(expected, actual).unwrap_or(0);
+            let pointer = first_json_pointer(&case.payloads[index], &String::from_utf8_lossy(actual))
+                .unwrap_or_else(|| "?".to_owned());
+            push_gate_failure(
+                failures,
+                &case.case_id,
+                format!("{} (byte {offset}, {pointer})", prefix(index)),
+                display_text(&case.payloads[index]),
+                display_text(&String::from_utf8_lossy(actual)),
+            );
+        }
+        if let Some(expected_digest) = case.payloads_sha256.get(index) {
+            let mut input = String::from("[");
+            input.push_str(&sag2_json::compact_json(&sag2_json::Value::Str(
+                case.endpoint.clone(),
+            )));
+            input.push(',');
+            input.push_str(&String::from_utf8_lossy(actual));
+            input.push(']');
+            let digest = sha256_hex(input.as_bytes());
+            if &digest == expected_digest {
+                digests_equal += 1;
+            } else {
+                diffs += 1;
+                push_gate_failure(
+                    failures,
+                    &case.case_id,
+                    format!("payloads_sha256[{index}]"),
+                    expected_digest.clone(),
+                    digest,
+                );
+            }
+        }
+    }
+    (compared, equal, digests_equal, diffs)
+}
+
+/// Gate C `search`: replay `search_sag2` under `OracleJudge` and compare both
+/// halves design §1.3 requires - the request payload bytes (C-1) and the result
+/// object (C-2).  `elapsed_ms` is the only excluded field and is declared in
+/// the report.
+fn run_gate_c(options: &Options) -> Result<ExitCode, String> {
+    let manifest = preflight(options)?;
+    let spec = manifest
+        .search
+        .as_ref()
+        .ok_or_else(|| "manifest has no search section".to_owned())?;
+    verify_manifest_files(
+        options,
+        &manifest,
+        &[spec.golden.as_str(), spec.corpus_golden.as_str()],
+    )?;
+
+    let corpora = read_search_corpora(options, spec)?;
+    if corpora.len() != spec.corpora {
+        return Err(format!(
+            "golden inconsistency: {} holds {} corpora, manifest says {}",
+            spec.corpus_golden,
+            corpora.len(),
+            spec.corpora
+        ));
+    }
+    let cases = read_search_cases(options, spec)?;
+    if cases.len() != spec.cases {
+        return Err(format!(
+            "golden inconsistency: {} holds {} cases, manifest says {}",
+            spec.golden,
+            cases.len(),
+            spec.cases
+        ));
+    }
+    let payload_total: usize = cases.iter().map(|case| case.payloads.len()).sum();
+    if payload_total != spec.payloads {
+        return Err(format!(
+            "golden inconsistency: {} payloads recorded, manifest says {}",
+            payload_total, spec.payloads
+        ));
+    }
+    for case in &cases {
+        if !corpora.contains_key(&case.fixture) {
+            return Err(format!(
+                "golden inconsistency: case {} uses corpus {} with no definition",
+                case.case_id, case.fixture
+            ));
+        }
+    }
+
+    let selected: Vec<&SearchCase> = match &options.fixtures {
+        None => cases.iter().collect(),
+        Some(fixtures) => {
+            for fixture in fixtures {
+                if !matches!(fixture.as_str(), "search" | "C0" | "C3" | "C4")
+                    && !fixture.starts_with("w")
+                {
+                    return Err(format!(
+                        "gate C fixture {fixture} is not implemented; the search section \
+                         covers C0, C3 and C4"
+                    ));
+                }
+            }
+            cases
+                .iter()
+                .filter(|case| {
+                    fixtures.iter().any(|fixture| {
+                        fixture == "search"
+                            || fixture == &case.fixture
+                            || fixture == &format!("w{}", case.index_workers)
+                    })
+                })
+                .collect()
+        }
+    };
+    let selected: Vec<&SearchCase> = match &options.filter {
+        None => selected,
+        Some(filter) => selected
+            .into_iter()
+            .filter(|case| case.case_id.contains(filter.as_str()))
+            .collect(),
+    };
+    if selected.is_empty() {
+        return Err(format!(
+            "no Gate C cases selected from {}",
+            options.golden.join(&spec.golden).display()
+        ));
+    }
+
+    // `--index-dir` keeps the built indexes for inspection; without it they
+    // live in a temporary directory that dies with the run.
+    let temporary;
+    let directory: PathBuf = match &options.index_dir {
+        Some(directory) => {
+            fs::create_dir_all(directory)
+                .map_err(|error| format!("cannot create {}: {error}", directory.display()))?;
+            directory.clone()
+        }
+        None => {
+            temporary = tempfile::tempdir()
+                .map_err(|error| format!("cannot create the Gate C index directory: {error}"))?;
+            temporary.path().to_path_buf()
+        }
+    };
+    let mut indexes: BTreeMap<(String, usize), CorpusIndex> = BTreeMap::new();
+    for case in &selected {
+        let key = (case.fixture.clone(), case.index_workers);
+        if indexes.contains_key(&key) {
+            continue;
+        }
+        let corpus = corpora.get(&case.fixture).ok_or_else(|| {
+            format!(
+                "golden inconsistency: case {} uses corpus {} with no definition",
+                case.case_id, case.fixture
+            )
+        })?;
+        let documents: Vec<sag2_index::Document> = corpus
+            .corpus
+            .iter()
+            .map(|document| sag2_index::Document {
+                title: &document.title,
+                text: &document.text,
+                path: document.path.as_deref(),
+                idx: document.idx.as_deref(),
+            })
+            .collect();
+        let path = directory.join(format!("{}-w{}.sqlite", case.fixture, case.index_workers));
+        let (index, _) = sag2_index::CorpusIndex::open(
+            &path,
+            &documents,
+            &corpus.fingerprint,
+            sag2_index::IndexOptions {
+                chunk_chars: corpus.chunk_chars,
+                index_workers: case.index_workers,
+                source_dir: None,
+                rebuild: sag2_index::RebuildPolicy::Always,
+            },
+        )
+        .map_err(|error| {
+            format!(
+                "cannot build the {} corpus at index_workers={}: {error}",
+                case.fixture, case.index_workers
+            )
+        })?;
+        indexes.insert(key, index);
+    }
+    println!(
+        "gate C: {} cases, {} corpora, {} indexes built",
+        selected.len(),
+        corpora.len(),
+        indexes.len()
+    );
+
+    let mut failures: Vec<Failure> = Vec::new();
+    let mut per_fixture: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    let mut payloads_compared = 0_usize;
+    let mut payloads_equal = 0_usize;
+    let mut digests_equal = 0_usize;
+    let mut c1_passed = 0_usize;
+    let mut c2_passed = 0_usize;
+    for case in &selected {
+        let index = indexes
+            .get(&(case.fixture.clone(), case.index_workers))
+            .ok_or_else(|| format!("{}: its index was not built", case.case_id))?;
+        let judge = sag2::BatchedJudge::new(sag2::OracleJudge::new());
+        let options = sag2::SearchOptions {
+            candidate_k: case.options.candidate_k,
+            seed_k: case.options.seed_k,
+            max_hops: case.options.max_hops,
+            expansion_term_limit: case.options.expansion_term_limit,
+            context: None,
+        };
+        let result = match sag2::search(index, &judge, &case.query, &options) {
+            Ok(result) => result,
+            Err(error) => {
+                push_gate_failure(
+                    &mut failures,
+                    &case.case_id,
+                    "search",
+                    "Ok",
+                    format!("{error}"),
+                );
+                let entry = per_fixture
+                    .entry(format!("{} w{}", case.fixture, case.index_workers))
+                    .or_insert((0, 0));
+                entry.0 += 1;
+                continue;
+            }
+        };
+        let recorded = judge.transport().payloads();
+        let (compared, equal, digests, c1_diffs) =
+            compare_payloads(case, &recorded, &mut failures);
+        payloads_compared += compared;
+        payloads_equal += equal;
+        digests_equal += digests;
+        if c1_diffs == 0 {
+            c1_passed += 1;
+        }
+        let expected = serde_json::json!({
+            "ranked_ids": case.ranked_ids,
+            "ranked_scores_bits": case.ranked_scores_bits,
+            "baseline_ids": case.baseline_ids,
+            "trace": case.trace,
+            "jev_usage": case.jev_usage,
+            "algorithm": case.algorithm,
+        });
+        let actual = search_result_value(&result);
+        let mut gate = GateFailures::new(&mut failures);
+        compare_json_exact(&case.case_id, "result", &expected, &actual, &mut gate);
+        let c2_ok = gate.diffs == 0;
+        if c2_ok {
+            c2_passed += 1;
+        }
+        let entry = per_fixture
+            .entry(format!("{} w{}", case.fixture, case.index_workers))
+            .or_insert((0, 0));
+        entry.0 += 1;
+        if c1_diffs == 0 && c2_ok {
+            entry.1 += 1;
+        }
+    }
+
+    let passed: usize = per_fixture.values().map(|(_, passed)| passed).sum();
+    println!(
+        "{:<12} {:>7} {:>7} {:>7}",
+        "fixture", "cases", "passed", "failed"
+    );
+    for (fixture, (total, passed)) in &per_fixture {
+        println!(
+            "{:<12} {:>7} {:>7} {:>7}",
+            fixture,
+            total,
+            passed,
+            total - passed
+        );
+    }
+    println!(
+        "gate C: {} cases, {} passed, {} failed; C-1 {}/{} cases, {}/{} payload bytes, \
+         {}/{} digests; C-2 {}/{} cases",
+        selected.len(),
+        passed,
+        selected.len() - passed,
+        c1_passed,
+        selected.len(),
+        payloads_equal,
+        payloads_compared,
+        digests_equal,
+        payloads_compared,
+        c2_passed,
+        selected.len()
+    );
+    for failure in failures.iter().take(10) {
+        println!(
+            "  {} {}: expected {}, got {}",
+            failure.case_id, failure.path, failure.expected, failure.actual
+        );
+    }
+
+    let report = serde_json::json!({
+        "golden": {
+            "dir": options.golden.display().to_string(),
+            "generated_by": format!("export_golden.py@{}", manifest.generator_version),
+            "python": manifest.python,
+            "sqlite": manifest.sqlite,
+            "runtime_sqlite": sag2_index::sqlite_version(),
+            "reference": {
+                "dir": options.reference.display().to_string(),
+                "commit": manifest.reference.commit,
+            },
+        },
+        "toolchain": {
+            "sqlite_allowlist": SQLITE_ALLOWLIST,
+            "jieba": manifest.jieba,
+            "pyuca": manifest.pyuca,
+            "unicode": manifest.unicode,
+            "tiktoken": "o200k_base",
+        },
+        "tolerances": {"level": "S", "f64": "bits", "ids": "exact"},
+        "gates": {"C": {
+            "cases": selected.len(),
+            "passed": passed,
+            "failed": selected.len() - passed,
+            "payloads": payloads_compared,
+            "payload_bytes_equal": payloads_equal,
+            "payload_digests_equal": digests_equal,
+            "subchecks": {
+                "c1_payloads": {"cases": selected.len(), "passed": c1_passed},
+                "c2_result": {"cases": selected.len(), "passed": c2_passed},
+            },
+            "fixtures": per_fixture.iter().map(|(fixture, (total, passed))| {
+                serde_json::json!({"fixture": fixture, "cases": total, "passed": passed})
+            }).collect::<Vec<_>>(),
+            "index_workers": indexes.keys().map(|(fixture, workers)| {
+                serde_json::json!({"fixture": fixture, "index_workers": workers})
+            }).collect::<Vec<_>>(),
+        }},
+        "excluded_fields": ["elapsed_ms"],
+        "excluded_checks": ["db_physical_bytes"],
+        "failures": failures,
+        "ulp_flips": [],
+        "unsupported": [],
+    });
+    write_report(&options.report, &report);
+
+    Ok(if failures_empty(&report) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(2)
+    })
 }
 
 #[cfg(test)]

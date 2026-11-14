@@ -14,7 +14,8 @@ Design authority: `../SAG2-Rust-移植设计.md` (§1.0 comparison functions,
 | `sag2-rank-sys` | vendored `sag_rank.c` (FTS5 `sag_stats`/`sag_bm25`) built with `-DSQLITE_CORE -DSAG_STATIC` into a static archive, plus a safe `register` wrapper |
 | `sag2-linktest` | independent downstream package proving the static archive links against `rusqlite`'s bundled SQLite 3.50.2 |
 | `sag2-index` | index access and construction: `metadata.signature`, the §3.4 open decision table, the Python schema/statistics/provenance build, cached statistics and `retrieve` with the reference pruning, LRU and epoch semantics |
-| `sag2-cli` | `verify --gate A|D`: replay of the golden retrieve cases and the tokenizer/chunk/index gates |
+| `sag2` | orchestration: `rank_dpp` (§9 R5 compensated sums), the judge payload builder and `search_sag2` (§1.3, §8) |
+| `sag2-cli` | `verify --gate A|B|C|D`: replay of the golden retrieve/search cases and the tokenizer/chunk/index gates |
 
 ```sh
 cargo build --workspace
@@ -53,6 +54,32 @@ cargo run -p sag2-cli -- verify --gate B --fixtures sortkeys,expansion --golden 
   reach on a corpus that contains its own terms). Records compare the ordered
   `terms`, `term_scores` (every `f64` by bits), `queries[].ranking_expression`
   byte for byte, `selected[]` and the interleaved `hits`.
+
+## Gate C (design §1.3, §8, §9 R5)
+
+```sh
+cargo run -p sag2-cli -- verify --gate C --fixtures search --golden golden/
+```
+
+`golden/search.jsonl.gz` holds one case per `search_sag2` run: C0's four frozen
+queries and options at `index_workers` 1 **and** 4, C4's twenty heading queries
+and C3's fifty generated queries at 1. Each case carries both halves §1.3
+compares:
+
+* **C-1** every request payload as the exact `compact_json` string plus the
+  `sha256(compact_json([endpoint, payload]))` the journal keys on, compared
+  byte for byte (a failure reports the first differing byte and its JSON
+  pointer); and
+* **C-2** `ranked_ids`/`ranked_scores_bits`, `baseline_ids`, every trace record
+  (stage sequence, candidate/document ids, `terms`, `term_scores`, expansion
+  queries, `evidence_ids`, per-round scores and batches) and `jev_usage`
+  (counters plus each batch's `estimated_input_tokens`/`candidate_count`).
+
+`elapsed_ms` is the only excluded field and is declared in `excluded_fields`.
+The indexes are built by this crate from `golden/search_corpus.jsonl`, so the
+`index_workers` dimension proves the parallel build is equivalent. The judge is
+the reference's fixed `OracleJev` (`tests/test_sag2.py:31-62`), so no network is
+involved; `tiktoken-rs`'s embedded `o200k_base` produces the token budget.
 
 ## Gate D (design §1.4, §4.4)
 

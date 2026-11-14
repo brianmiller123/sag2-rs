@@ -13,7 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, Transaction};
-use sag2_core::{chunk_document, tokenize, utf16_length};
+use sag2_core::{chunk_document, diversity_tokens, tokenize, utf16_length};
 use sag2_json::{compact_json, Object, Value};
 use sha2::{Digest, Sha256};
 
@@ -149,7 +149,7 @@ pub fn build(
 
     let mut seen: HashSet<String> = HashSet::new();
     let mut statistics_documents: Vec<StatisticDocument> = Vec::new();
-    let mut chunk_id = 0_i64;
+    let mut pending: Vec<PendingDocument> = Vec::new();
     for (position, document) in corpus.iter().enumerate() {
         let title = py_strip(document.title).to_owned();
         let (content, source_sha256, source_path) = match options.source_dir.as_deref() {
@@ -211,14 +211,21 @@ pub fn build(
         let source_id = source_index
             .rsplit_once('_')
             .map_or_else(|| source_index.clone(), |(left, _)| left.to_owned());
-        let chunks = chunk_document(
-            &content,
-            options.chunk_chars,
-            document.path.or(Some("document.txt")),
-        );
-        for chunk in chunks {
+        pending.push(PendingDocument {
+            position,
+            title,
+            content,
+            full_doc,
+            source_id,
+            chunk_path: document.path.map(str::to_owned),
+        });
+    }
+
+    let mut chunk_id = 0_i64;
+    for prepared in prepare_documents(&pending, options.chunk_chars, options.index_workers) {
+        for chunk in &prepared.chunks {
             chunk_id += 1;
-            let document_id = (position + 1) as i64;
+            let document_id = (prepared.position + 1) as i64;
             let spans = spans_json(&chunk.spans);
             let characters = utf16_length(&chunk.content) as i64;
             if contentless {
@@ -227,32 +234,32 @@ pub fn build(
                 chunk_statement.execute(rusqlite::params![
                     chunk_id,
                     document_id,
-                    title,
-                    chunk.heading,
+                    &prepared.title,
+                    &chunk.heading,
                     start,
                     end,
                     spans,
                     characters,
-                    source_id
+                    &prepared.source_id
                 ])?;
             } else {
                 chunk_statement.execute(rusqlite::params![
                     chunk_id,
                     document_id,
-                    title,
-                    chunk.heading,
-                    chunk.content,
-                    full_doc,
+                    &prepared.title,
+                    &chunk.heading,
+                    &chunk.content,
+                    &prepared.full_doc,
                     spans,
                     characters,
-                    source_id
+                    &prepared.source_id
                 ])?;
             }
             fts_statement.execute(rusqlite::params![
                 chunk_id,
-                join_tokens(&title),
-                join_tokens(&chunk.heading),
-                join_tokens(&chunk.content)
+                &prepared.title_tokens,
+                &chunk.heading_tokens,
+                &chunk.body_tokens
             ])?;
         }
     }
@@ -280,6 +287,94 @@ struct StatisticDocument {
     title: String,
     text: String,
     path: Option<String>,
+}
+
+/// One document whose chunking and FTS tokenisation still has to run: the part
+/// `_prepare_index_document` parallelises (`sag2.py:163-175`, `:274-282`).
+struct PendingDocument {
+    position: usize,
+    title: String,
+    content: String,
+    full_doc: String,
+    source_id: String,
+    chunk_path: Option<String>,
+}
+
+struct PreparedChunk {
+    heading: String,
+    content: String,
+    spans: Vec<(usize, usize)>,
+    heading_tokens: String,
+    body_tokens: String,
+}
+
+struct PreparedDocument {
+    position: usize,
+    title: String,
+    full_doc: String,
+    source_id: String,
+    title_tokens: String,
+    chunks: Vec<PreparedChunk>,
+}
+
+fn prepare_document(document: &PendingDocument, chunk_chars: usize) -> PreparedDocument {
+    let chunks = chunk_document(
+        &document.content,
+        chunk_chars,
+        document.chunk_path.as_deref().or(Some("document.txt")),
+    );
+    PreparedDocument {
+        position: document.position,
+        title: document.title.clone(),
+        full_doc: document.full_doc.clone(),
+        source_id: document.source_id.clone(),
+        title_tokens: join_tokens(&document.title),
+        chunks: chunks
+            .into_iter()
+            .map(|chunk| PreparedChunk {
+                heading_tokens: join_tokens(&chunk.heading),
+                body_tokens: join_tokens(&chunk.content),
+                heading: chunk.heading,
+                content: chunk.content,
+                spans: chunk.spans,
+            })
+            .collect(),
+    }
+}
+
+/// `index_workers` contiguous slices, reassembled in corpus order so the
+/// inserted rows are byte-identical to the single-threaded build (design §2.5:
+/// `index_workers > 1` may only change throughput).
+fn prepare_documents(
+    documents: &[PendingDocument],
+    chunk_chars: usize,
+    index_workers: usize,
+) -> Vec<PreparedDocument> {
+    let workers = index_workers.max(1).min(documents.len().max(1));
+    if workers <= 1 {
+        return documents
+            .iter()
+            .map(|document| prepare_document(document, chunk_chars))
+            .collect();
+    }
+    let stride = documents.len().div_ceil(workers);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = documents
+            .chunks(stride)
+            .map(|slice| {
+                scope.spawn(move || {
+                    slice
+                        .iter()
+                        .map(|document| prepare_document(document, chunk_chars))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("an index worker panicked"))
+            .collect()
+    })
 }
 
 fn spans_json(spans: &[(usize, usize)]) -> String {
@@ -439,28 +534,6 @@ fn write_rust_metadata(
     Ok(())
 }
 
-/// `sag2.py:122` `diversity_tokens`: `re.findall(r"[^\W_]+", text.casefold())`.
-///
-/// `[^\W_]` is Python's `str.isalnum()`; for every code point assigned in
-/// Unicode 15.0 that equals `\p{L}` or `\p{N}`, the tables Gate D certifies.
-fn diversity_tokens(text: &str) -> Vec<String> {
-    let folded = sag2_core::casefold(text);
-    let mut tokens = Vec::new();
-    let mut current = String::new();
-    for character in folded.chars() {
-        let scalar = character as u32;
-        if sag2_core::is_letter(scalar) || sag2_core::is_number(scalar) {
-            current.push(character);
-        } else if !current.is_empty() {
-            tokens.push(std::mem::take(&mut current));
-        }
-    }
-    if !current.is_empty() {
-        tokens.push(current);
-    }
-    tokens
-}
-
 /// `sag2.py:110-119` `fold_latin_accents`.
 ///
 /// The only property the reference reads from the Unicode database beyond
@@ -584,6 +657,7 @@ mod tests {
     fn materialised(chunk_chars: usize) -> IndexOptions {
         IndexOptions {
             chunk_chars,
+            index_workers: 1,
             source_dir: None,
             rebuild: RebuildPolicy::Always,
         }
@@ -717,6 +791,7 @@ mod tests {
         let path = directory.path().join("index.sqlite");
         let options = IndexOptions {
             chunk_chars: 512,
+            index_workers: 1,
             source_dir: Some(directory.path().to_owned()),
             rebuild: RebuildPolicy::Always,
         };
@@ -760,6 +835,71 @@ mod tests {
     }
 
     #[test]
+    fn index_workers_do_not_change_the_built_rows() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        // Distinct rows, so the dedup path stays out of the way.
+        let texts: Vec<String> = (0..12)
+            .map(|position| {
+                format!(
+                    "# Heading\n\nThe gate compares every row (document {position}).\n\n\
+                     ## Second\n\nIt also compares the index."
+                )
+            })
+            .collect();
+        let corpus: Vec<Document> = texts
+            .iter()
+            .map(|text| Document {
+                title: "Guide",
+                text,
+                path: None,
+                idx: None,
+            })
+            .collect();
+        let mut snapshots = Vec::new();
+        for workers in [1_usize, 4] {
+            let path = directory.path().join(format!("w{workers}.sqlite"));
+            let options = IndexOptions {
+                chunk_chars: 512,
+                index_workers: workers,
+                source_dir: None,
+                rebuild: RebuildPolicy::Always,
+            };
+            build(&path, &corpus, "fixture", &options, &RUNTIME_VERSIONS).expect("build");
+            let db = Connection::open(&path).expect("open");
+            let chunks: Vec<(i64, i64, String, String, String, i64)> = db
+                .prepare("SELECT id,document_id,title,heading,content,characters FROM chunks ORDER BY id")
+                .expect("prepare")
+                .query_map([], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                })
+                .expect("query")
+                .collect::<Result<_, _>>()
+                .expect("rows");
+            let fts: Vec<(i64, String, String, String)> = db
+                .prepare("SELECT rowid,title,heading,body FROM chunk_fts ORDER BY rowid")
+                .expect("prepare")
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .expect("query")
+                .collect::<Result<_, _>>()
+                .expect("rows");
+            let statistics: String = db
+                .query_row("SELECT data FROM index_statistics", [], |row| row.get(0))
+                .expect("statistics");
+            snapshots.push((chunks, fts, statistics));
+        }
+        assert_eq!(snapshots[0], snapshots[1]);
+    }
+
+    #[test]
     fn folds_latin_accents_but_keeps_non_latin_marks() {
         assert_eq!(fold_latin_accents("zürich"), "zurich");
         assert_eq!(fold_latin_accents("Ångström"), "Angstrom");
@@ -768,13 +908,5 @@ mod tests {
         assert!(is_latin_name('A' as u32));
         assert!(is_latin_name('é' as u32));
         assert!(!is_latin_name('Ω' as u32));
-    }
-
-    #[test]
-    fn diversity_tokens_are_alnum_runs_after_casefold() {
-        assert_eq!(
-            diversity_tokens("A.H.G. half-ounce_日本"),
-            ["a", "h", "g", "half", "ounce", "日本"]
-        );
     }
 }

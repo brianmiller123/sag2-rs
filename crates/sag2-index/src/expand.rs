@@ -17,10 +17,10 @@
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
-use sag2_core::names;
+use sag2_core::{names, quote_term};
 use sag2_json::{compact_json, Value};
 
-use crate::retrieve::{quote_term, QueryError};
+use crate::retrieve::QueryError;
 use crate::pool::QUERY_WORKERS;
 use crate::CorpusIndex;
 
@@ -99,6 +99,11 @@ pub struct ExpansionQuery {
 }
 
 /// One `hits[]` entry: the retrieved row plus the §1.2 attribution fields.
+///
+/// Python merges the chunk row and the attribution into one dict
+/// (`sag2.py:741-746`); `hit` is that row and the three fields after it are the
+/// attribution Gate B compares.  `search_sag2` needs the full row (the judge
+/// payload reads `title`/`heading`/`content`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExpansionHit {
     pub id: i64,
@@ -107,6 +112,7 @@ pub struct ExpansionHit {
     pub expansion_term: String,
     pub expansion_term_rank: usize,
     pub expansion_bm25_rank: usize,
+    pub hit: crate::retrieve::Hit,
 }
 
 /// A failure of the expansion path.
@@ -305,6 +311,12 @@ impl CorpusIndex {
         } else {
             Ok(source.to_owned())
         }
+    }
+
+    /// `sag2.py:420-421`: `match_query(self.repair_names(query, set()))`.
+    pub fn match_query(&self, query: &str) -> Result<String, ExpansionError> {
+        let repaired = self.repair_names(query, &BTreeSet::new())?;
+        Ok(sag2_core::match_query(&repaired))
     }
 
     /// `sag2.py:585-663` `expansion_terms`.
@@ -607,6 +619,7 @@ impl CorpusIndex {
                     expansion_term: resolved[position].term.clone(),
                     expansion_term_rank: position + 1,
                     expansion_bm25_rank: rank + 1,
+                    hit: hit.clone(),
                 });
                 queries[position].selected.push(Selected {
                     document_id: hit.document_id,

@@ -36,6 +36,7 @@ pub use open::{
     TOKENIZER_VERSION, UCA_KEYS_SHA256, UCA_VERSION, UNICODE_VERSION,
 };
 pub use pool::{register_rank, QueryOptions, QUERY_CACHE_ENTRIES, QUERY_WORKERS};
+pub use py312::sum as py312_sum;
 pub use retrieve::{Hit, QueryError, BASE_SQL, SAG_STATS_SQL};
 pub use sag2_core::DEFAULT_CHUNK_CHARS;
 pub use signature::{changed_field, signature, CHUNK_POLICY, INDEX_SCHEMA};

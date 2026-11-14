@@ -13,7 +13,9 @@ mod ascii_cut;
 mod chunk;
 mod collate;
 mod dict;
+mod diversity;
 pub mod names;
+mod query;
 mod tokenize;
 mod unicode;
 
@@ -22,6 +24,8 @@ pub use collate::sort_key;
 pub use dict::{
     anchor_every, contains as freq_contains, max_key_chars, short_entries, short_entry_count,
 };
+pub use diversity::diversity_tokens;
+pub use query::{match_query, quote_term};
 pub use tokenize::tokenize;
 pub use unicode::{
     casefold, combining_class, is_letter, is_mark, is_number, is_space, is_uppercase, is_word, lower,

@@ -35,6 +35,24 @@ fn frozen_reference_tokenizer_lines() {
 }
 
 #[test]
+fn mixed_script_blocks_keep_one_hmm_buffer() {
+    // Python's `__cut_DAG` buffers consecutive single-character routes and runs
+    // `finalseg` over the whole buffer; "最多20个" is therefore one word, "20"
+    // and "个", not "最"+"多" followed by a separate ASCII cut.
+    assert_eq!(tokens("选出最多20个"), ["选出", "最多", "20", "个"]);
+    assert_eq!(
+        tokens("方法流程 选出最多20个扩展词项"),
+        ["方法", "流程", "选出", "最多", "20", "个", "扩展", "词项"]
+    );
+    // A contiguous ASCII stretch inside a mixed block still follows the patched
+    // `finalseg` (`%` left-end rule applies here too).
+    assert_eq!(
+        tokens("enterpriserag-bench共511 962"),
+        ["enterpriserag", "bench", "enterpriserag-bench", "共", "511", "962"]
+    );
+}
+
+#[test]
 fn a_percent_ends_the_leftmost_ascii_run() {
     assert_eq!(
         tokens("paper-arXiv%3A2610.22588-18181b"),

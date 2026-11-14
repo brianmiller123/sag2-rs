@@ -143,6 +143,7 @@ fn format_version_mismatch_is_refused_and_never_rebuilds() {
     ] {
         let options = IndexOptions {
             chunk_chars: 2200,
+            index_workers: 1,
             source_dir: None,
             rebuild,
         };
@@ -181,6 +182,7 @@ fn foreign_database_is_refused_instead_of_dropped() {
 
     let strict = IndexOptions {
         chunk_chars: 2200,
+        index_workers: 1,
         source_dir: None,
         rebuild: RebuildPolicy::Strict,
     };
@@ -222,6 +224,7 @@ fn signature_mismatch_follows_the_policy() {
     // The stored signature is `["fixture",2200,...]`; ask for another corpus.
     let strict = IndexOptions {
         chunk_chars: 2200,
+        index_workers: 1,
         source_dir: None,
         rebuild: RebuildPolicy::Strict,
     };

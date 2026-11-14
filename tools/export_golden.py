@@ -49,6 +49,12 @@ Outputs (all under ``--out``, default ``golden/``):
     carrying the replay inputs (seeds, base expression, excluded ids, limits)
     and the ordered ``terms`` / ``term_scores`` / ``queries`` / ``hits`` the
     reference produced for that hop
+``search.jsonl.gz``, ``search_corpus.jsonl``
+    Gate C's frozen judge trace (design §1.3): one line per search case with
+    the byte-exact request payloads, their journal digests, the ranked
+    candidates, the trace records and the judge usage; and the corpus + chunk
+    parameters each case's index is built from (C0 at ``index_workers`` 1 and
+    4, C4 and C3 at 1)
 ``freq_keys.txt.gz``, ``freq_probes.jsonl``
     Gate D's `freq` section (design §4.1 rule 5): every short (<= 3 code point)
     positive ``TOKENIZER.FREQ`` key in UTF-8 byte order, and sampled keys with
@@ -107,7 +113,7 @@ if os.environ.get("PYTHONHASHSEED") != "0":
     )
 
 DEFAULT_REFERENCE = Path("../SAG-Benchmark/sag2/scripts")
-GENERATOR_VERSION = "0.7.1"
+GENERATOR_VERSION = "0.8.0"
 
 # Design §3.3: the v1 `rust_index_metadata` key set.  A Rust-built index must
 # carry exactly these keys; the values are compared against the runtime.
@@ -995,6 +1001,192 @@ def export_named_expansion(sag2, work_dir):
         },
         lines,
     )
+
+
+# --------------------------------------------------------------------------
+# Gate C (search) - design §1.3.  The reference `search_sag2` under the fixed
+# `OracleJev` is the only thing that can produce the payload bytes and the
+# trace; the export records both halves the gate compares:
+#
+#   C-1  every request payload as the exact `compact_json` string, plus the
+#        `sha256(compact_json([endpoint, payload]))` the journal keys on; and
+#   C-2  the ranked ids/scores, the trace records and the `jev_usage` counters.
+#
+# The corpora are shipped alongside (`search_corpus.jsonl`) because the
+# verifier builds the indexes itself: C0 at `index_workers` 1 and 4 (design
+# §2.5: a parallel build must be equivalent), C4 and C3 at 1.
+# --------------------------------------------------------------------------
+
+SEARCH_ENDPOINT = "http://localhost/decisions"
+
+# The defaults of `search_sag2` (`sag2.py:930-940`), recorded explicitly so the
+# verifier never has to guess what a fixture ran with.
+SEARCH_DEFAULTS = {
+    "candidate_k": 100,
+    "seed_k": 10,
+    "max_hops": 2,
+    "expansion_term_limit": 20,
+}
+
+
+def _serialise_batch(batch):
+    """One `jev_usage.batches[]` entry (`sag2.py:922-927`), field for field."""
+    return {
+        "candidate_count": batch["candidate_count"],
+        "estimated_input_tokens": batch["estimated_input_tokens"],
+        "request_attempts": batch["request_attempts"],
+        "http_attempts": batch["http_attempts"],
+        "failed_attempts": dict(batch["failed_attempts"]),
+        "input_tokens": batch["input_tokens"],
+        "output_tokens": batch["output_tokens"],
+        "model": batch["model"],
+    }
+
+
+def _serialise_usage(usage):
+    """`jev_usage` (`sag2.py:915-921`); batches carry their hop (`:946`)."""
+    return {
+        "requests": usage["requests"],
+        "judgments": usage["judgments"],
+        "input_tokens": usage["input_tokens"],
+        "output_tokens": usage["output_tokens"],
+        "batches": [
+            {"hop": batch["hop"], **_serialise_batch(batch)}
+            for batch in usage["batches"]
+        ],
+    }
+
+
+def _serialise_search_trace(trace):
+    """The two trace record shapes (`sag2.py:969-980`, `:1014-1031`)."""
+    records = []
+    for entry in trace:
+        if entry["stage"] in ("bm25", "expansion"):
+            records.append(
+                {
+                    "stage": entry["stage"],
+                    "hop": entry["hop"],
+                    "count": entry["count"],
+                    "candidate_document_ids": entry["candidate_document_ids"],
+                    "candidate_ids": entry["candidate_ids"],
+                    "terms": entry["terms"],
+                    "term_scores": _serialise_term_scores(entry["term_scores"]),
+                    "expansion_queries": _serialise_queries(entry["expansion_queries"]),
+                }
+            )
+        elif entry["stage"] == "jev":
+            records.append(
+                {
+                    "stage": entry["stage"],
+                    "hop": entry["hop"],
+                    "count": entry["count"],
+                    "carried_seed_count": entry["carried_seed_count"],
+                    "protected_bm25_count": entry["protected_bm25_count"],
+                    "evidence_ids": entry["evidence_ids"],
+                    "scores": [
+                        {"id": score["id"], "score_bits": _hex_bits(score["score"])}
+                        for score in entry["scores"]
+                    ],
+                    "batches": [_serialise_batch(batch) for batch in entry["batches"]],
+                }
+            )
+        else:
+            raise SystemExit(f"search: unknown trace stage {entry['stage']!r}")
+    return records
+
+
+def _payload_digest(payload):
+    """`sha256(compact_json([endpoint, payload]))` (`model_api.py:48`)."""
+    return _sha256_bytes(
+        json.dumps([SEARCH_ENDPOINT, payload], ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    )
+
+
+def _search_case(name, workers, position, query, options, client, result):
+    return {
+        "case_id": f"{name}/w{workers}/q{position:02d}",
+        "fixture": name,
+        "index_workers": workers,
+        "query": query,
+        "options": options,
+        "endpoint": SEARCH_ENDPOINT,
+        "payloads": [json.dumps(payload, ensure_ascii=False, separators=(",", ":")) for payload in client.payloads],
+        "payloads_sha256": [_payload_digest(payload) for payload in client.payloads],
+        "ranked_ids": [candidate["id"] for candidate in result["candidates"]],
+        "ranked_scores_bits": [
+            _hex_bits(candidate["jev_score"]) for candidate in result["candidates"]
+        ],
+        "baseline_ids": [candidate["id"] for candidate in result["baseline"]],
+        "trace": _serialise_search_trace(result["trace"]),
+        "jev_usage": _serialise_usage(result["jev_usage"]),
+        "algorithm": result["algorithm"],
+    }
+
+
+def _search_corpus(fixture, chunk_chars):
+    documents = []
+    for document in fixture.corpus:
+        record = {"title": document.get("title", ""), "text": document["text"]}
+        if "path" in document:
+            record["path"] = document["path"]
+        if "idx" in document:
+            record["idx"] = document["idx"]
+        documents.append(record)
+    return {
+        "fixture": fixture.name,
+        "fingerprint": fixture.fingerprint,
+        "chunk_chars": chunk_chars,
+        "corpus": documents,
+    }
+
+
+def export_search(reference, fixtures, c4, sag2, work_dir):
+    """Gate C: the frozen `search_sag2` case set (design §1.3)."""
+    c0 = next(fixture for fixture in fixtures if fixture.name == "C0")
+    c3 = next(fixture for fixture in fixtures if fixture.name == "C3")
+    specs = [
+        (
+            c0,
+            c0.chunk_chars,
+            (1, 4),
+            [(case["query"], case["options"]) for case in reference["cases"]],
+        ),
+        (c4, c4.chunk_chars, (1,), [(query, None) for query in c4_queries(c4, sag2)]),
+        (c3, c3.chunk_chars, (1,), [(query, None) for query in c3.queries]),
+    ]
+    corpora, cases = [], []
+    for fixture, chunk_chars, worker_counts, queries in specs:
+        corpora.append(_search_corpus(fixture, chunk_chars))
+        for workers in worker_counts:
+            db_path = work_dir / f"{fixture.name}-search-w{workers}.sqlite"
+            index = sag2.CorpusIndex(
+                db_path,
+                fixture.corpus,
+                fixture.fingerprint,
+                chunk_chars=chunk_chars,
+                index_workers=workers,
+            )
+            try:
+                for position, (query, options) in enumerate(queries):
+                    resolved = {**SEARCH_DEFAULTS, **(options or {})}
+                    client = oracle_jev(sag2)
+                    result = asyncio.run(
+                        sag2.search_sag2(index, client, query, **resolved)
+                    )
+                    cases.append(
+                        _search_case(
+                            fixture.name, workers, position, query, resolved, client, result
+                        )
+                    )
+            finally:
+                index.close()
+        print(
+            f"{fixture.name}: {len(queries)} search queries at index_workers "
+            f"{list(worker_counts)}"
+        )
+    return corpora, cases
 
 
 # --------------------------------------------------------------------------
@@ -1947,6 +2139,7 @@ def build_manifest(
     sortkeys,
     expansion,
     freq,
+    search,
 ):
     corpus_digest = hashlib.sha256()
     for fixture in fixtures:
@@ -1973,6 +2166,7 @@ def build_manifest(
         "sortkeys": sortkeys,
         "expansion": expansion,
         "freq": freq,
+        "search": search,
         "fixtures": [
             {
                 "fixture": entry["fixture"],
@@ -2199,6 +2393,24 @@ def main(argv=None):
             json.dumps(line, ensure_ascii=False) + "\n" for line in expansion_lines
         )
 
+        # Gate C (search, design §1.3): the frozen `search_sag2` run with its
+        # byte-exact payloads, its trace and its judge usage.
+        search_corpora, search_cases = export_search(
+            reference, fixtures, c4, sag2, work_dir
+        )
+        search_text = "".join(
+            json.dumps(line, ensure_ascii=False) + "\n" for line in search_cases
+        )
+        search_corpus_text = "".join(
+            json.dumps(line, ensure_ascii=False) + "\n" for line in search_corpora
+        )
+        search_blob = _gzip_bytes(search_text.encode())
+        payload_count = sum(len(case["payloads"]) for case in search_cases)
+        print(
+            f"search: {len(search_cases)} cases over {len(search_corpora)} corpora, "
+            f"{payload_count} payloads"
+        )
+
         # Gate D `freq` (design §4.1 rule 5): the table's whole short key set
         # plus tokenizer probes covering every anchor position and the corpus.
         freq_blob, freq_text, freq_metadata = export_freq(
@@ -2298,6 +2510,21 @@ def main(argv=None):
                 "lines": freq_metadata["probes"],
             }
         )
+        files.append(
+            {
+                "path": "search.jsonl.gz",
+                "sha256": _sha256_bytes(search_blob),
+                "lines": len(search_cases),
+                "gzip_bytes": len(search_blob),
+            }
+        )
+        files.append(
+            {
+                "path": "search_corpus.jsonl",
+                "sha256": _sha256_bytes(search_corpus_text.encode()),
+                "lines": len(search_corpora),
+            }
+        )
         manifest = build_manifest(
             fixtures,
             {
@@ -2348,6 +2575,15 @@ def main(argv=None):
                 "golden": "expansion.jsonl",
             },
             freq_metadata,
+            {
+                "cases": len(search_cases),
+                "corpora": len(search_corpora),
+                "payloads": payload_count,
+                "endpoint": SEARCH_ENDPOINT,
+                "defaults": SEARCH_DEFAULTS,
+                "golden": "search.jsonl.gz",
+                "corpus_golden": "search_corpus.jsonl",
+            },
         )
 
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -2372,6 +2608,8 @@ def main(argv=None):
         (out_dir / "chunks.jsonl").write_text(chunk_text)
         (out_dir / "index_expected.jsonl").write_text(index_expected_text)
         (out_dir / "expansion.jsonl").write_text(expansion_text)
+        (out_dir / "search.jsonl.gz").write_bytes(search_blob)
+        (out_dir / "search_corpus.jsonl").write_text(search_corpus_text)
         (out_dir / "freq_keys.txt.gz").write_bytes(freq_blob)
         (out_dir / "freq_probes.jsonl").write_text(freq_text)
         for entry in expansion_fixtures:
@@ -2395,6 +2633,7 @@ def main(argv=None):
             f"{sortkey_metadata['codepoints']['codepoints']} sort-key code points, "
             f"{sortkey_metadata['pairs']['pairs']} sort-key pairs, "
             f"{len(expansion_lines)} expansion records, "
+            f"{len(search_cases)} search cases ({payload_count} payloads), "
             f"{freq_metadata['keys']} short FREQ keys, "
             f"{freq_metadata['probes']} FREQ probes and "
             f"{len(fixture_stats)} indexes to {out_dir}"

@@ -1,5 +1,5 @@
 {
-  "generator_version": "0.7.1",
+  "generator_version": "0.8.0",
   "python": "3.12.11",
   "sqlite": "3.50.4",
   "jieba": "0.42.1",
@@ -132,6 +132,17 @@
       "path": "freq_probes.jsonl",
       "sha256": "23382516e03af027fd50daa1fa8f42795a745c21ebd633a1eee91df78d5bda9a",
       "lines": 5000
+    },
+    {
+      "path": "search.jsonl.gz",
+      "sha256": "0ed5ef44cd00e79332565c17a916e93d6dfb36c4e221d0ab70e3f78fd9f5d9b3",
+      "lines": 78,
+      "gzip_bytes": 1743213
+    },
+    {
+      "path": "search_corpus.jsonl",
+      "sha256": "a141a006e62fa80cbf22919301ec0b34f8c4ca403c9a23c91e6d4c048fe93f45",
+      "lines": 3
     }
   ],
   "tokenizer": {
@@ -322,6 +333,20 @@
     "corpus_probes": 640,
     "golden": "freq_keys.txt.gz",
     "probes_golden": "freq_probes.jsonl"
+  },
+  "search": {
+    "cases": 78,
+    "corpora": 3,
+    "payloads": 226,
+    "endpoint": "http://localhost/decisions",
+    "defaults": {
+      "candidate_k": 100,
+      "seed_k": 10,
+      "max_hops": 2,
+      "expansion_term_limit": 20
+    },
+    "golden": "search.jsonl.gz",
+    "corpus_golden": "search_corpus.jsonl"
   },
   "fixtures": [
     {

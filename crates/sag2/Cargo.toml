@@ -1,0 +1,18 @@
+[package]
+name = "sag2"
+description = "SAG2 orchestration: rank_dpp, the judge payload builder and search_sag2"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+sag2-core = { path = "../sag2-core" }
+sag2-index = { path = "../sag2-index" }
+sag2-json = { path = "../sag2-json" }
+serde_json = "1"
+# `o200k_base` is embedded in the crate (`include_str!`), so the token budget
+# needs no network or data file (design §2.4 `tiktoken`).
+tiktoken-rs = "0.6"
+
+[dev-dependencies]
+tempfile = "3"

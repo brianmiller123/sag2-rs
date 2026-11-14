@@ -80,15 +80,6 @@ impl From<rusqlite::Error> for QueryError {
     }
 }
 
-/// `sag2.py:95-97` `quote_term`.
-pub(crate) fn quote_term(term: &str) -> String {
-    let mut quoted = String::with_capacity(term.len() + 2);
-    quoted.push('"');
-    quoted.push_str(&term.replace('"', "\"\""));
-    quoted.push('"');
-    quoted
-}
-
 /// `re.findall(r'"((?:""|[^"])*)"', expression)` (`sag2.py:502`).
 ///
 /// The captured text keeps doubled quotes as two characters, exactly like the

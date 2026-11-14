@@ -10,8 +10,10 @@ name = "sag2-cli"
 path = "src/main.rs"
 
 [dependencies]
+sag2 = { path = "../sag2" }
 sag2-core = { path = "../sag2-core" }
 sag2-index = { path = "../sag2-index" }
+sag2-json = { path = "../sag2-json" }
 flate2 = "1.1"
 rusqlite = { version = "0.37", features = ["bundled"] }
 tempfile = "3"
