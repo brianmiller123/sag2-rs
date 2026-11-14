@@ -127,18 +127,14 @@ fn write_freq_tables(out_dir: &Path, total: u64, freq: &BTreeMap<String, u32>) {
         writeln!(source, "    ({word:?}, {value}),").expect("write consts");
     }
     writeln!(source, "];").expect("write consts");
-    // Python lowercases the text but not the dictionary, so only already
-    // lowercase entries can match.  These are the only words that straddle the
-    // ASCII/CJK boundary the tokenizer splits on (design §4.2).
-    writeln!(
-        source,
-        "pub static CROSSING_WORDS: &[&str] = &["
-    )
-    .expect("write consts");
-    for word in crossing {
-        writeln!(source, "    {word:?},").expect("write consts");
+    // Design §4.2: exactly these three lowercase dictionary entries straddle
+    // the ASCII/CJK boundary.  `tokenize` no longer scans for them separately
+    // (the whole-block cut keeps them whole), but the invariant is still worth
+    // asserting here, and `golden/tokenizer.jsonl` pins the words.
+    let expected = ["1号店", "4s店", "江南style"];
+    if crossing != expected {
+        panic!("cross-script dictionary entries changed: {crossing:?}, expected {expected:?}");
     }
-    writeln!(source, "];").expect("write consts");
     fs::write(out_dir.join("dict_consts.rs"), source).expect("write dict consts");
 }
 

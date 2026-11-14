@@ -12,6 +12,15 @@
 //!   last; the tie-break is observable in `order`.
 //! * `math.ulp(max(residuals))` bounds the tail, and every residual update is
 //!   clamped with `max(0.0, ...)`.
+//! * A candidate whose content has no `diversity_tokens` gets an **empty**
+//!   vector: Python's normalisation loop runs zero times, the kernel dot is
+//!   `0.0` and the diagonal stays `score²`.  That is valid, not an error.
+//!
+//! R5's remaining platform assumption: `f64::ln` (norm weights and the docs
+//! above) and `f64::sqrt` must produce the same bits as CPython's `math.log` /
+//! `math.sqrt` on the target.  Gate B compares `ln`-derived values by bits, but
+//! only for its sampled arguments; outside that sample equality rests on the
+//! platform's libm being correctly rounded for these operations.
 
 use sag2_core::diversity_tokens;
 use sag2_index::py312_sum;
@@ -23,7 +32,10 @@ use crate::Candidate;
 pub enum DppError {
     /// `idf[term]` is missing; Python raises `KeyError` (`sag2.py:130`).
     MissingIdf(String),
-    /// The vector norm is zero; Python raises `ZeroDivisionError`.
+    /// A **non-empty** vector has a zero norm; Python raises
+    /// `ZeroDivisionError` there.  Unreachable today: every weight is
+    /// `(1 + ln(count)) * idf` with `count >= 1` and `idf > 0`, and an empty
+    /// token list is handled before the norm is taken.
     ZeroNorm,
 }
 
@@ -68,6 +80,11 @@ fn vector(candidate: &Candidate, idf: &std::collections::BTreeMap<String, f64>) 
     for (term, count) in counts {
         let weight = idf.get(&term).copied().ok_or(DppError::MissingIdf(term.clone()))?;
         weighted.push((term, (1.0 + (count as f64).ln()) * weight));
+    }
+    if weighted.is_empty() {
+        // Empty vector: `{term: value / norm for ...}` iterates zero times in
+        // Python, so the candidate keeps a zero-similarity vector.
+        return Ok(Vec::new());
     }
     let norm = py312_sum(weighted.iter().map(|(_, value)| value * value)).sqrt();
     if norm == 0.0 {
@@ -220,6 +237,36 @@ mod tests {
         rank_dpp(&mut candidates, &idf(&[("x", 1.0), ("y", 1.0)])).expect("dpp");
         let ids: Vec<i64> = candidates.iter().map(|c| c.hit.id).collect();
         assert_eq!(ids, [1, 2, 3]);
+    }
+
+    #[test]
+    fn empty_diversity_vectors_are_valid_and_keep_the_score_diagonal() {
+        // Python: `diversity_tokens("---") == []`, so the vector is `{}`, the
+        // normalisation loop runs zero times and the kernel dot is 0.0.  The
+        // empty candidate (score 0.5) therefore keeps 0.25 while the two
+        // similar candidates lose residual to each other: order [3, 1, 2].
+        let mut candidates = vec![
+            candidate(1, "---", 0.5),
+            candidate(2, "w0 w1", 0.6),
+            candidate(3, "w0 w1", 0.7),
+        ];
+        rank_dpp(
+            &mut candidates,
+            &idf(&[("w0", 0.7242596137760313), ("w1", 2.437378041851008)]),
+        )
+        .expect("a candidate without diversity tokens is valid");
+        assert_eq!(
+            candidates.iter().map(|c| c.hit.id).collect::<Vec<_>>(),
+            [3, 1, 2]
+        );
+
+        // A punctuation-only content in every slot is still a valid ranking.
+        let mut candidates = vec![candidate(4, "|---|", 0.9), candidate(5, "  ", 0.8)];
+        rank_dpp(&mut candidates, &idf(&[])).expect("no weights are read");
+        assert_eq!(
+            candidates.iter().map(|c| c.hit.id).collect::<Vec<_>>(),
+            [4, 5]
+        );
     }
 
     #[test]

@@ -14,6 +14,12 @@
 //!   `sum()`: the summation order of `dict.fromkeys(tokenize(text))` matters.
 //! * `hits` interleave round-robin by rank over the term lists, not term by
 //!   term.
+//!
+//! R5 platform assumption: the `ln` values here (`sag2.py:629/643/652`) and in
+//! `rank_dpp` are Rust `f64::ln` against CPython's `math.log`.  Gate B compares
+//! the resulting bits, but only for the arguments its fixtures reach; outside
+//! that sample equality rests on the platform libm rounding these operations
+//! identically to the reference build.
 
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};

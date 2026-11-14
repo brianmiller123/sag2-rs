@@ -90,6 +90,7 @@ fn mixed_ascii_cjk_dictionary_words_stay_whole() {
     assert_eq!(tokens("4S店 and 1号店"), ["4s店", "1号店"]);
     assert_eq!(tokens("x4s店"), ["x", "4s店"]);
     assert_eq!(tokens("江南style"), ["江南", "江南style"]);
+    assert_eq!(tokens("x 江南style y"), ["x", "江南", "江南style", "y"]);
 }
 
 #[test]

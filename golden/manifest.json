@@ -1,5 +1,5 @@
 {
-  "generator_version": "0.8.1",
+  "generator_version": "0.8.2",
   "python": "3.12.11",
   "sqlite": "3.50.4",
   "jieba": "0.42.1",
@@ -26,8 +26,8 @@
     },
     {
       "path": "tokenizer.jsonl",
-      "sha256": "916386f93fc65261d43c1f7e7a23b832034a1620e53ff71ce87bd8f5d3de9051",
-      "lines": 8798
+      "sha256": "c6dd32595d1112966cc991fd36a6b03cb085bb94cc6ce4ac20d2f63bb204eeb3",
+      "lines": 8802
     },
     {
       "path": "ascii_runs.jsonl",
@@ -135,9 +135,9 @@
     },
     {
       "path": "search.jsonl.gz",
-      "sha256": "0ed5ef44cd00e79332565c17a916e93d6dfb36c4e221d0ab70e3f78fd9f5d9b3",
-      "lines": 78,
-      "gzip_bytes": 1743213
+      "sha256": "69f08df800469f56cb753499a50988efb2a1e934e5e0675bb882ad49b5a02ecb",
+      "lines": 84,
+      "gzip_bytes": 5685913
     },
     {
       "path": "search_corpus.jsonl",
@@ -146,7 +146,7 @@
     }
   ],
   "tokenizer": {
-    "segments": 8798,
+    "segments": 8802,
     "golden": "tokenizer.jsonl"
   },
   "ascii_runs": {
@@ -335,9 +335,9 @@
     "probes_golden": "freq_probes.jsonl"
   },
   "search": {
-    "cases": 78,
+    "cases": 84,
     "corpora": 3,
-    "payloads": 226,
+    "payloads": 238,
     "endpoint": "http://localhost/decisions",
     "defaults": {
       "candidate_k": 100,

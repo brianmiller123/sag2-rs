@@ -194,64 +194,10 @@ fn emit_block(block: &str, inside: bool, out: &mut Vec<String>) {
         }
         return;
     }
-    // Keep dictionary words that straddle the ASCII/CJK split intact
-    // (design §4.2: the only words that can cross the boundary).
-    let mut segment_start = 0_usize;
-    let mut cursor = 0_usize;
-    while cursor < block.len() {
-        match dict::crossing_word_at(&block[cursor..]) {
-            Some(word) => {
-                if segment_start < cursor {
-                    emit_runs(&block[segment_start..cursor], out);
-                }
-                out.push(word.to_owned());
-                cursor += word.len();
-                segment_start = cursor;
-            }
-            None => {
-                cursor += block[cursor..]
-                    .chars()
-                    .next()
-                    .expect("block is non-empty at cursor")
-                    .len_utf8();
-            }
-        }
-    }
-    if segment_start < block.len() {
-        emit_runs(&block[segment_start..], out);
-    }
-}
-
-/// Split a block remainder into CJK and ASCII runs and cut each one.
-fn emit_runs(segment: &str, out: &mut Vec<String>) {
-    let mut run_start = 0_usize;
-    let mut run_class: Option<Class> = None;
-    for (index, character) in segment.char_indices() {
-        let current = class(character);
-        match run_class {
-            Some(active) if active == current => {}
-            Some(active) => {
-                emit_run(&segment[run_start..index], active, out);
-                run_start = index;
-                run_class = Some(current);
-            }
-            None => {
-                run_start = index;
-                run_class = Some(current);
-            }
-        }
-    }
-    if let Some(active) = run_class {
-        emit_run(&segment[run_start..], active, out);
-    }
-}
-
-fn emit_run(run: &str, class: Class, out: &mut Vec<String>) {
-    match class {
-        Class::Other => out.extend(run.chars().map(|character| character.to_string())),
-        Class::Cjk => out.extend(JIEBA.cut(run, true).into_iter().map(str::to_owned)),
-        Class::Ascii => ascii_cut::cut_run(run, out),
-    }
+    // No CJK means no crossing dictionary word, only ASCII text; Python's
+    // `__cut_DAG` over it is exactly the ported ASCII model (dictionary DAG +
+    // the patched `finalseg`).
+    ascii_cut::cut_run(block, out);
 }
 
 /// Rules 3-5 of design §4.1 for one cut word.

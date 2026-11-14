@@ -28,10 +28,12 @@ Outputs (all under ``--out``, default ``golden/``):
     every fixture document, the desktop reference cases and the
     ``tests/test_chunking.py`` scenarios with heading, spans and content
 ``tokenizer.jsonl``
-    every tokenizer segment: the four frozen reference lines plus every
-    document title/text and every chunk content of the Gate A/D fixtures and
-    of C4 (the repository prose) and C7 (the alias/grounding corpus), so the
-    mixed CJK/ASCII HMM branch is covered by the tokenizer gate itself
+    every tokenizer segment: the four frozen reference lines, the pinned
+    mixed-script segments (the three dictionary words that cross the
+    ASCII/CJK boundary and mixed sentences around them), plus every document
+    title/text and every chunk content of the Gate A/D fixtures and of C4 (the
+    repository prose) and C7 (the alias/grounding corpus), so the mixed
+    CJK/ASCII HMM branch is covered by the tokenizer gate itself
 ``index_expected.jsonl``
     per fixture: the ``sqlite_master`` schema, ``metadata.signature``, every
     ``chunks`` row, every ``chunk_fts`` row, the 24 ``(rowid, bm25)`` probes,
@@ -57,7 +59,9 @@ Outputs (all under ``--out``, default ``golden/``):
 ``search.jsonl.gz``, ``search_corpus.jsonl``
     Gate C's frozen judge trace (design §1.3): one line per search case with
     the byte-exact request payloads, their journal digests, the ranked
-    candidates, the trace records and the judge usage; and the corpus + chunk
+    candidates, the trace records and the judge usage; C0 also carries the
+    ``max_hops`` 0/1 variants and one multi-turn ``context`` case.  And the
+    corpus + chunk
     parameters each case's index is built from (C0 at ``index_workers`` 1 and
     4, C4 and C3 at 1)
 ``freq_keys.txt.gz``, ``freq_probes.jsonl``
@@ -118,7 +122,7 @@ if os.environ.get("PYTHONHASHSEED") != "0":
     )
 
 DEFAULT_REFERENCE = Path("../SAG-Benchmark/sag2/scripts")
-GENERATOR_VERSION = "0.8.1"
+GENERATOR_VERSION = "0.8.2"
 
 # Design §3.3: the v1 `rust_index_metadata` key set.  A Rust-built index must
 # carry exactly these keys; the values are compared against the runtime.
@@ -1109,9 +1113,28 @@ def _payload_digest(payload):
     )
 
 
-def _search_case(name, workers, position, query, options, client, result):
+def _candidate_record(candidate):
+    """One returned candidate, every field C-2 now compares."""
     return {
-        "case_id": f"{name}/w{workers}/q{position:02d}",
+        "id": candidate["id"],
+        "document_id": candidate["document_id"],
+        "hop": candidate["hop"],
+        "fusion_score_bits": _hex_bits(candidate["fusion_score"]),
+        "jev_model": candidate["jev_model"],
+        "title": candidate["title"],
+        "heading": candidate["heading"],
+        "content": candidate["content"],
+        # The chunk row stores spans as a JSON string (`corpus index` schema).
+        "spans": json.loads(candidate["spans"]),
+        "characters": candidate["characters"],
+        "source_id": candidate["source_id"],
+        "full_doc": candidate["full_doc"],
+    }
+
+
+def _search_case(name, workers, label, query, options, context, client, result):
+    case = {
+        "case_id": f"{name}/w{workers}/{label}",
         "fixture": name,
         "index_workers": workers,
         "query": query,
@@ -1124,9 +1147,35 @@ def _search_case(name, workers, position, query, options, client, result):
             _hex_bits(candidate["jev_score"]) for candidate in result["candidates"]
         ],
         "baseline_ids": [candidate["id"] for candidate in result["baseline"]],
+        "ranked_candidates": [
+            _candidate_record(candidate) for candidate in result["candidates"]
+        ],
         "trace": _serialise_search_trace(result["trace"]),
         "jev_usage": _serialise_usage(result["jev_usage"]),
         "algorithm": result["algorithm"],
+    }
+    if context is not None:
+        case["context"] = context
+    return case
+
+
+def _c0_context(index):
+    """One multi-turn context for C0 (evidence + history + decisions).
+
+    The object keys are alphabetical so the verifier's order-insensitive JSON
+    parser reproduces the reference's insertion order inside the payload bytes;
+    the evidence fields are rebuilt from the candidate struct on the Rust side.
+    """
+    row = index.db.execute(
+        "SELECT id,title,heading,content FROM chunks WHERE title='Anchor' ORDER BY id LIMIT 1"
+    ).fetchone()
+    if row is None:
+        raise SystemExit("C0 has no Anchor chunk for the context fixture")
+    return {
+        "original_question": "Where was Alston born?",
+        "evidence": [{"content": row[3], "heading": row[2], "id": row[0], "title": row[1]}],
+        "search_history": [{"count": 3, "query": "Anchor", "stage": "bm25"}],
+        "previous_decisions": [{"candidate_id": row[0], "decision": "retain"}],
     }
 
 
@@ -1151,15 +1200,32 @@ def export_search(reference, fixtures, c4, sag2, work_dir):
     """Gate C: the frozen `search_sag2` case set (design §1.3)."""
     c0 = next(fixture for fixture in fixtures if fixture.name == "C0")
     c3 = next(fixture for fixture in fixtures if fixture.name == "C3")
+    anchor = reference["cases"][0]
+    c0_queries = [
+        (None, case["query"], case["options"], None) for case in reference["cases"]
+    ]
+    # W-2: the hop-count matrix.  The zero-hop run must still call the judge
+    # once and record exactly the bm25 + jev trace rows; the one-hop run must
+    # stop before hop 2.
+    c0_queries.extend(
+        [
+            ("q00-hops0", anchor["query"], {**anchor["options"], "max_hops": 0}, None),
+            ("q00-hops1", anchor["query"], {**anchor["options"], "max_hops": 1}, None),
+            # W-1: a non-empty multi-turn context, so C-1 compares the
+            # `current_search_query`/`retrieval_history`/`previous_decisions`/
+            # `history_note`/combined-evidence state shape.
+            ("q00-context", anchor["query"], anchor["options"], _c0_context),
+        ]
+    )
     specs = [
+        (c0, c0.chunk_chars, (1, 4), c0_queries),
         (
-            c0,
-            c0.chunk_chars,
-            (1, 4),
-            [(case["query"], case["options"]) for case in reference["cases"]],
+            c4,
+            c4.chunk_chars,
+            (1,),
+            [(None, query, None, None) for query in c4_queries(c4, sag2)],
         ),
-        (c4, c4.chunk_chars, (1,), [(query, None) for query in c4_queries(c4, sag2)]),
-        (c3, c3.chunk_chars, (1,), [(query, None) for query in c3.queries]),
+        (c3, c3.chunk_chars, (1,), [(None, query, None, None) for query in c3.queries]),
     ]
     corpora, cases = [], []
     for fixture, chunk_chars, worker_counts, queries in specs:
@@ -1174,15 +1240,48 @@ def export_search(reference, fixtures, c4, sag2, work_dir):
                 index_workers=workers,
             )
             try:
-                for position, (query, options) in enumerate(queries):
+                for position, (label, query, options, context_builder) in enumerate(queries):
+                    label = label or f"q{position:02d}"
                     resolved = {**SEARCH_DEFAULTS, **(options or {})}
+                    context = context_builder(index) if context_builder is not None else None
                     client = oracle_jev(sag2)
+                    kwargs = dict(resolved)
+                    if context is not None:
+                        kwargs["context"] = context
                     result = asyncio.run(
-                        sag2.search_sag2(index, client, query, **resolved)
+                        sag2.search_sag2(index, client, query, **kwargs)
                     )
+                    stages = [row["stage"] for row in result["trace"]]
+                    if resolved["max_hops"] == 0 and (
+                        stages != ["bm25", "jev"]
+                        or result["jev_usage"]["requests"] != 1
+                    ):
+                        raise SystemExit(
+                            f"{fixture.name}/{label}: max_hops=0 must score once, "
+                            f"got stages {stages} and {result['jev_usage']['requests']} requests"
+                        )
+                    if resolved["max_hops"] == 1 and any(
+                        row["hop"] == 2 for row in result["trace"]
+                    ):
+                        raise SystemExit(
+                            f"{fixture.name}/{label}: max_hops=1 reached hop 2"
+                        )
+                    if context is not None:
+                        state = client.payloads[0]["state"]
+                        if '"history_note"' not in state or '"passage_id"' not in state:
+                            raise SystemExit(
+                                f"{fixture.name}/{label}: the context did not reach the state builder"
+                            )
                     cases.append(
                         _search_case(
-                            fixture.name, workers, position, query, resolved, client, result
+                            fixture.name,
+                            workers,
+                            label,
+                            query,
+                            resolved,
+                            context,
+                            client,
+                            result,
                         )
                     )
             finally:
@@ -1801,6 +1900,18 @@ def tokenizer_segments_for(fixture, sag2, work_dir):
     return fixture_segments(fixture, rows)
 
 
+# Design §4.2's equivalence premise: the three dictionary entries that
+# straddle the ASCII/CJK boundary and mixed sentences whose ASCII stretch is
+# separated by a multi-character route.  Pinned in the golden so Gate D, not
+# only a unit test, defends them.
+MIXED_SCRIPT_SEGMENTS = [
+    "4s店",
+    "4S店 and 1号店",
+    "江南style",
+    "x 江南style y",
+]
+
+
 def export_tokenizer(reference, fixture_segments_by_name, sag2):
     """`tokenizer.jsonl`: segment id, normalised text and the reference tokens."""
     segments = []
@@ -1811,6 +1922,8 @@ def export_tokenizer(reference, fixture_segments_by_name, sag2):
                 f"frozen tokenizer line {index} disagrees with the reference implementation"
             )
         segments.append((f"C0/tokenizer/{index}", entry["text"], tokens))
+    for index, text in enumerate(MIXED_SCRIPT_SEGMENTS):
+        segments.append((f"C0/tokenizer/mixed-script/{index}", text, sag2.tokenize(text)))
     for name, entries in fixture_segments_by_name.items():
         for segment_id, text in entries:
             segments.append((segment_id, text, sag2.tokenize(text)))

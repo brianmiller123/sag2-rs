@@ -2,6 +2,10 @@
 {"segment_id": "C0/tokenizer/1", "text": "Chester A. Arthur's Jean-Luc Picard", "tokens": ["chester", "arthur", "s", "jean", "luc", "jean-luc", "picard"]}
 {"segment_id": "C0/tokenizer/2", "text": "Anchor 北京数据库", "tokens": ["anchor", "北京", "数据", "据库", "数据库"]}
 {"segment_id": "C0/tokenizer/3", "text": "foo-bar-baz a_b foo.bar +test #tag C++ 3.14 1,000 -foo-", "tokens": ["foo", "bar", "baz", "foo-bar-baz", "a_b", "foo", "bar", "foo.bar", "test", "tag", "c++", "3.14", "1", "000", "foo"]}
+{"segment_id": "C0/tokenizer/mixed-script/0", "text": "4s店", "tokens": ["4s店"]}
+{"segment_id": "C0/tokenizer/mixed-script/1", "text": "4S店 and 1号店", "tokens": ["4s店", "1号店"]}
+{"segment_id": "C0/tokenizer/mixed-script/2", "text": "江南style", "tokens": ["江南", "江南style"]}
+{"segment_id": "C0/tokenizer/mixed-script/3", "text": "x 江南style y", "tokens": ["x", "江南", "江南style", "y"]}
 {"segment_id": "C0/title/0", "text": "Anchor", "tokens": ["anchor"]}
 {"segment_id": "C0/text/0", "text": "Anchor birthplace depicts Alice Paul. Alice Paul. Bob Smith.", "tokens": ["anchor", "birthplace", "depicts", "alice", "paul", "alice", "paul", "bob", "smith"]}
 {"segment_id": "C0/title/1", "text": "Single", "tokens": ["single"]}

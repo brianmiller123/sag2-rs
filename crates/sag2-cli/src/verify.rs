@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Generator version this verifier understands.
-const GENERATOR_VERSION: &str = "0.8.1";
+const GENERATOR_VERSION: &str = "0.8.2";
 
 /// Minimum interpreter the goldens may come from (design §11 divergence D5).
 const REQUIRED_PYTHON: (u64, u64) = (3, 12);
@@ -4239,6 +4239,24 @@ struct SearchOptionsGolden {
     expansion_term_limit: usize,
 }
 
+/// One recorded `context` argument (multi-turn state, `sag2.py:939`).
+#[derive(Deserialize)]
+struct SearchContextGolden {
+    original_question: String,
+    evidence: Vec<ContextEvidence>,
+    search_history: Vec<serde_json::Value>,
+    previous_decisions: serde_json::Value,
+}
+
+/// One `context["evidence"]` entry: the fields the judge's state reads.
+#[derive(Deserialize)]
+struct ContextEvidence {
+    id: i64,
+    title: String,
+    heading: String,
+    content: String,
+}
+
 /// One `search.jsonl.gz` line.  C-1 compares `payloads`/`payloads_sha256`; C-2
 /// compares the result fields, which are kept as untyped JSON because they are
 /// compared field by field (`compare_json_exact`) rather than deserialised.
@@ -4255,6 +4273,11 @@ struct SearchCase {
     ranked_ids: Vec<i64>,
     ranked_scores_bits: Vec<String>,
     baseline_ids: Vec<i64>,
+    /// The full returned candidates (W-1/S-2): identity, hop, fusion/jev,
+    /// text and spans.  Always present from exporter 0.8.2 on.
+    ranked_candidates: serde_json::Value,
+    #[serde(default)]
+    context: Option<SearchContextGolden>,
     trace: serde_json::Value,
     jev_usage: serde_json::Value,
     algorithm: String,
@@ -4341,6 +4364,24 @@ fn search_result_value(result: &sag2::SearchResult) -> serde_json::Value {
             .map(|c| hex_bits(c.jev_score))
             .collect::<Vec<_>>(),
         "baseline_ids": result.baseline.iter().map(|c| c.hit.id).collect::<Vec<_>>(),
+        "ranked_candidates": result
+            .candidates
+            .iter()
+            .map(|candidate| serde_json::json!({
+                "id": candidate.hit.id,
+                "document_id": candidate.hit.document_id,
+                "hop": candidate.hop,
+                "fusion_score_bits": hex_bits(candidate.fusion_score),
+                "jev_model": candidate.jev_model,
+                "title": candidate.hit.title,
+                "heading": candidate.hit.heading,
+                "content": candidate.hit.content,
+                "spans": candidate.hit.spans,
+                "characters": candidate.hit.characters,
+                "source_id": candidate.hit.source_id,
+                "full_doc": candidate.hit.full_doc,
+            }))
+            .collect::<Vec<_>>(),
         "trace": result.trace.iter().map(trace_entry_value).collect::<Vec<_>>(),
         "jev_usage": search_usage_value(&result.usage),
         "algorithm": result.algorithm,
@@ -4473,6 +4514,73 @@ fn search_usage_value(usage: &sag2::Usage) -> serde_json::Value {
 fn json_from_sag2(value: &sag2_json::Value) -> serde_json::Value {
     serde_json::from_str(&sag2_json::compact_json(value))
         .expect("sag2-json output is valid JSON")
+}
+
+/// The inverse of [`json_from_sag2`], for the `context` fields the judge
+/// carries verbatim into the payload.
+///
+/// `serde_json::Map` is a `BTreeMap` here (`preserve_order` is off), so parsing
+/// the golden loses the source order.  That is intentional: the exporter writes
+/// these objects with alphabetical keys, which is the order the verifier then
+/// rebuilds, matching the reference's insertion order in the payload bytes.
+fn json_to_sag2(value: &serde_json::Value) -> sag2_json::Value {
+    match value {
+        serde_json::Value::Null => sag2_json::Value::Null,
+        serde_json::Value::Bool(flag) => sag2_json::Value::Bool(*flag),
+        serde_json::Value::Number(number) => match number.as_i64() {
+            Some(integer) => sag2_json::Value::Int(integer),
+            None => sag2_json::Value::Float(
+                number
+                    .as_f64()
+                    .expect("a JSON number that is not an i64 is an f64"),
+            ),
+        },
+        serde_json::Value::String(text) => sag2_json::Value::Str(text.clone()),
+        serde_json::Value::Array(items) => {
+            sag2_json::Value::Array(items.iter().map(json_to_sag2).collect())
+        }
+        serde_json::Value::Object(entries) => {
+            let mut object = sag2_json::Object::new();
+            for (key, item) in entries {
+                object.insert(key.clone(), json_to_sag2(item));
+            }
+            sag2_json::Value::Object(object)
+        }
+    }
+}
+
+/// Rebuild the `context` argument from its golden form.  Only the state-facing
+/// fields are used; `hop`/scores are fixed because the reference's context
+/// evidence is informational, not ranked.
+fn search_context(golden: &SearchContextGolden) -> sag2::SearchContext {
+    sag2::SearchContext {
+        original_question: golden.original_question.clone(),
+        evidence: golden
+            .evidence
+            .iter()
+            .map(|entry| sag2::Candidate {
+                hit: sag2::Hit {
+                    id: entry.id,
+                    document_id: entry.id,
+                    title: entry.title.clone(),
+                    heading: entry.heading.clone(),
+                    content: entry.content.clone(),
+                    full_doc: None,
+                    spans: Vec::new(),
+                    characters: 0,
+                    source_id: String::new(),
+                    score: 0.0,
+                },
+                hop: 0,
+                fusion_score: 0.0,
+                jev_score: 0.0,
+                jev_model: None,
+                previous_jev_score: None,
+            })
+            .collect(),
+        search_history: golden.search_history.iter().map(json_to_sag2).collect(),
+        previous_decisions: json_to_sag2(&golden.previous_decisions),
+    }
 }
 
 /// The first byte at which two payloads differ (the gate's failure evidence).
@@ -4773,7 +4881,7 @@ fn run_gate_c(options: &Options) -> Result<ExitCode, String> {
             seed_k: case.options.seed_k,
             max_hops: case.options.max_hops,
             expansion_term_limit: case.options.expansion_term_limit,
-            context: None,
+            context: case.context.as_ref().map(search_context),
         };
         let result = match sag2::search(index, &judge, &case.query, &options) {
             Ok(result) => result,
@@ -4805,6 +4913,7 @@ fn run_gate_c(options: &Options) -> Result<ExitCode, String> {
             "ranked_ids": case.ranked_ids,
             "ranked_scores_bits": case.ranked_scores_bits,
             "baseline_ids": case.baseline_ids,
+            "ranked_candidates": case.ranked_candidates,
             "trace": case.trace,
             "jev_usage": case.jev_usage,
             "algorithm": case.algorithm,

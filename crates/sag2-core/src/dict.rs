@@ -119,18 +119,6 @@ pub fn ascii_freq(word: &str) -> Option<u32> {
         .map(|(_, value)| *value)
 }
 
-/// Longest dictionary word that mixes the CJK range with ASCII and therefore
-/// spans the boundary `tokenize` splits on (design §4.2's equivalence premise).
-pub fn crossing_word_at(suffix: &str) -> Option<&'static str> {
-    let mut best: Option<&'static str> = None;
-    for &word in CROSSING_WORDS {
-        if suffix.starts_with(word) && best.is_none_or(|current| word.len() > current.len()) {
-            best = Some(word);
-        }
-    }
-    best
-}
-
 #[cfg(test)]
 mod tests {
     use super::contains;

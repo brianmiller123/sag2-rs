@@ -63,17 +63,23 @@ cargo run -p sag2-cli -- verify --gate C --fixtures search --golden golden/
 
 `golden/search.jsonl.gz` holds one case per `search_sag2` run: C0's four frozen
 queries and options at `index_workers` 1 **and** 4, C4's twenty heading queries
-and C3's fifty generated queries at 1. Each case carries both halves §1.3
+and C3's fifty generated queries at 1, plus C0 variants that cover the gate's
+blind spots - `max_hops` 0 and 1 (the zero-hop case must still score once) and
+one multi-turn `context` (evidence + `search_history` + `previous_decisions`,
+which turns on the judge's history state). Each case carries both halves §1.3
 compares:
 
 * **C-1** every request payload as the exact `compact_json` string plus the
   `sha256(compact_json([endpoint, payload]))` the journal keys on, compared
   byte for byte (a failure reports the first differing byte and its JSON
   pointer); and
-* **C-2** `ranked_ids`/`ranked_scores_bits`, `baseline_ids`, every trace record
-  (stage sequence, candidate/document ids, `terms`, `term_scores`, expansion
-  queries, `evidence_ids`, per-round scores and batches) and `jev_usage`
-  (counters plus each batch's `estimated_input_tokens`/`candidate_count`).
+* **C-2** `ranked_ids`/`ranked_scores_bits`, `baseline_ids`, the full returned
+  candidates (id, document id, hop, fusion score bits, `jev_model`, title,
+  heading, content, spans, characters, source id and `full_doc`), every trace
+  record (stage sequence, candidate/document ids, `terms`, `term_scores`,
+  expansion queries, `evidence_ids`, per-round scores and batches) and
+  `jev_usage` (counters plus each batch's
+  `estimated_input_tokens`/`candidate_count`).
 
 `elapsed_ms` is the only excluded field and is declared in `excluded_fields`.
 The indexes are built by this crate from `golden/search_corpus.jsonl`, so the
@@ -89,10 +95,12 @@ cargo run -p sag2-cli -- verify --gate D --fixtures tokenizer,chunks,index --gol
 
 `--fixtures` selects any subset:
 
-* `tokenizer` — the frozen tokenizer lines, every title/text/chunk segment of
-  the Gate A/D fixtures plus C4's repository prose and C7's alias corpus, the
-  ASCII cross product, the exhaustive per-code-point Unicode tables (§4.4) and
-  the `freq` table (below).  C4/C7 are here because they are the corpora whose
+* `tokenizer` — the frozen tokenizer lines, the pinned mixed-script segments
+  (`4s店`, `1号店`, `江南style` and mixed sentences), every title/text/chunk
+  segment of the Gate A/D fixtures plus C4's repository prose and C7's alias
+  corpus, the ASCII cross product, the exhaustive per-code-point Unicode tables
+  (§4.4) and the `freq` table (below).  C4/C7 are here because they are the
+  corpora whose
   mixed CJK/ASCII blocks reach the HMM-buffer branch.
 * `freq` — rule 5's short (`<= 3` code point) `TOKENIZER.FREQ` key set against
   `golden/freq_keys.txt.gz`: exact set equality (no missing, no extra key), an
