@@ -1,9 +1,11 @@
-//! `sag2-cli verify --gate A|D`: replay the golden gate cases (design §1.1,
-//! §4.4, §7.3).
+//! `sag2-cli verify --gate A|B|D`: replay the golden gate cases (design §1.1,
+//! §4.4, §5.5, §7.3).
 //!
-//! Gate A replays the retrieved hits; Gate D compares the tokenizer against the
-//! frozen reference lines, every corpus segment, the ASCII cross product and
-//! the exhaustive per-code-point Unicode tables.
+//! Gate A replays the retrieved hits; Gate B compares pyuca's sort keys over
+//! the vocabulary, every code point and 200,000 comparison pairs; Gate D
+//! compares the tokenizer against the frozen reference lines, every corpus
+//! segment, the ASCII cross product and the exhaustive per-code-point Unicode
+//! tables.
 //!
 //! Gate D `index` implements design §1.4's sub-checks: D1 (`sqlite_master`
 //! name/type/sql, whitespace-normalised), D2 (signature and statistics), D3
@@ -30,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Generator version this verifier understands.
-const GENERATOR_VERSION: &str = "0.5.0";
+const GENERATOR_VERSION: &str = "0.6.0";
 
 /// Minimum interpreter the goldens may come from (design §11 divergence D5).
 const REQUIRED_PYTHON: (u64, u64) = (3, 12);
@@ -73,6 +75,38 @@ struct Manifest {
     chunks: Option<ChunksSpec>,
     #[serde(default)]
     index_expected: Option<IndexExpectedSpec>,
+    #[serde(default)]
+    sortkeys: Option<SortkeysSpec>,
+}
+
+/// Gate B's sort-key goldens (design §5.5).
+#[derive(Deserialize)]
+struct SortkeysSpec {
+    vocab: SortkeysVocab,
+    codepoints: SortkeysCodepoints,
+    pairs: SortkeysPairs,
+}
+
+/// `sk_vocab.jsonl`: one term per line in code point order.
+#[derive(Deserialize)]
+struct SortkeysVocab {
+    terms: usize,
+}
+
+/// `sk_cp.bin.gz`: `magic, u32 count`, then `len:u8 + weights:[u16le;len]`.
+#[derive(Deserialize)]
+struct SortkeysCodepoints {
+    magic: String,
+    codepoints: usize,
+    max_weights: usize,
+}
+
+/// `sk_pairs.bin.gz`: `magic, u32 count`, then
+/// `kind:u8 + a:u32le + b:u32le + expected:i8`.
+#[derive(Deserialize)]
+struct SortkeysPairs {
+    magic: String,
+    pairs: usize,
 }
 
 /// Gate D's chunk-golden document count (`chunks.jsonl`).
@@ -282,8 +316,8 @@ pub fn verify(args: &[String]) -> ExitCode {
 }
 
 pub fn usage() -> &'static str {
-    "usage: sag2-cli verify --gate A|D --golden golden/ \
-     [--fixtures tokenizer,chunks,index] [--reference <scripts>] \
+    "usage: sag2-cli verify --gate A|B|D --golden golden/ \
+     [--fixtures tokenizer,chunks,index|sortkeys] [--reference <scripts>] \
      [--index-cache <dir>] [--index-dir <dir>] [--filter <substring>] \
      [--report report.json]"
 }
@@ -330,9 +364,10 @@ fn verify_reference(reference: &ManifestReference, dir: &Path) -> Result<(), Str
 fn run(options: &Options) -> Result<ExitCode, String> {
     match options.gate.to_ascii_uppercase().as_str() {
         "A" => run_gate_a(options),
+        "B" => run_gate_b(options),
         "D" => run_gate_d(options),
         other => Err(format!(
-            "gate {other} is not implemented; only gates A and D have goldens"
+            "gate {other} is not implemented; gates A, B and D have goldens"
         )),
     }
 }
@@ -1985,6 +2020,382 @@ fn serialise_spans_usize(spans: &[(usize, usize)]) -> String {
         .map(|&(start, end)| (start as u64, end as u64))
         .collect();
     serialise_spans(&spans)
+}
+
+/// Gate B `sortkeys`: pyuca 1.2's `sort_key` over the vocabulary, every code
+/// point and 200,000 comparison pairs (design §5.5).
+///
+/// This is the one gate that must fail even when no existing fixture changes:
+/// the term set is open, so a code point that appears tomorrow may collate
+/// differently.  Keys are compared element-wise (`eq_json` on integer arrays),
+/// then the sorted order is compared as a sequence, then the comparison signs
+/// are checked independently.
+fn run_gate_b(options: &Options) -> Result<ExitCode, String> {
+    let fixtures = options
+        .fixtures
+        .clone()
+        .unwrap_or_else(|| vec!["sortkeys".to_owned()]);
+    for fixture in &fixtures {
+        if fixture != "sortkeys" {
+            return Err(format!(
+                "gate B fixture {fixture} is not implemented; only sortkeys has goldens"
+            ));
+        }
+    }
+    let manifest = preflight(options)?;
+    verify_manifest_files(
+        options,
+        &manifest,
+        &[
+            "sk_vocab.jsonl",
+            "sk_cp.bin.gz",
+            "sk_pairs.bin.gz",
+            // The port's NFD must exist for `sort_key` to be pyuca's; the
+            // digest check makes the table part of this gate's inputs.
+            "unicode_nfd.bin.gz",
+        ],
+    )?;
+    let spec = manifest
+        .sortkeys
+        .as_ref()
+        .ok_or_else(|| "manifest has no sortkeys section".to_owned())?;
+
+    let mut failures: Vec<Failure> = Vec::new();
+    let mut sections = serde_json::Map::new();
+    let mut passed = true;
+    for fixture in &fixtures {
+        if fixture != "sortkeys" {
+            continue;
+        }
+        let section = gate_b_sortkeys(options, spec, &mut failures)?;
+        passed &= section["passed"].as_bool().unwrap_or(false);
+        sections.insert("sortkeys".to_owned(), section);
+    }
+    passed &= failures.is_empty();
+
+    println!(
+        "gate B ({}): {} failures",
+        fixtures.join(","),
+        failures.len()
+    );
+    for failure in failures.iter().take(10) {
+        println!(
+            "  {} {}: expected {}, got {}",
+            failure.case_id, failure.path, failure.expected, failure.actual
+        );
+    }
+
+    let report = serde_json::json!({
+        "golden": {
+            "dir": options.golden.display().to_string(),
+            "generated_by": format!("export_golden.py@{}", manifest.generator_version),
+            "python": manifest.python,
+            "sqlite": manifest.sqlite,
+            "runtime_sqlite": sag2_index::sqlite_version(),
+            "reference": {
+                "dir": options.reference.display().to_string(),
+                "commit": manifest.reference.commit,
+            },
+        },
+        "toolchain": {
+            "sqlite_allowlist": SQLITE_ALLOWLIST,
+            "jieba": manifest.jieba,
+            "pyuca": manifest.pyuca,
+            "unicode": manifest.unicode,
+        },
+        "tolerances": {"level": "S", "f64": "bits", "ids": "exact"},
+        "gates": {"B": {
+            "fixtures": fixtures,
+            "sections": sections,
+        }},
+        "excluded_fields": [],
+        "excluded_checks": ["db_physical_bytes"],
+        "failures": failures,
+        "ulp_flips": [],
+        "unsupported": [],
+    });
+    write_report(&options.report, &report);
+    Ok(if passed {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(2)
+    })
+}
+
+/// One `sk_vocab.jsonl` line.
+#[derive(Deserialize)]
+struct SortkeyLine {
+    term: String,
+    key: Vec<u32>,
+    /// Position in Python's stable `sorted(terms, key=collator.sort_key)`.
+    rank: usize,
+}
+
+fn gate_b_sortkeys(
+    options: &Options,
+    spec: &SortkeysSpec,
+    failures: &mut Vec<Failure>,
+) -> Result<serde_json::Value, String> {
+    let failures_before = failures.len();
+
+    // sk_vocab: element-wise keys, then the sorted sequence.
+    let vocab_path = options.golden.join("sk_vocab.jsonl");
+    let vocab_text = fs::read_to_string(&vocab_path)
+        .map_err(|error| format!("cannot read {}: {error}", vocab_path.display()))?;
+    let mut lines: Vec<SortkeyLine> = Vec::new();
+    for (number, line) in vocab_text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let parsed: SortkeyLine = serde_json::from_str(line)
+            .map_err(|error| format!("{}:{}: {error}", vocab_path.display(), number + 1))?;
+        if parsed.rank >= spec.vocab.terms {
+            return Err(format!(
+                "{}:{}: rank {} is outside the manifest's {} terms",
+                vocab_path.display(),
+                number + 1,
+                parsed.rank,
+                spec.vocab.terms
+            ));
+        }
+        lines.push(parsed);
+    }
+    if lines.len() != spec.vocab.terms {
+        return Err(format!(
+            "golden inconsistency: sk_vocab.jsonl holds {} terms, manifest says {}",
+            lines.len(),
+            spec.vocab.terms
+        ));
+    }
+    let mut vocab_key_diffs = 0_usize;
+    let mut rust_keys: Vec<Vec<u32>> = Vec::with_capacity(lines.len());
+    for line in &lines {
+        let actual = sag2_core::sort_key(&line.term);
+        rust_keys.push(actual.clone());
+        if actual != line.key {
+            vocab_key_diffs += 1;
+            if failures.len() < MAX_FAILURES {
+                failures.push(Failure {
+                    case_id: format!("sortkey/vocab/{}", line.term),
+                    path: "key".to_owned(),
+                    expected: format!("{:?}", line.key),
+                    actual: format!("{actual:?}"),
+                    delta: None,
+                });
+            }
+        }
+    }
+    // Rust's `Vec<u32>` ordering is Python's tuple ordering: lexicographic,
+    // and a shorter prefix sorts first.
+    let mut order: Vec<usize> = (0..lines.len()).collect();
+    order.sort_by(|left, right| rust_keys[*left].cmp(&rust_keys[*right]));
+    let mut expected_by_rank: Vec<&str> = vec![""; lines.len()];
+    for line in &lines {
+        expected_by_rank[line.rank] = line.term.as_str();
+    }
+    let mut vocab_order_diffs = 0_usize;
+    for (position, index) in order.iter().enumerate() {
+        if lines[*index].rank != position {
+            vocab_order_diffs += 1;
+            if failures.len() < MAX_FAILURES {
+                failures.push(Failure {
+                    case_id: "sortkey/vocab/order".to_owned(),
+                    path: format!("position {position}"),
+                    expected: expected_by_rank[position].to_owned(),
+                    actual: lines[*index].term.clone(),
+                    delta: None,
+                });
+            }
+        }
+    }
+
+    // sk_cp: every code point.  Lone surrogates are not scalar values, so the
+    // golden records them but `sort_key` cannot be handed one (the same
+    // boundary Gate D draws for its exhaustive tables).
+    let cp_path = options.golden.join("sk_cp.bin.gz");
+    let compressed = fs::read(&cp_path)
+        .map_err(|error| format!("cannot read {}: {error}", cp_path.display()))?;
+    let data = gunzip(&cp_path, &compressed)?;
+    if data.len() < 12 || &data[..8] != spec.codepoints.magic.as_bytes() {
+        return Err(format!(
+            "{} does not start with the manifest magic",
+            cp_path.display()
+        ));
+    }
+    let count =
+        u32::from_le_bytes(data[8..12].try_into().expect("sortkey codepoint count")) as usize;
+    if count != spec.codepoints.codepoints {
+        return Err(format!(
+            "golden inconsistency: {} holds {count} code points, manifest says {}",
+            cp_path.display(),
+            spec.codepoints.codepoints
+        ));
+    }
+    let mut codepoints_checked = 0_usize;
+    let mut surrogates_skipped = 0_usize;
+    let mut codepoint_diffs = 0_usize;
+    let mut offset = 12_usize;
+    for cp in 0..count {
+        if offset >= data.len() {
+            return Err(format!("{} ends before code point {cp}", cp_path.display()));
+        }
+        let length = data[offset] as usize;
+        offset += 1;
+        if length > spec.codepoints.max_weights || offset + 2 * length > data.len() {
+            return Err(format!(
+                "{}: U+{cp:04X} declares {length} weights, manifest allows {}",
+                cp_path.display(),
+                spec.codepoints.max_weights
+            ));
+        }
+        let expected: Vec<u32> = (0..length)
+            .map(|index| {
+                let at = offset + 2 * index;
+                u32::from(u16::from_le_bytes(
+                    data[at..at + 2].try_into().expect("sortkey weight"),
+                ))
+            })
+            .collect();
+        offset += 2 * length;
+        if (0xD800..=0xDFFF).contains(&cp) {
+            surrogates_skipped += 1;
+            continue;
+        }
+        codepoints_checked += 1;
+        let character = char::from_u32(cp as u32).expect("scalar value");
+        let actual = sag2_core::sort_key(&character.to_string());
+        if actual != expected {
+            codepoint_diffs += 1;
+            if failures.len() < MAX_FAILURES {
+                failures.push(Failure {
+                    case_id: "sortkey/codepoints".to_owned(),
+                    path: format!("U+{cp:04X}"),
+                    expected: format!("{expected:?}"),
+                    actual: format!("{actual:?}"),
+                    delta: None,
+                });
+            }
+        }
+    }
+    if offset != data.len() {
+        return Err(format!(
+            "{} holds {} trailing bytes after {count} records",
+            cp_path.display(),
+            data.len() - offset
+        ));
+    }
+
+    // sk_pairs: the sign of the comparison, independent of the key arrays.
+    let pairs_path = options.golden.join("sk_pairs.bin.gz");
+    let compressed = fs::read(&pairs_path)
+        .map_err(|error| format!("cannot read {}: {error}", pairs_path.display()))?;
+    let data = gunzip(&pairs_path, &compressed)?;
+    if data.len() < 12 || &data[..8] != spec.pairs.magic.as_bytes() {
+        return Err(format!(
+            "{} does not start with the manifest magic",
+            pairs_path.display()
+        ));
+    }
+    let count = u32::from_le_bytes(data[8..12].try_into().expect("sortkey pair count")) as usize;
+    if count != spec.pairs.pairs {
+        return Err(format!(
+            "golden inconsistency: {} holds {count} pairs, manifest says {}",
+            pairs_path.display(),
+            spec.pairs.pairs
+        ));
+    }
+    if data.len() != 12 + count * 10 {
+        return Err(format!(
+            "{} holds {} bytes, {count} 10-byte records need {}",
+            pairs_path.display(),
+            data.len(),
+            12 + count * 10
+        ));
+    }
+    let mut pairs_checked = 0_usize;
+    let mut pair_diffs = 0_usize;
+    for index in 0..count {
+        let base = 12 + index * 10;
+        let kind = data[base];
+        let left = u32::from_le_bytes(data[base + 1..base + 5].try_into().expect("pair a"));
+        let right = u32::from_le_bytes(data[base + 5..base + 9].try_into().expect("pair b"));
+        let expected = data[base + 9] as i8;
+        let (left_term, right_term) = match kind {
+            0 => (
+                char::from_u32(left)
+                    .ok_or_else(|| format!("sortkey pair {index}: U+{left:04X} is not scalar"))?
+                    .to_string(),
+                char::from_u32(right)
+                    .ok_or_else(|| format!("sortkey pair {index}: U+{right:04X} is not scalar"))?
+                    .to_string(),
+            ),
+            1 => (
+                lines
+                    .get(left as usize)
+                    .ok_or_else(|| {
+                        format!("sortkey pair {index}: index {left} is outside sk_vocab")
+                    })?
+                    .term
+                    .clone(),
+                lines
+                    .get(right as usize)
+                    .ok_or_else(|| {
+                        format!("sortkey pair {index}: index {right} is outside sk_vocab")
+                    })?
+                    .term
+                    .clone(),
+            ),
+            other => {
+                return Err(format!(
+                    "{}: pair {index} has unknown kind {other}",
+                    pairs_path.display()
+                ))
+            }
+        };
+        pairs_checked += 1;
+        let actual = match sag2_core::sort_key(&left_term).cmp(&sag2_core::sort_key(&right_term)) {
+            std::cmp::Ordering::Less => -1_i8,
+            std::cmp::Ordering::Equal => 0,
+            std::cmp::Ordering::Greater => 1,
+        };
+        if actual != expected {
+            pair_diffs += 1;
+            if failures.len() < MAX_FAILURES {
+                failures.push(Failure {
+                    case_id: "sortkey/pairs".to_owned(),
+                    path: format!("pair {index}"),
+                    expected: format!("{expected} ({left_term:?} vs {right_term:?})"),
+                    actual: actual.to_string(),
+                    delta: None,
+                });
+            }
+        }
+    }
+
+    println!(
+        "sortkeys: {} terms ({} key diffs, {} order diffs), \
+         {codepoints_checked} code points ({codepoint_diffs} diffs, {surrogates_skipped} surrogates), \
+         {pairs_checked} pairs ({pair_diffs} diffs)",
+        lines.len(),
+        vocab_key_diffs,
+        vocab_order_diffs
+    );
+    let passed = failures_before == failures.len()
+        && vocab_key_diffs == 0
+        && vocab_order_diffs == 0
+        && codepoint_diffs == 0
+        && pair_diffs == 0;
+    Ok(serde_json::json!({
+        "vocab_terms": lines.len(),
+        "vocab_key_diffs": vocab_key_diffs,
+        "vocab_order_diffs": vocab_order_diffs,
+        "codepoints_checked": codepoints_checked,
+        "surrogates_skipped": surrogates_skipped,
+        "codepoint_diffs": codepoint_diffs,
+        "pairs_checked": pairs_checked,
+        "pair_diffs": pair_diffs,
+        "passed": passed,
+    }))
 }
 
 fn run_gate_d(options: &Options) -> Result<ExitCode, String> {

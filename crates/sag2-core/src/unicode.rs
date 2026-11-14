@@ -13,6 +13,8 @@
 //! * `nfkd.bin`: `u32 count, u8 width` then `count` records
 //!   `cp:u32le, len:u8, cps:[u32le;width]`, the fully decomposed compatibility
 //!   mapping of every code point that changes (Hangul is algorithmic).
+//! * `nfd.bin`: the same layout for the *canonical* decomposition pyuca's
+//!   `sort_key` starts with (design §5.4 step 1).
 //! * `compose.bin`: `u32 count` then `count` records
 //!   `a:u32le, b:u32le, composite:u32le`, sorted by `(a, b)`; the canonical
 //!   composition pairs Python's `NFC` applies (Hangul is algorithmic).
@@ -30,6 +32,7 @@ static NUMBERS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/numbers.bin"))
 static UPPERCASE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/uppercase.bin"));
 static MARKS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/marks.bin"));
 static NFKD: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/nfkd.bin"));
+static NFD: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/nfd.bin"));
 static COMPOSE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/compose.bin"));
 
 const MAPPING_RECORD: usize = 17;
@@ -161,12 +164,13 @@ pub fn is_mark(cp: u32) -> bool {
     bit_is_set(MARKS, cp)
 }
 
-/// One record of `nfkd.bin` for `cp`, plus the table's record width.
-fn nfkd_record(cp: u32) -> Option<(&'static [u8], usize)> {
-    let count = table_count(NFKD);
-    let width = NFKD[4] as usize;
+/// One record of a sparse decomposition table for `cp`, plus the table's
+/// record width.  `table` is `nfd.bin` or `nfkd.bin`, which share the layout.
+fn sparse_record(table: &'static [u8], cp: u32) -> Option<(&'static [u8], usize)> {
+    let count = table_count(table);
+    let width = table[4] as usize;
     let stride = 5 + 4 * width;
-    let records = &NFKD[5..];
+    let records = &table[5..];
     let mut low = 0_usize;
     let mut high = count;
     while low < high {
@@ -237,7 +241,7 @@ fn compose_pair(left: u32, right: u32) -> Option<u32> {
     None
 }
 
-fn decompose_char(character: char, out: &mut Vec<char>) {
+fn decompose_char(table: &'static [u8], character: char, out: &mut Vec<char>) {
     let cp = character as u32;
     if (HANGUL_S_BASE..HANGUL_S_BASE + HANGUL_S_COUNT).contains(&cp) {
         let index = cp - HANGUL_S_BASE;
@@ -252,14 +256,14 @@ fn decompose_char(character: char, out: &mut Vec<char>) {
         }
         return;
     }
-    match nfkd_record(cp) {
+    match sparse_record(table, cp) {
         Some((record, width)) => {
             let length = record[4] as usize;
             for index in 0..length {
                 let at = 5 + index * 4;
                 let mapped =
-                    u32::from_le_bytes(record[at..at + 4].try_into().expect("nfkd mapping cp"));
-                out.push(char::from_u32(mapped).expect("nfkd mapping is a scalar value"));
+                    u32::from_le_bytes(record[at..at + 4].try_into().expect("decomposition cp"));
+                out.push(char::from_u32(mapped).expect("decomposition is a scalar value"));
             }
             debug_assert!(length <= width);
         }
@@ -319,11 +323,25 @@ fn compose(characters: &[char]) -> String {
     out.into_iter().collect()
 }
 
+/// `unicodedata.normalize("NFD", text)`.
+///
+/// pyuca's `sort_key` normalises with NFD before the trie lookup (design §5.4
+/// step 1); the canonical table holds only the non-identity mappings, the
+/// Hangul syllables decompose algorithmically and the ordering is UAX #15.
+pub fn nfd(text: &str) -> String {
+    let mut characters: Vec<char> = Vec::with_capacity(text.len());
+    for character in text.chars() {
+        decompose_char(NFD, character, &mut characters);
+    }
+    canonical_order(&mut characters);
+    characters.into_iter().collect()
+}
+
 /// `unicodedata.normalize("NFKD", text)`.
 pub fn nfkd(text: &str) -> String {
     let mut characters: Vec<char> = Vec::with_capacity(text.len());
     for character in text.chars() {
-        decompose_char(character, &mut characters);
+        decompose_char(NFKD, character, &mut characters);
     }
     canonical_order(&mut characters);
     characters.into_iter().collect()
@@ -333,7 +351,7 @@ pub fn nfkd(text: &str) -> String {
 pub fn nfkc(text: &str) -> String {
     let mut characters: Vec<char> = Vec::with_capacity(text.len());
     for character in text.chars() {
-        decompose_char(character, &mut characters);
+        decompose_char(NFKD, character, &mut characters);
     }
     canonical_order(&mut characters);
     compose(&characters)

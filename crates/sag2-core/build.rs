@@ -28,7 +28,8 @@ const LOWER: (&str, &[u8], usize) = ("unicode_lower", b"SAG2LOWR", 17);
 const CASEFOLD: (&str, &[u8], usize) = ("unicode_casefold", b"SAG2CASE", 17);
 const COMBINING: (&str, &[u8], usize) = ("unicode_combining", b"SAG2COMB", 5);
 const CATEGORIES: (&str, &[u8], usize) = ("unicode_categories", b"SAG2CATE", 5);
-const SPARSE: [(&str, &[u8]); 3] = [
+const SPARSE: [(&str, &[u8]); 4] = [
+    ("unicode_nfd", b"SAG2NFDD"),
     ("unicode_nfkd", b"SAG2NFKD"),
     ("unicode_nfkc", b"SAG2NFKC"),
     ("unicode_compose", b"SAG2COMP"),
@@ -57,6 +58,7 @@ fn main() {
     let (total, freq) = load_dict(&dict_path);
     write_freq_tables(&out_dir, total, &freq);
     write_unicode_tables(&golden, &out_dir);
+    write_ducet_tables(&crate_dir.join("data/allkeys-9.0.0.txt"), &out_dir);
 }
 
 /// Python's `jieba.Tokenizer.gen_pfdict` (`sag2.py:49` constructs the tokenizer
@@ -264,4 +266,176 @@ fn write_unicode_tables(golden: &Path, out_dir: &Path) {
         fs::write(out_dir.join(format!("{output}.bin")), &data[8..])
             .expect("write sparse table");
     }
+}
+
+/// DUCET 9.0.0's longest key is three code points; a longer key would need a
+/// wider packing, so fail loudly instead of truncating.
+const DUCET_MAX_KEY: usize = 3;
+/// A code point occupies 21 bits in the packed key (0x10FFFF < 2^21).
+const DUCET_KEY_BITS: u32 = 21;
+
+/// Compile `allkeys-9.0.0.txt` into the compact arrays `collate.rs`
+/// binary-searches (design §5.4 item 2).
+///
+/// * `ducet_keys.bin`: packed `u64le` keys, ascending.  A key is at most three
+///   code points at 21 bits each (`cp0 << 42 | cp1 << 21 | cp2`, absent = 0).
+///   `U+0000` is a key on its own but never appears inside a longer key, so
+///   zero padding is unambiguous.
+/// * `ducet_offsets.bin`: `u32le` start of each entry's collation elements in
+///   `ducet_ces.bin`, plus one sentinel (`count = offsets[i + 1] - offsets[i]`).
+/// * `ducet_ces.bin`: `u16le` weights, three per collation element.  Every
+///   weight in this file fits `u16` (the maximum is 65533), and `[*` variable
+///   entries keep the three weights pyuca reads (design §5.4 item 5).
+/// * `ducet_implicit.bin`: `start:u32le, end:u32le, base:u32le` from the
+///   file's `@implicitweights` directives.
+fn write_ducet_tables(path: &Path, out_dir: &Path) {
+    println!("cargo:rerun-if-changed={}", path.display());
+    let text = fs::read_to_string(path)
+        .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+    // pyuca's `Trie.add` overwrites a repeated key; `BTreeMap::insert` does the
+    // same and keeps the output sorted by packed key.
+    let mut entries: BTreeMap<u64, Vec<[u16; 3]>> = BTreeMap::new();
+    let mut implicit: Vec<(u32, u32, u32)> = Vec::new();
+    for (number, raw) in text.lines().enumerate() {
+        let line_number = number + 1;
+        let line = raw.split('#').next().unwrap_or("").trim();
+        if line.is_empty() || line.starts_with("@version") {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("@implicitweights") {
+            let (range, base) = rest.split_once(';').unwrap_or_else(|| {
+                panic!("{}:{line_number}: malformed @implicitweights", path.display())
+            });
+            let (start, end) = range.split_once("..").unwrap_or_else(|| {
+                panic!("{}:{line_number}: malformed @implicitweights range", path.display())
+            });
+            implicit.push((
+                ducet_codepoint(start, path, line_number),
+                ducet_codepoint(end, path, line_number),
+                ducet_codepoint(base, path, line_number),
+            ));
+            continue;
+        }
+        if line.starts_with('@') {
+            panic!(
+                "{}:{line_number}: unsupported DUCET directive {line:?}",
+                path.display()
+            );
+        }
+        let (left, right) = line.split_once(';').unwrap_or_else(|| {
+            panic!("{}:{line_number}: DUCET line has no ';'", path.display())
+        });
+        let key: Vec<u32> = left
+            .split_whitespace()
+            .map(|field| ducet_codepoint(field, path, line_number))
+            .collect();
+        if key.is_empty() || key.len() > DUCET_MAX_KEY {
+            panic!(
+                "{}:{line_number}: key has {} code points, the packed layout holds {DUCET_MAX_KEY}",
+                path.display(),
+                key.len()
+            );
+        }
+        let elements = parse_collation_elements(right);
+        if elements.is_empty() {
+            panic!(
+                "{}:{line_number}: entry has no collation element; pyuca's implicit-weight \
+                 fallback assumes it never sees one",
+                path.display()
+            );
+        }
+        entries.insert(pack_ducet_key(&key), elements);
+    }
+
+    let mut keys = Vec::with_capacity(entries.len() * 8);
+    let mut offsets = Vec::with_capacity((entries.len() + 1) * 4);
+    let mut ces: Vec<u8> = Vec::new();
+    for (key, elements) in &entries {
+        keys.extend_from_slice(&key.to_le_bytes());
+        offsets.extend_from_slice(&((ces.len() / 6) as u32).to_le_bytes());
+        for element in elements {
+            for weight in element {
+                ces.extend_from_slice(&weight.to_le_bytes());
+            }
+        }
+    }
+    offsets.extend_from_slice(&((ces.len() / 6) as u32).to_le_bytes());
+
+    let mut implicit_bytes = Vec::with_capacity(implicit.len() * 12);
+    for (start, end, base) in &implicit {
+        implicit_bytes.extend_from_slice(&start.to_le_bytes());
+        implicit_bytes.extend_from_slice(&end.to_le_bytes());
+        implicit_bytes.extend_from_slice(&base.to_le_bytes());
+    }
+
+    fs::write(out_dir.join("ducet_keys.bin"), &keys).expect("write ducet keys");
+    fs::write(out_dir.join("ducet_offsets.bin"), &offsets).expect("write ducet offsets");
+    fs::write(out_dir.join("ducet_ces.bin"), &ces).expect("write ducet collation elements");
+    fs::write(out_dir.join("ducet_implicit.bin"), &implicit_bytes)
+        .expect("write ducet implicit weights");
+}
+
+fn ducet_codepoint(text: &str, path: &Path, line: usize) -> u32 {
+    let trimmed = text.trim();
+    let parsed = u32::from_str_radix(trimmed, 16)
+        .unwrap_or_else(|_| panic!("{}:{line}: {trimmed:?} is not hex", path.display()));
+    if parsed > 0x10FFFF {
+        panic!("{}:{line}: {trimmed:?} is not a code point", path.display());
+    }
+    parsed
+}
+
+/// `pyuca.collator.COLL_ELEMENT_PATTERN`: `[` then `*` or `.`, then three
+/// exactly-four-digit groups, then an optional ignored fourth group, then `]`.
+/// Anything that does not match is skipped, exactly as `finditer` does.
+fn parse_collation_elements(text: &str) -> Vec<[u16; 3]> {
+    let mut elements = Vec::new();
+    let mut cursor = 0_usize;
+    while let Some(offset) = text[cursor..].find('[') {
+        let open = cursor + offset;
+        let Some(close_offset) = text[open..].find(']') else {
+            break;
+        };
+        let close = open + close_offset;
+        cursor = close + 1;
+        let token = &text[open + 1..close];
+        let mut characters = token.chars();
+        match characters.next() {
+            Some('.') | Some('*') => {}
+            _ => continue,
+        }
+        let fields: Vec<&str> = characters.as_str().split('.').collect();
+        if fields.len() < 3 || fields.len() > 4 {
+            continue;
+        }
+        if !fields
+            .iter()
+            .take(3)
+            .all(|field| field.len() == 4 && field.chars().all(|c| c.is_ascii_hexdigit()))
+        {
+            continue;
+        }
+        if let Some(fourth) = fields.get(3) {
+            if !(4..=5).contains(&fourth.len())
+                || !fourth.chars().all(|c| c.is_ascii_hexdigit())
+            {
+                continue;
+            }
+        }
+        let mut weights = [0_u16; 3];
+        for (slot, field) in weights.iter_mut().zip(fields.iter()) {
+            *slot = u16::from_str_radix(field, 16).expect("four hex digits fit u16");
+        }
+        elements.push(weights);
+    }
+    elements
+}
+
+fn pack_ducet_key(cps: &[u32]) -> u64 {
+    let mut packed = 0_u64;
+    for (index, &cp) in cps.iter().enumerate() {
+        debug_assert!(cp < 1 << DUCET_KEY_BITS);
+        packed |= u64::from(cp) << (DUCET_KEY_BITS * (DUCET_MAX_KEY as u32 - 1 - index as u32));
+    }
+    packed
 }

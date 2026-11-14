@@ -1,5 +1,5 @@
 {
-  "generator_version": "0.5.0",
+  "generator_version": "0.6.0",
   "python": "3.12.11",
   "sqlite": "3.50.4",
   "jieba": "0.42.1",
@@ -77,6 +77,12 @@
       "gzip_bytes": 1682875
     },
     {
+      "path": "unicode_nfd.bin.gz",
+      "sha256": "31bb4155b58c7dc84ead245462e1f04f4f19c53ab7dda6b355560764fe6e1500",
+      "records": 2061,
+      "gzip_bytes": 10337
+    },
+    {
       "path": "unicode_nfkd.bin.gz",
       "sha256": "f9deb0e71c5caec269e51772ad7b86d94bb7dec5eec6ea8912f00ba05a478d17",
       "records": 5857,
@@ -93,6 +99,23 @@
       "sha256": "2d8bee1e0561143f2dffccfb26d9228ab751bfdf2efe869c4d775945fa8bb0ba",
       "records": 941,
       "gzip_bytes": 4137
+    },
+    {
+      "path": "sk_vocab.jsonl",
+      "sha256": "886a135cfdf8dccf92b7c3bcad5ae79a50420b61511c61b4e53c6de12f9c0d93",
+      "lines": 4821
+    },
+    {
+      "path": "sk_cp.bin.gz",
+      "sha256": "7699a4e41531d4cb1d58bb7060897b21ed7fdc387ef38f91dc386e5a8384fa77",
+      "records": 1114112,
+      "gzip_bytes": 1990719
+    },
+    {
+      "path": "sk_pairs.bin.gz",
+      "sha256": "9bddd4ee7b5958086b9bdf35a55ac45fc09cc04e0a42ddf9145d1776d47744c8",
+      "records": 200000,
+      "gzip_bytes": 899327
     }
   ],
   "tokenizer": {
@@ -151,6 +174,18 @@
     }
   },
   "unicode_sparse": {
+    "nfd": {
+      "path": "unicode_nfd.bin.gz",
+      "magic": "SAG2NFDD",
+      "fields": [
+        "cp:u32le",
+        "len:u8",
+        "cps:[u32le;width]"
+      ],
+      "header": "count:u32le, width:u8",
+      "records": 2061,
+      "width": 4
+    },
     "nfkd": {
       "path": "unicode_nfkd.bin.gz",
       "magic": "SAG2NFKD",
@@ -197,6 +232,32 @@
     "fixtures": 7,
     "probes": 27,
     "golden": "index_expected.jsonl"
+  },
+  "sortkeys": {
+    "vocab": {
+      "golden": "sk_vocab.jsonl",
+      "terms": 4821,
+      "order": "term"
+    },
+    "codepoints": {
+      "golden": "sk_cp.bin.gz",
+      "magic": "SAG2SKCP",
+      "codepoints": 1114112,
+      "layout": "u32 count, then len:u8 + weights:[u16le;len] per code point",
+      "max_weights": 57,
+      "surrogates": "present in the golden; lone surrogates are not scalar values"
+    },
+    "pairs": {
+      "golden": "sk_pairs.bin.gz",
+      "magic": "SAG2SKPR",
+      "pairs": 200000,
+      "layout": "u32 count, then kind:u8 + a:u32le + b:u32le + expected:i8",
+      "seed": 20261114,
+      "kinds": {
+        "0": "code points",
+        "1": "sk_vocab.jsonl file order"
+      }
+    }
   },
   "fixtures": [
     {

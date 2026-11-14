@@ -38,6 +38,12 @@ Outputs (all under ``--out``, default ``golden/``):
     generator/python/sqlite/jieba/pyuca/unicode versions, the reference source
     digests and commit, corpus digest, file digests and the fixture -> index
     mapping
+``unicode_nfd.bin.gz``
+    canonical NFD of every code point (pyuca's `sort_key` starts with it; the
+    tokenizer's tables only cover NFKD/NFKC)
+``sk_vocab.jsonl``, ``sk_cp.bin.gz``, ``sk_pairs.bin.gz``
+    Gate B's sort-key goldens (design §5.5): the vocabulary keys, the key of
+    every single-code-point string and 200,000 ordered comparison pairs
 """
 
 from __future__ import annotations
@@ -89,7 +95,7 @@ if os.environ.get("PYTHONHASHSEED") != "0":
     )
 
 DEFAULT_REFERENCE = Path("../SAG-Benchmark/sag2/scripts")
-GENERATOR_VERSION = "0.5.0"
+GENERATOR_VERSION = "0.6.0"
 
 # Design §3.3: the v1 `rust_index_metadata` key set.  A Rust-built index must
 # carry exactly these keys; the values are compared against the runtime.
@@ -946,6 +952,15 @@ CATEGORY_PATTERNS = (
 # `compose` carries `u32 count` and then `count` records of
 # `a:u32le, b:u32le, composite:u32le`, sorted by `(a, b)`.
 SPARSE_UNICODE_TABLES = {
+    # Canonical decomposition (design §5.4 step 1): pyuca's `sort_key` starts
+    # with `unicodedata.normalize("NFD", s)`, and the tokenizer tables only
+    # cover NFKD/NFKC, so Gate B needs this table of its own.
+    "nfd": {
+        "magic": b"SAG2NFDD",
+        "path": "unicode_nfd.bin.gz",
+        "fields": ["cp:u32le", "len:u8", "cps:[u32le;width]"],
+        "header": "count:u32le, width:u8",
+    },
     "nfkd": {
         "magic": b"SAG2NFKD",
         "path": "unicode_nfkd.bin.gz",
@@ -1014,10 +1029,12 @@ def _compose_pairs():
 
 
 def export_sparse_unicode_tables():
+    nfd, nfd_width = _sparse_mapping(lambda char: unicodedata.normalize("NFD", char))
     nfkd, nfkd_width = _sparse_mapping(lambda char: unicodedata.normalize("NFKD", char))
     nfkc, nfkc_width = _sparse_mapping(lambda char: unicodedata.normalize("NFKC", char))
     pairs = _compose_pairs()
     blobs = {
+        "nfd": _sparse_mapping_bytes(b"SAG2NFDD", nfd, nfd_width),
         "nfkd": _sparse_mapping_bytes(b"SAG2NFKD", nfkd, nfkd_width),
         "nfkc": _sparse_mapping_bytes(b"SAG2NFKC", nfkc, nfkc_width),
     }
@@ -1027,6 +1044,7 @@ def export_sparse_unicode_tables():
         buffer += struct.pack("<III", left, right, composite)
     blobs["compose"] = bytes(buffer)
     counts = {
+        "nfd": {"records": len(nfd), "width": nfd_width},
         "nfkd": {"records": len(nfkd), "width": nfkd_width},
         "nfkc": {"records": len(nfkc), "width": nfkc_width},
         "compose": {"records": len(pairs)},
@@ -1132,6 +1150,274 @@ def export_ascii_runs(sag2):
     return "".join(json.dumps(line, ensure_ascii=False) + "\n" for line in lines), len(lines)
 
 
+# --------------------------------------------------------------------------
+# Gate B (collation) - design §5.5: the pyuca 1.2 sort-key goldens.
+#
+# The open term set is the reason this fixture exists: it is the one gate that
+# must fail even when no current fixture changes, because a term that appears
+# tomorrow may use a code point that collates differently.
+# --------------------------------------------------------------------------
+
+SK_CP_MAGIC = b"SAG2SKCP"
+SK_PAIRS_MAGIC = b"SAG2SKPR"
+SK_PAIR_COUNT = 200_000
+SK_PAIR_SEED = 20261114
+
+# Design §5.5 item 1's adversarial set: case pairs, composed and decomposed
+# accents, `ß`, Greek final sigma, kana variants, CJK and CJK ext-B, combining
+# sequences (including one that needs canonical reordering), emoji, single
+# punctuation and the empty string.
+SK_ADVERSARIAL_TERMS = [
+    "",
+    "alice", "Alice", "ALICE",
+    "cafe", "café", "cafe\u0301",
+    "straße", "strasse",
+    "ΑΣ", "ας", "ασ",
+    "ア", "あ", "ｱ",
+    "一", "二", "一二三", "一二年",
+    "\U00020000", "\U00020001", "\U0002A6D6",
+    "e\u0301\u0327", "e\u0327\u0301", "\u0301",
+    "👍", "👨‍👩‍👧‍👦", "𝄞",
+    "%", "_", ".", "-", "A.H.G.", "half-ounce",
+    "ｶﾀｶﾅ", "ガ", "か\u3099",
+    # DUCET contractions the fixture corpora would never produce: a
+    # two-code-point key with a starter second code point (`l·`) and the only
+    # three-code-point keys in the table (Kannada, Sinhala, Tibetan stacks).
+    "l·l", "L·L", "ೋ", "ෝ", "ྲཱྀ",
+    # A code point that only reaches its two-code-point entry after NFD:
+    # `й` decomposes to `и` + U+0306 and DUCET folds the pair into one entry.
+    "й", "Й",
+    # Non-starter folding across an intervening mark of a lower class: pyuca
+    # folds U+0306 / U+0654 into the preceding segment even though it is not
+    # adjacent (`и` + U+0316 + U+0306, `ا` + U+0650 + U+0654).
+    "и\u0316\u0306", "ا\u0650\u0654",
+    # A mark sequence blocked from folding by an equal combining class.
+    "a\u0301\u0301",
+]
+
+
+def _sortkey_vocabulary(fixtures, index_expectations, retrieve_lines, chunk_cases, sag2):
+    """Every term the gates could order (design §5.5 item 1).
+
+    The `frequencies` keys are the terms `expansion_terms` ranks; the corpus
+    tokens, name phrases and title windows cover the terms `retrieve_expansion`
+    derives from them (`name_phrase` joins and `repair_names` grounding); the
+    query expressions cover the C0/C3/C4/C5 query terms; the adversarial list
+    covers the code points no fixture contains.
+    """
+    terms = set(SK_ADVERSARIAL_TERMS)
+    for expectation in index_expectations:
+        statistics = json.loads(expectation["statistics"])
+        terms.update(statistics.get("frequencies", {}))
+        # `title_phrases` is a list of token tuples; the sorted term is the
+        # space-joined phrase (`sag2.py:686-688`).
+        terms.update(" ".join(phrase) for phrase in statistics.get("title_phrases", []))
+        aliases = statistics.get("aliases", {})
+        terms.update(aliases)
+        terms.update(aliases.values())
+
+    def absorb(text):
+        terms.update(sag2.tokenize(text))
+        for match in sag2.NAMES.finditer(text):
+            terms.add(" ".join(sag2.tokenize(match[0])))
+
+    for fixture in fixtures:
+        for document in fixture.corpus:
+            absorb(document.get("title", ""))
+            absorb(document.get("text", ""))
+    for case in chunk_cases:
+        absorb(case["source"])
+        for chunk in case["chunks"]:
+            absorb(chunk["content"])
+    for line in retrieve_lines:
+        absorb(line["expression"])
+    # `title_phrases` and the `repair_names` fallback ground a phrase to a
+    # contiguous token window of a title (`sag2.py:686-688`), so every 2..4
+    # window is a term the sorter may have to place.
+    for fixture in fixtures:
+        for document in fixture.corpus:
+            tokens = sag2.tokenize(document.get("title", ""))
+            for start in range(len(tokens)):
+                for width in (2, 3, 4):
+                    window = tokens[start : start + width]
+                    if len(window) == width:
+                        terms.add(" ".join(window))
+    return terms
+
+
+def _sortkey_codepoints(collator):
+    """`sk_cp.bin.gz`: the key of every single-code-point string.
+
+    Layout: `magic, u32 count`, then one variable-length record per code point
+    in ascending order: `len:u8, weights:[u16le;len]`.  A fixed-width record
+    costs > 4 MB gzipped because the longest key is 57 weights; the design's
+    ≤ 3 MB target needs the length-prefixed form.  Every weight is asserted to
+    fit `u16` so the narrowing is checked, not assumed.
+    """
+    buffer = bytearray(SK_CP_MAGIC)
+    buffer += struct.pack("<I", CODEPOINTS)
+    max_weights = 0
+    for cp in range(CODEPOINTS):
+        key = collator.sort_key(chr(cp))
+        if len(key) > 0xFF:
+            raise SystemExit(f"U+{cp:04X}: sort key wider than 255 weights")
+        for weight in key:
+            if weight > 0xFFFF:
+                raise SystemExit(f"U+{cp:04X}: sort key weight {weight} does not fit u16")
+        max_weights = max(max_weights, len(key))
+        buffer += struct.pack("<B", len(key))
+        buffer += b"".join(struct.pack("<H", weight) for weight in key)
+    return bytes(buffer), max_weights
+
+
+def _sortkey_pairs(input_order, keys_by_term, collator):
+    """`sk_pairs.bin.gz`: 200,000 ordered pairs and their expected sign.
+
+    Layout: `magic, u32 count`, then `kind:u8, a:u32le, b:u32le, expected:i8`
+    where `kind == 0` means code points and `kind == 1` indexes `sk_vocab.jsonl`
+    (file order).  Key equality alone cannot prove the comparison semantics
+    (design §5.5), so this fixture checks the sign independently.
+    """
+    rng = random.Random(SK_PAIR_SEED)
+    index_of = {term: position for position, term in enumerate(input_order)}
+    records = []
+
+    def sign(left, right):
+        return (left > right) - (left < right)
+
+    def add_vocab(left, right):
+        records.append(
+            (
+                1,
+                index_of[left],
+                index_of[right],
+                sign(keys_by_term[left], keys_by_term[right]),
+            )
+        )
+
+    def add_codepoints(left, right):
+        records.append(
+            (
+                0,
+                left,
+                right,
+                sign(collator.sort_key(chr(left)), collator.sort_key(chr(right))),
+            )
+        )
+
+    # Every ordered pair of the adversarial set: case, accent, sigma, kana,
+    # CJK and combining-sequence relations are all represented exactly.
+    for left in SK_ADVERSARIAL_TERMS:
+        for right in SK_ADVERSARIAL_TERMS:
+            add_vocab(left, right)
+    # Equal terms must compare 0 (the sorter is stable and ties are real).
+    for term in input_order[:20_000]:
+        add_vocab(term, term)
+    # Adjacent code points, the densest place where implicit weights meet
+    # explicit entries.
+    for cp in range(0, CODEPOINTS - 1, 28):
+        if 0xD800 <= cp <= 0xDFFF or 0xD800 <= cp + 1 <= 0xDFFF:
+            continue
+        add_codepoints(cp, cp + 1)
+    # Category boundaries: CJK vs ASCII, ext-B vs BMP, marks vs bases, emoji.
+    boundaries = [
+        (0x0041, 0x4E00), (0x4E00, 0x9FCC), (0x9FCC, 0xA000),
+        (0x3400, 0x4DB5), (0x4DB5, 0x20000), (0x2A6D6, 0x2B820),
+        (0x2B820, 0x2CEAF), (0x2CEA2, 0x2B820), (0x17000, 0x18AFF),
+        (0x0301, 0x0061), (0x0065, 0x0301), (0x0391, 0x03B1),
+        (0x30A2, 0x3042), (0xFF71, 0x30A2), (0x1F44D, 0x0041),
+        (0x0000, 0x0020), (0x0020, 0x0021), (0x007E, 0x00A0),
+        (0x00E9, 0x0065), (0x10FFFF, 0x0041),
+    ]
+    for index in range(20_000):
+        left, right = boundaries[index % len(boundaries)]
+        add_codepoints(left, right)
+    # Random code points and random vocabulary terms, then fill to the exact
+    # declared count with vocabulary pairs (deterministic under the seed).
+    for _ in range(40_000):
+        add_codepoints(
+            SCALARS[rng.randrange(len(SCALARS))], SCALARS[rng.randrange(len(SCALARS))]
+        )
+    for _ in range(60_000):
+        add_vocab(
+            input_order[rng.randrange(len(input_order))],
+            input_order[rng.randrange(len(input_order))],
+        )
+    while len(records) < SK_PAIR_COUNT:
+        add_vocab(
+            input_order[rng.randrange(len(input_order))],
+            input_order[rng.randrange(len(input_order))],
+        )
+    if len(records) != SK_PAIR_COUNT:
+        raise SystemExit(f"built {len(records)} sort-key pairs, want {SK_PAIR_COUNT}")
+    buffer = bytearray(SK_PAIRS_MAGIC)
+    buffer += struct.pack("<I", len(records))
+    for kind, left, right, expected in records:
+        buffer += struct.pack("<BIIb", kind, left, right, expected)
+    return bytes(buffer), len(records)
+
+
+def export_sortkeys(
+    fixtures,
+    index_expectations,
+    retrieve_lines,
+    chunk_cases,
+    sag2,
+    collator,
+):
+    """Gate B's three goldens plus their manifest metadata (design §5.5).
+
+    The two binary goldens are returned already gzipped with a zero mtime, so
+    re-exporting produces byte-identical files (design §7.5 `golden-regen`).
+    """
+    terms = _sortkey_vocabulary(
+        fixtures, index_expectations, retrieve_lines, chunk_cases, sag2
+    )
+    input_order = sorted(terms)
+    keys_by_term = {term: list(collator.sort_key(term)) for term in input_order}
+    ordered = sorted(input_order, key=lambda term: tuple(keys_by_term[term]))
+    rank = {term: position for position, term in enumerate(ordered)}
+    lines = [
+        {"term": term, "key": keys_by_term[term], "rank": rank[term]}
+        for term in input_order
+    ]
+    vocab_text = "".join(json.dumps(line, ensure_ascii=False) + "\n" for line in lines)
+    codepoints, max_weights = _sortkey_codepoints(collator)
+    pairs, pair_count = _sortkey_pairs(input_order, keys_by_term, collator)
+    metadata = {
+        "vocab": {
+            "golden": "sk_vocab.jsonl",
+            "terms": len(lines),
+            # `term` order is code point order; `rank` is the position in
+            # Python's stable `sorted(terms, key=collator.sort_key)`.
+            "order": "term",
+        },
+        "codepoints": {
+            "golden": "sk_cp.bin.gz",
+            "magic": SK_CP_MAGIC.decode(),
+            "codepoints": CODEPOINTS,
+            "layout": "u32 count, then len:u8 + weights:[u16le;len] per code point",
+            "max_weights": max_weights,
+            "surrogates": "present in the golden; lone surrogates are not scalar values",
+        },
+        "pairs": {
+            "golden": "sk_pairs.bin.gz",
+            "magic": SK_PAIRS_MAGIC.decode(),
+            "pairs": pair_count,
+            "layout": "u32 count, then kind:u8 + a:u32le + b:u32le + expected:i8",
+            "seed": SK_PAIR_SEED,
+            "kinds": {"0": "code points", "1": "sk_vocab.jsonl file order"},
+        },
+    }
+    return (
+        vocab_text,
+        len(lines),
+        _gzip_bytes(codepoints),
+        _gzip_bytes(pairs),
+        metadata,
+    )
+
+
 def reference_provenance(reference_dir):
     """Identify the exact reference source set the goldens came from."""
     provenance = {}
@@ -1165,6 +1451,7 @@ def build_manifest(
     sparse_unicode,
     chunks,
     index_expected,
+    sortkeys,
 ):
     corpus_digest = hashlib.sha256()
     for fixture in fixtures:
@@ -1188,6 +1475,7 @@ def build_manifest(
         "unicode_sparse": sparse_unicode,
         "chunks": chunks,
         "index_expected": index_expected,
+        "sortkeys": sortkeys,
         "fixtures": [
             {
                 "fixture": entry["fixture"],
@@ -1256,6 +1544,11 @@ def main(argv=None):
     import pyuca  # noqa: E402
 
     import sag2  # noqa: E402
+
+    # The reference module-level singleton (`sag2.py:50`); Gate B's goldens are
+    # its output, so the exporter must use the same class the reference picks
+    # (`pyuca.Collator` is the UCA 9.0.0 collator under Python >= 3.6).
+    collator = pyuca.Collator()
 
     reference = json.loads((reference_dir.parent / "tests" / "sag2_reference.json").read_text())
     provenance = reference_provenance(reference_dir)
@@ -1363,6 +1656,16 @@ def main(argv=None):
         ascii_text, ascii_lines = export_ascii_runs(sag2)
         unicode_blobs = export_unicode_tables()
         sparse_blobs, sparse_metadata = export_sparse_unicode_tables()
+        sortkey_text, sortkey_lines, sk_cp_blob, sk_pairs_blob, sortkey_metadata = (
+            export_sortkeys(
+                fixtures,
+                index_expectations,
+                retrieve_lines,
+                chunk_cases,
+                sag2,
+                collator,
+            )
+        )
 
         files = [
             {"path": "retrieve.jsonl", "sha256": _sha256_bytes(retrieve_text.encode()),
@@ -1401,6 +1704,29 @@ def main(argv=None):
                     "gzip_bytes": len(blob),
                 }
             )
+        files.append(
+            {
+                "path": "sk_vocab.jsonl",
+                "sha256": _sha256_bytes(sortkey_text.encode()),
+                "lines": sortkey_lines,
+            }
+        )
+        files.append(
+            {
+                "path": "sk_cp.bin.gz",
+                "sha256": _sha256_bytes(sk_cp_blob),
+                "records": sortkey_metadata["codepoints"]["codepoints"],
+                "gzip_bytes": len(sk_cp_blob),
+            }
+        )
+        files.append(
+            {
+                "path": "sk_pairs.bin.gz",
+                "sha256": _sha256_bytes(sk_pairs_blob),
+                "records": sortkey_metadata["pairs"]["pairs"],
+                "gzip_bytes": len(sk_pairs_blob),
+            }
+        )
         manifest = build_manifest(
             fixtures,
             {
@@ -1444,6 +1770,7 @@ def main(argv=None):
                 "probes": probe_expressions(fixtures),
                 "golden": "index_expected.jsonl",
             },
+            sortkey_metadata,
         )
 
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -1471,6 +1798,9 @@ def main(argv=None):
             (out_dir / spec["path"]).write_bytes(unicode_blobs[name])
         for name, spec in SPARSE_UNICODE_TABLES.items():
             (out_dir / spec["path"]).write_bytes(sparse_blobs[name])
+        (out_dir / "sk_vocab.jsonl").write_text(sortkey_text)
+        (out_dir / "sk_cp.bin.gz").write_bytes(sk_cp_blob)
+        (out_dir / "sk_pairs.bin.gz").write_bytes(sk_pairs_blob)
         (out_dir / "manifest.json").write_text(
             json.dumps(manifest, ensure_ascii=False, indent=2) + "\n"
         )
@@ -1479,8 +1809,10 @@ def main(argv=None):
             f"{tokenizer_lines} tokenizer segments, {ascii_lines} ASCII runs, "
             f"{len(chunk_cases)} chunk cases, {len(index_expectations)} index expectations, "
             f"{len(UNICODE_TABLES)} dense + {len(SPARSE_UNICODE_TABLES)} sparse unicode "
-            f"tables and {len(fixture_stats)} indexes "
-            f"to {out_dir}"
+            f"tables, {sortkey_lines} sort-key terms, "
+            f"{sortkey_metadata['codepoints']['codepoints']} sort-key code points, "
+            f"{sortkey_metadata['pairs']['pairs']} sort-key pairs and "
+            f"{len(fixture_stats)} indexes to {out_dir}"
         )
     finally:
         shutil.rmtree(staging, ignore_errors=True)

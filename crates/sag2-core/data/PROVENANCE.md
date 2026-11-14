@@ -24,3 +24,37 @@ The file is unmodified; any local edit invalidates the Gate D evidence and the
 `manifest.json` provenance recorded by `tools/export_golden.py`.
 
 License: jieba is MIT-licensed (see the upstream repository).
+
+# Third-party data: `allkeys-9.0.0.txt`
+
+`allkeys-9.0.0.txt` is the DUCET 9.0.0 table that ships with **pyuca 1.2**, the
+collation implementation the reference imports (`sag2.py:50`, design §5.1):
+
+| field | value |
+| --- | --- |
+| source | `site-packages/pyuca/allkeys-9.0.0.txt` from `pyuca==1.2` |
+| sha256 | `0633f4520c99f249b0c53aa1442cd2521702041fb00a32df944fec13c9da3ed5` |
+| bytes | 1,808,188 |
+| entries | 30,677 (29,809 single code points, 864 two, 4 three) |
+| collation elements | 36,624 (largest entry 18; maximum weight 65533) |
+| `@implicitweights` | `17000..18AFF; FB00` (Tangut and Tangut Components) |
+
+It is vendored because no crate implements UCA 9.0.0 (design §5.1), and the
+gate requires byte-exact parity with pyuca 1.2 rather than a newer UCA. The
+port reads it at build time only: `build.rs` compiles it into the sorted
+longest-prefix table `sag2-core` embeds (design §5.4 item 2).
+
+Two properties of this file matter to the port:
+
+* every collation element carries exactly three weights (no `[.x.x.x.x]`
+  fourth weight), so pyuca's fourth level is always empty;
+* `[*` marks 7,123 entries as variable, and pyuca assigns them the same
+  three weights as `[.` entries — the port must do the same (design §5.4
+  item 5).
+
+The file is unmodified; any local edit changes the sort keys Gate B certifies.
+The digest is also recorded as `uca_keys_sha256` in the index provenance
+(`crates/sag2-index/src/open.rs`).
+
+License: the DUCET file is distributed under the Unicode Terms of Use
+(https://www.unicode.org/copyright.html).
