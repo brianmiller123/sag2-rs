@@ -7,9 +7,11 @@ rust-version.workspace = true
 
 [dependencies]
 rusqlite = { version = "0.37", features = ["bundled"] }
+sag2-core = { path = "../sag2-core" }
 sag2-json = { path = "../sag2-json" }
 sag2-rank-sys = { path = "../sag2-rank-sys" }
 serde_json = "1"
+sha2 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

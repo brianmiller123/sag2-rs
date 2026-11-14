@@ -172,11 +172,7 @@ fn nfkd_record(cp: u32) -> Option<(&'static [u8], usize)> {
     while low < high {
         let middle = (low + high) / 2;
         let base = middle * stride;
-        let found = u32::from_le_bytes(
-            records[base..base + 4]
-                .try_into()
-                .expect("nfkd record cp"),
-        );
+        let found = u32::from_le_bytes(records[base..base + 4].try_into().expect("nfkd record cp"));
         match found.cmp(&cp) {
             std::cmp::Ordering::Less => low = middle + 1,
             std::cmp::Ordering::Greater => high = middle,
@@ -261,9 +257,8 @@ fn decompose_char(character: char, out: &mut Vec<char>) {
             let length = record[4] as usize;
             for index in 0..length {
                 let at = 5 + index * 4;
-                let mapped = u32::from_le_bytes(
-                    record[at..at + 4].try_into().expect("nfkd mapping cp"),
-                );
+                let mapped =
+                    u32::from_le_bytes(record[at..at + 4].try_into().expect("nfkd mapping cp"));
                 out.push(char::from_u32(mapped).expect("nfkd mapping is a scalar value"));
             }
             debug_assert!(length <= width);
@@ -301,8 +296,7 @@ fn compose(characters: &[char]) -> String {
             let blocked = last_class.is_some_and(|last| last >= class);
             if !blocked {
                 if let Some(composite) = compose_pair(out[index] as u32, character as u32) {
-                    out[index] =
-                        char::from_u32(composite).expect("composition is a scalar value");
+                    out[index] = char::from_u32(composite).expect("composition is a scalar value");
                     continue;
                 }
             }
@@ -323,6 +317,16 @@ fn compose(characters: &[char]) -> String {
         out.push(character);
     }
     out.into_iter().collect()
+}
+
+/// `unicodedata.normalize("NFKD", text)`.
+pub fn nfkd(text: &str) -> String {
+    let mut characters: Vec<char> = Vec::with_capacity(text.len());
+    for character in text.chars() {
+        decompose_char(character, &mut characters);
+    }
+    canonical_order(&mut characters);
+    characters.into_iter().collect()
 }
 
 /// `unicodedata.normalize("NFKC", text)`.

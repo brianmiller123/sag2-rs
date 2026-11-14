@@ -578,6 +578,7 @@ name = "sag2-cli"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "rusqlite",
  "sag2-core",
  "sag2-index",
  "serde",
@@ -599,9 +600,11 @@ name = "sag2-index"
 version = "0.1.0"
 dependencies = [
  "rusqlite",
+ "sag2-core",
  "sag2-json",
  "sag2-rank-sys",
  "serde_json",
+ "sha2",
  "tempfile",
 ]
 

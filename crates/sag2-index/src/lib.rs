@@ -4,11 +4,13 @@
 //! `links = "sqlite3"` constraint and the `Connection` lifetime live in one
 //! place (design §2.3).  P0 covers the read path: the corpus signature and the
 //! §3.4 open decision table, the cached statistics, and the `retrieve` SQL with
-//! its pruning, LRU and epoch semantics.  Building an index needs the tokenizer
-//! and the chunker, which P1 adds.
+//! its pruning, LRU and epoch semantics.  P1 adds [`CorpusIndex::open`]'s
+//! building branch (design §1.4 D1-D3): the Python schema, the signature, the
+//! cached seven-key statistics and the `rust_index_metadata` provenance rows.
 
 #![deny(unsafe_code)]
 
+mod build;
 mod open;
 mod pool;
 mod py312;
@@ -21,13 +23,16 @@ use std::path::{Path, PathBuf};
 
 use sag2_json::{compact_json, Value};
 
+pub use build::{BuildError, Document};
 pub use open::{
     decide, inspect, open, open_readonly, Decision, ExistingIndex, IndexOptions, OpenAction,
-    OpenError, OpenOutcome, RebuildPolicy, RebuildReason, RuntimeVersions, VersionCheck,
-    DEFAULT_CHUNK_CHARS, FORMAT_VERSION, PENDING_BUILD_RUNTIME, RUNTIME_VERSIONS,
+    OpenError, OpenOutcome, RebuildPolicy, RebuildReason, RuntimeVersions, FORMAT_VERSION,
+    FORMAT_VERSION_STR, JIEBA_DICT_SHA256, RUNTIME_VERSIONS, SAG_RANK_SHA256, SQLITE_VERSION,
+    TOKENIZER_VERSION, UCA_KEYS_SHA256, UCA_VERSION, UNICODE_VERSION,
 };
 pub use pool::{QueryOptions, QUERY_CACHE_ENTRIES, QUERY_WORKERS};
 pub use retrieve::{Hit, QueryError};
+pub use sag2_core::DEFAULT_CHUNK_CHARS;
 pub use signature::{changed_field, signature, CHUNK_POLICY, INDEX_SCHEMA};
 pub use statistics::{Statistics, StatisticsError};
 

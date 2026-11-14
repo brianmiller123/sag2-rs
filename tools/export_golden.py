@@ -24,6 +24,13 @@ Outputs (all under ``--out``, default ``golden/``):
     fixture index
 ``indexes/<fixture>.sqlite``
     the Python-built index each case runs against (Gate A runs on these)
+``chunks.jsonl``
+    every fixture document, the desktop reference cases and the
+    ``tests/test_chunking.py`` scenarios with heading, spans and content
+``index_expected.jsonl``
+    per fixture: ``metadata.signature``, every ``chunks`` row, the
+    ``chunk_fts`` vocabulary per column, ``index_statistics`` and the
+    ``rust_index_metadata`` key set (Gate D's Rust-vs-Python baseline)
 ``manifest.json``
     generator/python/sqlite/jieba/pyuca/unicode versions, the reference source
     digests and commit, corpus digest, file digests and the fixture -> index
@@ -78,7 +85,22 @@ if os.environ.get("PYTHONHASHSEED") != "0":
     )
 
 DEFAULT_REFERENCE = Path("../SAG-Benchmark/sag2/scripts")
-GENERATOR_VERSION = "0.3.0"
+GENERATOR_VERSION = "0.4.0"
+
+# Design §3.3: the v1 `rust_index_metadata` key set.  A Rust-built index must
+# carry exactly these keys; the values are compared against the runtime.
+RUST_INDEX_METADATA_KEYS = [
+    "format_version",
+    "tokenizer_version",
+    "chunk_policy_version",
+    "jieba_dict_sha256",
+    "unicode_version",
+    "uca_version",
+    "uca_keys_sha256",
+    "sqlite_version",
+    "sag_rank_sha256",
+    "sag2_rs_version",
+]
 
 # The reference modules whose identity the manifest records (design §7.1).
 REFERENCE_FILES = {
@@ -430,9 +452,206 @@ def export_fixture(fixture, sag2, work_dir):
         rows = [
             dict(row) for row in index.db.execute("SELECT * FROM chunks ORDER BY id")
         ]
-        return db_path, signature, cases, rows
+        expectation = index_expectation(fixture, index)
+        return db_path, signature, cases, rows, expectation
     finally:
         index.close()
+
+
+# --------------------------------------------------------------------------
+# Gate D (chunks) - design §1.4 D3, §7.2 `chunks`: every fixture document plus
+# the desktop reference cases and the `tests/test_chunking.py` scenarios.  The
+# record carries the *raw* corpus path (`path`, may be null) and the argument
+# `_prepare_index_document` actually passes to `chunk_document`
+# (`chunk_path`, `doc.get("path", "document.txt")`).  Keeping both makes the
+# §9 R13 double default observable: `chunk_document(path=None)` means
+# `document.md`, the index default means `document.txt`.
+# --------------------------------------------------------------------------
+
+
+def _chunk_case(doc_id, fixture, title, source, path, chunk_path, target, chunks, idx=None):
+    return {
+        "doc_id": doc_id,
+        "fixture": fixture,
+        "title": title,
+        "source": source,
+        "path": path,
+        "idx": idx,
+        "chunk_path": chunk_path,
+        "target": target,
+        "chunks": [
+            {
+                "heading": chunk["heading"],
+                "spans": [list(span) for span in chunk["spans"]],
+                "content": chunk["content"],
+            }
+            for chunk in chunks
+        ],
+    }
+
+
+def export_chunk_cases(fixtures, reference_dir, sag2):
+    """`chunks.jsonl`: fixture documents, desktop cases and chunking scenarios."""
+    cases = []
+    for fixture in fixtures:
+        for position, document in enumerate(fixture.corpus):
+            chunk_path = document.get("path", "document.txt")
+            chunks = sag2.chunk_document(
+                document["text"], fixture.chunk_chars, chunk_path
+            )
+            cases.append(
+                _chunk_case(
+                    f"{fixture.name}/{position}",
+                    fixture.name,
+                    document.get("title", ""),
+                    document["text"],
+                    document.get("path"),
+                    chunk_path,
+                    fixture.chunk_chars,
+                    chunks,
+                    document.get("idx"),
+                )
+            )
+
+    desktop_path = reference_dir.parent / "tests" / "desktop_chunks.json"
+    desktop = json.loads(desktop_path.read_text())
+    for case in desktop["cases"]:
+        chunks = sag2.chunk_document(case["source"], case["target"], case["path"])
+        actual = [
+            {
+                "heading": chunk["heading"],
+                "spans": [list(span) for span in chunk["spans"]],
+                "content": chunk["content"],
+            }
+            for chunk in chunks
+        ]
+        if actual != case["expected"]:
+            raise SystemExit(
+                f"desktop chunk case {case['name']} disagrees with the reference file"
+            )
+        cases.append(
+            _chunk_case(
+                f"chunking/desktop/{case['name']}",
+                "chunking",
+                "",
+                case["source"],
+                case["path"],
+                case["path"],
+                case["target"],
+                chunks,
+            )
+        )
+
+    first = "完整条件" * 100 + "。"
+    long = "超长句子" * 150 + "。"
+    last = "只有满足上述条件才能发布。"
+    scenarios = [
+        (
+            "chunking/long-sentence-overlap",
+            "# 发布指南\n## 生产环境\n" + first + long + last,
+            None,
+            None,
+            512,
+        ),
+        (
+            "chunking/plain-text-offsets",
+            "完整句子。" * 200,
+            "document.txt",
+            "document.txt",
+            512,
+        ),
+        (
+            "chunking/crlf-file-index",
+            "# 发布指南\r\n## 生产环境\r\n" + ("授权规则必须完整保留。\r\n\r\n" * 60),
+            "dsid_1__Guide.md",
+            "dsid_1__Guide.md",
+            512,
+        ),
+        (
+            "chunking/large-gap-utf16",
+            "# A\nfirst.\n" + "\n" * 10000 + "second.",
+            "guide.md",
+            "guide.md",
+            2200,
+        ),
+        (
+            "chunking/heading-retention",
+            "# 发布指南\n## 生产环境\n" + "发布前必须核对授权。" * 100,
+            "guide.md",
+            "guide.md",
+            512,
+        ),
+        (
+            "chunking/function-default-document-md",
+            "# not a heading in plain text\n\nsecond paragraph",
+            None,
+            None,
+            512,
+        ),
+        (
+            "chunking/index-default-document-txt",
+            "# not a heading in plain text\n\nsecond paragraph",
+            None,
+            "document.txt",
+            512,
+        ),
+    ]
+    for doc_id, source, path, chunk_path, target in scenarios:
+        chunks = sag2.chunk_document(source, target, chunk_path)
+        cases.append(
+            _chunk_case(doc_id, "chunking", "", source, path, chunk_path, target, chunks)
+        )
+    return cases
+
+
+# --------------------------------------------------------------------------
+# Gate D (index) - design §1.4 D1-D3: the signature, every `chunks` row, the
+# `chunk_fts` vocabulary per column, the cached statistics and the provenance
+# key set.  The reference index itself is the P0 `indexes/<fixture>.sqlite`.
+# --------------------------------------------------------------------------
+
+
+def index_expectation(fixture, index):
+    """Everything Gate D compares about a Python-built index."""
+    metadata_rows = index.db.execute("SELECT COUNT(*) FROM metadata").fetchone()[0]
+    signature = index.db.execute("SELECT signature FROM metadata").fetchone()[0]
+    chunks = [
+        dict(row) for row in index.db.execute("SELECT * FROM chunks ORDER BY id")
+    ]
+    index.db.execute(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS temp.vocab "
+        "USING fts5vocab(main,chunk_fts,'col')"
+    )
+    vocabulary = {}
+    for column in ("title", "heading", "body"):
+        vocabulary[column] = [
+            [row["term"], row["doc"]]
+            for row in index.db.execute(
+                "SELECT term, doc FROM temp.vocab WHERE col=? ORDER BY term",
+                (column,),
+            )
+        ]
+    statistics_rows = index.db.execute(
+        "SELECT signature, data FROM index_statistics"
+    ).fetchall()
+    if len(statistics_rows) != 1:
+        raise SystemExit(
+            f"{fixture.name}: expected one index_statistics row, "
+            f"found {len(statistics_rows)}"
+        )
+    return {
+        "fixture": fixture.name,
+        "index": f"{fixture.name}.sqlite",
+        "fingerprint": fixture.fingerprint,
+        "chunk_chars": fixture.chunk_chars,
+        "metadata_rows": metadata_rows,
+        "signature": signature,
+        "chunks": chunks,
+        "fts_vocabulary": vocabulary,
+        "statistics_signature": statistics_rows[0][0],
+        "statistics": statistics_rows[0][1],
+        "rust_index_metadata_keys": RUST_INDEX_METADATA_KEYS,
+    }
 
 
 # --------------------------------------------------------------------------
@@ -705,6 +924,8 @@ def build_manifest(
     ascii_runs,
     unicode_tables,
     sparse_unicode,
+    chunks,
+    index_expected,
 ):
     corpus_digest = hashlib.sha256()
     for fixture in fixtures:
@@ -726,6 +947,8 @@ def build_manifest(
         "ascii_runs": ascii_runs,
         "unicode_tables": unicode_tables,
         "unicode_sparse": sparse_unicode,
+        "chunks": chunks,
+        "index_expected": index_expected,
         "fixtures": [
             {
                 "fixture": entry["fixture"],
@@ -781,9 +1004,13 @@ def main(argv=None):
     work_dir.mkdir(parents=True)
     try:
         retrieve_lines, dump_lines, fixture_stats = [], [], []
+        index_expectations = []
         segments_by_fixture = {}
         for fixture in fixtures:
-            db_path, signature, cases, rows = export_fixture(fixture, sag2, work_dir)
+            db_path, signature, cases, rows, expectation = export_fixture(
+                fixture, sag2, work_dir
+            )
+            index_expectations.append(expectation)
             segments_by_fixture[fixture.name] = fixture_segments(fixture, rows)
             fixture_stats.append(
                 {
@@ -832,6 +1059,14 @@ def main(argv=None):
         dump_text = "".join(
             json.dumps(line, ensure_ascii=False) + "\n" for line in dump_lines
         )
+        chunk_cases = export_chunk_cases(fixtures, reference_dir, sag2)
+        chunk_text = "".join(
+            json.dumps(line, ensure_ascii=False) + "\n" for line in chunk_cases
+        )
+        index_expected_text = "".join(
+            json.dumps(line, ensure_ascii=False) + "\n"
+            for line in index_expectations
+        )
         tokenizer_text, tokenizer_lines = export_tokenizer(
             reference, segments_by_fixture, sag2
         )
@@ -848,6 +1083,11 @@ def main(argv=None):
              "lines": tokenizer_lines},
             {"path": "ascii_runs.jsonl", "sha256": _sha256_bytes(ascii_text.encode()),
              "lines": ascii_lines},
+            {"path": "chunks.jsonl", "sha256": _sha256_bytes(chunk_text.encode()),
+             "lines": len(chunk_cases)},
+            {"path": "index_expected.jsonl",
+             "sha256": _sha256_bytes(index_expected_text.encode()),
+             "lines": len(index_expectations)},
         ]
         for name, spec in UNICODE_TABLES.items():
             blob = unicode_blobs[name]
@@ -901,6 +1141,18 @@ def main(argv=None):
                 for name, spec in UNICODE_TABLES.items()
             },
             sparse_metadata,
+            {
+                "documents": len(chunk_cases),
+                "chunks": sum(len(case["chunks"]) for case in chunk_cases),
+                "scenarios": sum(
+                    1 for case in chunk_cases if case["fixture"] == "chunking"
+                ),
+                "golden": "chunks.jsonl",
+            },
+            {
+                "fixtures": len(index_expectations),
+                "golden": "index_expected.jsonl",
+            },
         )
 
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -912,6 +1164,8 @@ def main(argv=None):
         (out_dir / "index_dump.jsonl").write_text(dump_text)
         (out_dir / "tokenizer.jsonl").write_text(tokenizer_text)
         (out_dir / "ascii_runs.jsonl").write_text(ascii_text)
+        (out_dir / "chunks.jsonl").write_text(chunk_text)
+        (out_dir / "index_expected.jsonl").write_text(index_expected_text)
         for name, spec in UNICODE_TABLES.items():
             (out_dir / spec["path"]).write_bytes(unicode_blobs[name])
         for name, spec in SPARSE_UNICODE_TABLES.items():
@@ -922,6 +1176,7 @@ def main(argv=None):
         print(
             f"wrote {len(retrieve_lines)} retrieve cases, {len(dump_lines)} index rows, "
             f"{tokenizer_lines} tokenizer segments, {ascii_lines} ASCII runs, "
+            f"{len(chunk_cases)} chunk cases, {len(index_expectations)} index expectations, "
             f"{len(UNICODE_TABLES)} dense + {len(SPARSE_UNICODE_TABLES)} sparse unicode "
             f"tables and {len(fixture_stats)} indexes "
             f"to {out_dir}"

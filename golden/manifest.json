@@ -1,5 +1,5 @@
 {
-  "generator_version": "0.3.0",
+  "generator_version": "0.4.0",
   "python": "3.12.11",
   "sqlite": "3.50.4",
   "jieba": "0.42.1",
@@ -33,6 +33,16 @@
       "path": "ascii_runs.jsonl",
       "sha256": "2764017d83a4fe129d98c20cc564329a355789b90ae6fe994d257ebaa33b8204",
       "lines": 311852
+    },
+    {
+      "path": "chunks.jsonl",
+      "sha256": "9668236d801365eafb59746e9f21e2bb6354bb3ae4df008b4e48732724c7e35f",
+      "lines": 2898
+    },
+    {
+      "path": "index_expected.jsonl",
+      "sha256": "4cc647c46f8cb13654b027ce029bcd7b46f3826acd15caa5fed0a048e9e73301",
+      "lines": 6
     },
     {
       "path": "unicode_lower.bin.gz",
@@ -176,6 +186,16 @@
       "header": "count:u32le",
       "records": 941
     }
+  },
+  "chunks": {
+    "documents": 2898,
+    "chunks": 2934,
+    "scenarios": 19,
+    "golden": "chunks.jsonl"
+  },
+  "index_expected": {
+    "fixtures": 6,
+    "golden": "index_expected.jsonl"
   },
   "fixtures": [
     {

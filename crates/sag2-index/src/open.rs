@@ -9,91 +9,90 @@
 //!   implementation or format, so it is rejected and never rebuilt, because a
 //!   rebuild would hide the inconsistency.
 //!
-//! Building an index needs the tokenizer and the chunker, which P1 owns.  So a
-//! decision that would build returns [`OpenError::BuildUnavailable`] instead of
-//! silently doing nothing; the decision itself is complete and unit-tested.
+//! The free [`open`] entry point has no corpus, so a decision that would build
+//! returns [`OpenError::BuildUnavailable`]; [`CorpusIndex::open`] carries the
+//! corpus and performs the build (§3.4).
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
+use sag2_core::DEFAULT_CHUNK_CHARS;
+
+use crate::build::{self, BuildError, Document};
 use crate::pool::{QueryOptions, QueryPool};
 use crate::signature::{changed_field, signature, CHUNK_POLICY};
 use crate::statistics::{self, StatisticsError};
 use crate::CorpusIndex;
 
-/// `sag2.py`/`chunking.py` default chunk size (`chunking.py:6`).
-pub const DEFAULT_CHUNK_CHARS: usize = 2200;
-
 /// `rust_index_metadata.format_version` this build reads and writes.
 pub const FORMAT_VERSION: i64 = 1;
 
-/// How this build certifies one `rust_index_metadata` value (design §3.3).
-///
-/// A field is either certified or explicitly owned by a later plan.  The
-/// `PendingBuild` variant is visible in the type on purpose: forgetting to
-/// certify a field is a compile-time edit, and an index that carries the key
-/// is rejected rather than silently accepted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum VersionCheck {
-    /// This build certifies the exact value an index must carry.
-    Certified(&'static str),
-    /// The value belongs to a component a later plan writes; until then any
-    /// index that carries the key is rejected.
-    PendingBuild,
-}
+/// [`FORMAT_VERSION`] in the string form the provenance table stores.
+pub const FORMAT_VERSION_STR: &str = "1";
 
-impl VersionCheck {
-    /// The certified value, if this build has one.
-    pub fn certified(self) -> Option<&'static str> {
-        match self {
-            VersionCheck::Certified(value) => Some(value),
-            VersionCheck::PendingBuild => None,
-        }
-    }
-}
+/// Design §3.3 example: every feature that changes the token stream is in the
+/// version, `cjk` being the compatibility switch (design §2.4).
+pub const TOKENIZER_VERSION: &str = "jieba-0.42.1/re_skip-1/nfkc-15.0.0/lower-15.0.0/cjk-on";
 
-/// The `rust_index_metadata` keys whose values must match the running build.
+/// `data/dict.txt`, the certified jieba 0.42.1 dictionary
+/// (`crates/sag2-core/data/PROVENANCE.md`).
+pub const JIEBA_DICT_SHA256: &str =
+    "7197c3211ddd98962b036cdf40324d1ea2bfaa12bd028e68faa70111a88e12a8";
+
+/// DUCET 9.0.0 (`allkeys-9.0.0.txt` shipped with pyuca 1.2); P2 vendors the
+/// same file for the collation.
+pub const UCA_KEYS_SHA256: &str =
+    "0633f4520c99f249b0c53aa1442cd2521702041fb00a32df944fec13c9da3ed5";
+
+/// `crates/sag2-rank-sys/vendor/sag_rank.c` (design §9 R15).
+pub const SAG_RANK_SHA256: &str =
+    "a87ab48d4c6fecd57f9d9b4b86109a20917451766942a88d1a040f593025726b";
+
+/// `unicodedata.unidata_version` of the reference interpreter.
+pub const UNICODE_VERSION: &str = "15.0.0";
+
+/// `pyuca.Collator.UCA_VERSION`.
+pub const UCA_VERSION: &str = "9.0.0";
+
+/// The SQLite version this build's amalgamation reports.
+pub const SQLITE_VERSION: &str = "3.50.2";
+
+/// The `rust_index_metadata` values the running build certifies (design §3.3).
 #[derive(Debug, Clone, Copy)]
 pub struct RuntimeVersions {
-    /// Tokenizer identity; P1 owns the tokenizer.
-    pub tokenizer_version: VersionCheck,
-    /// Embedded jieba dictionary digest; P1 owns the tokenizer.
-    pub jieba_dict_sha256: VersionCheck,
+    /// Tokenizer identity.
+    pub tokenizer_version: &'static str,
+    /// Embedded jieba dictionary digest.
+    pub jieba_dict_sha256: &'static str,
     /// `unicodedata.unidata_version` of the reference interpreter.
-    pub unicode_version: VersionCheck,
+    pub unicode_version: &'static str,
     /// `pyuca` UCA version.
-    pub uca_version: VersionCheck,
-    /// Digest of the UCA key tables; P2 owns the collation.
-    pub uca_keys_sha256: VersionCheck,
+    pub uca_version: &'static str,
+    /// Digest of the UCA key tables.
+    pub uca_keys_sha256: &'static str,
     /// SQLite version this build links (the vendored amalgamation).
-    pub sqlite_version: VersionCheck,
-    /// Digest of the vendored `sag_rank.c`; P1 publishes the build digest.
-    pub sag_rank_sha256: VersionCheck,
+    pub sqlite_version: &'static str,
+    /// Digest of the vendored `sag_rank.c`.
+    pub sag_rank_sha256: &'static str,
     /// `sag2-index`'s own version, the troubleshooting anchor.
-    pub sag2_rs_version: VersionCheck,
+    pub sag2_rs_version: &'static str,
     /// `CHUNK_POLICY`.
-    pub chunk_policy_version: VersionCheck,
+    pub chunk_policy_version: &'static str,
 }
-
-/// Message recorded when an index carries a key this build cannot certify yet.
-pub const PENDING_BUILD_RUNTIME: &str = "<pending P1 build>";
 
 /// The contract this build certifies (design §3.3).
 pub const RUNTIME_VERSIONS: RuntimeVersions = RuntimeVersions {
-    // P1 owns the tokenizer, its dictionary, the build digest and the UCA
-    // tables; the values are declared here so the gap is in the type, not in a
-    // silently skipped check.
-    tokenizer_version: VersionCheck::PendingBuild,
-    jieba_dict_sha256: VersionCheck::PendingBuild,
-    unicode_version: VersionCheck::Certified("15.0.0"),
-    uca_version: VersionCheck::Certified("9.0.0"),
-    uca_keys_sha256: VersionCheck::PendingBuild,
-    sqlite_version: VersionCheck::Certified("3.50.2"),
-    sag_rank_sha256: VersionCheck::PendingBuild,
-    sag2_rs_version: VersionCheck::Certified(env!("CARGO_PKG_VERSION")),
-    chunk_policy_version: VersionCheck::Certified(CHUNK_POLICY),
+    tokenizer_version: TOKENIZER_VERSION,
+    jieba_dict_sha256: JIEBA_DICT_SHA256,
+    unicode_version: UNICODE_VERSION,
+    uca_version: UCA_VERSION,
+    uca_keys_sha256: UCA_KEYS_SHA256,
+    sqlite_version: SQLITE_VERSION,
+    sag_rank_sha256: SAG_RANK_SHA256,
+    sag2_rs_version: env!("CARGO_PKG_VERSION"),
+    chunk_policy_version: CHUNK_POLICY,
 };
 
 /// How hard an open may try to make the index match the corpus.
@@ -183,8 +182,10 @@ pub enum OpenError {
     },
     /// The `chunks` schema is the `source_dir` variant, which P0 does not read.
     SourceDirUnsupported,
-    /// Building is P1 scope; P0 refuses instead of writing a partial index.
+    /// The caller supplied no corpus, so a build decision is refused.
     BuildUnavailable,
+    /// Building from the corpus failed.
+    Build(BuildError),
     /// `sag_register_rank` failed.
     RankExtension(i32),
     /// The cached statistics are unusable.
@@ -196,16 +197,24 @@ pub enum OpenError {
 impl std::fmt::Display for OpenError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            OpenError::MissingDatabase(path) => write!(formatter, "index not found: {}", path.display()),
+            OpenError::MissingDatabase(path) => {
+                write!(formatter, "index not found: {}", path.display())
+            }
             OpenError::MissingSignature => {
-                write!(formatter, "database has no metadata row; refusing to guess its provenance")
+                write!(
+                    formatter,
+                    "database has no metadata row; refusing to guess its provenance"
+                )
             }
             OpenError::SignatureMismatch { expected, found } => write!(
                 formatter,
                 "index signature mismatch: expected {expected}, found {found}"
             ),
             OpenError::IndexSignatureMismatch { field } => {
-                write!(formatter, "index was built for a different corpus ({field})")
+                write!(
+                    formatter,
+                    "index was built for a different corpus ({field})"
+                )
             }
             OpenError::ForeignDatabase => write!(
                 formatter,
@@ -232,10 +241,14 @@ impl std::fmt::Display for OpenError {
             ),
             OpenError::BuildUnavailable => write!(
                 formatter,
-                "index building needs the tokenizer and chunker (P1); P0 only reads existing indexes"
+                "index building needs a corpus; use CorpusIndex::open with the corpus rows"
             ),
+            OpenError::Build(error) => write!(formatter, "cannot build the index: {error}"),
             OpenError::RankExtension(code) => {
-                write!(formatter, "sag_register_rank failed with SQLite code {code}")
+                write!(
+                    formatter,
+                    "sag_register_rank failed with SQLite code {code}"
+                )
             }
             OpenError::Statistics(error) => write!(formatter, "{error}"),
             OpenError::Sqlite(error) => write!(formatter, "{error}"),
@@ -254,6 +267,12 @@ impl From<rusqlite::Error> for OpenError {
 impl From<StatisticsError> for OpenError {
     fn from(error: StatisticsError) -> Self {
         OpenError::Statistics(error)
+    }
+}
+
+impl From<BuildError> for OpenError {
+    fn from(error: BuildError) -> Self {
+        OpenError::Build(error)
     }
 }
 
@@ -350,7 +369,7 @@ fn check_versions(
     }
     // Design §3.3: the v1 key set is fixed.  Design §3.2 rule 4 only makes
     // *unknown* keys ignorable; a required key that is absent is a rejection.
-    let checks: [(&'static str, VersionCheck); 9] = [
+    let checks: [(&'static str, &'static str); 9] = [
         ("tokenizer_version", runtime.tokenizer_version),
         ("chunk_policy_version", runtime.chunk_policy_version),
         ("jieba_dict_sha256", runtime.jieba_dict_sha256),
@@ -361,21 +380,17 @@ fn check_versions(
         ("sag_rank_sha256", runtime.sag_rank_sha256),
         ("sag2_rs_version", runtime.sag2_rs_version),
     ];
-    for (field, check) in checks {
+    for (field, expected) in checks {
         let stored = metadata
             .get(field)
             .ok_or(OpenError::MissingVersionKey(field))?;
-        let runtime_value = match check {
-            VersionCheck::Certified(expected) if stored == expected => continue,
-            VersionCheck::Certified(expected) => expected,
-            // An index that carries a value this build cannot certify is
-            // refused: accepting it would launder an unknown provenance.
-            VersionCheck::PendingBuild => PENDING_BUILD_RUNTIME,
-        };
+        if stored == expected {
+            continue;
+        }
         return Err(OpenError::IncompatibleIndex {
             field,
             index: stored.clone(),
-            runtime: runtime_value.to_owned(),
+            runtime: expected.to_owned(),
         });
     }
     Ok(())
@@ -432,8 +447,9 @@ pub fn inspect(path: &Path) -> Result<ExistingIndex, OpenError> {
 
 /// Open an existing index, applying the §3.4 decision table.
 ///
-/// A decision to build is reported as [`OpenError::BuildUnavailable`]: building
-/// needs the tokenizer and chunker (P1), and P0 must not half-build an index.
+/// A decision to build is reported as [`OpenError::BuildUnavailable`]: this
+/// entry point has no corpus, and half-building an index is worse than saying
+/// so.  [`CorpusIndex::open`] is the builder.
 pub fn open(
     path: &Path,
     options: &IndexOptions,
@@ -452,6 +468,49 @@ pub fn open(
             open_readonly(path, &expected, QueryOptions::default())?,
             OpenOutcome::reused(),
         )),
+    }
+}
+
+impl CorpusIndex {
+    /// Build or reuse the index for `corpus` (`sag2.py:197-311`, design §2.5).
+    ///
+    /// With `options.source_dir` the index is written (contentless FTS plus
+    /// `source_files`), but the P0 reader still refuses the
+    /// `start_char`/`end_char` layout with [`OpenError::SourceDirUnsupported`].
+    pub fn open(
+        path: &Path,
+        corpus: &[Document<'_>],
+        fingerprint: &str,
+        options: IndexOptions,
+    ) -> Result<(Self, OpenOutcome), OpenError> {
+        let expected = signature(
+            fingerprint,
+            options.chunk_chars,
+            options.source_dir.as_deref(),
+        );
+        let existing = inspect(path)?;
+        let outcome = match decide(options.rebuild, &existing, &expected, &RUNTIME_VERSIONS) {
+            Decision::Reject(error) => return Err(error),
+            Decision::Reuse => OpenOutcome::reused(),
+            Decision::Build => {
+                build::build(path, corpus, fingerprint, &options, &RUNTIME_VERSIONS)?;
+                OpenOutcome {
+                    action: OpenAction::Built,
+                    rebuilt: None,
+                }
+            }
+            Decision::Rebuild(reason) => {
+                build::build(path, corpus, fingerprint, &options, &RUNTIME_VERSIONS)?;
+                OpenOutcome {
+                    action: OpenAction::Rebuilt,
+                    rebuilt: Some(reason),
+                }
+            }
+        };
+        Ok((
+            open_readonly(path, &expected, QueryOptions::default())?,
+            outcome,
+        ))
     }
 }
 
@@ -519,7 +578,7 @@ mod tests {
 
     use super::{
         decide, Decision, ExistingIndex, OpenError, RebuildPolicy, RebuildReason, RuntimeVersions,
-        VersionCheck, FORMAT_VERSION, PENDING_BUILD_RUNTIME, RUNTIME_VERSIONS,
+        FORMAT_VERSION, RUNTIME_VERSIONS,
     };
 
     const EXPECTED: &str =
@@ -527,15 +586,15 @@ mod tests {
     const OTHER: &str = "[\"other\",2200,5,null,\"desktop-sentences-v1\",\"plain-text-default\"]";
 
     const RUNTIME: RuntimeVersions = RuntimeVersions {
-        tokenizer_version: VersionCheck::Certified("tokera-1"),
-        jieba_dict_sha256: VersionCheck::Certified("dict-1"),
-        unicode_version: VersionCheck::Certified("15.0.0"),
-        uca_version: VersionCheck::Certified("9.0.0"),
-        uca_keys_sha256: VersionCheck::Certified("uca-1"),
-        sqlite_version: VersionCheck::Certified("3.50.2"),
-        sag_rank_sha256: VersionCheck::Certified("rank-1"),
-        sag2_rs_version: VersionCheck::Certified("0.1.0"),
-        chunk_policy_version: VersionCheck::Certified("desktop-sentences-v1"),
+        tokenizer_version: "tokera-1",
+        jieba_dict_sha256: "dict-1",
+        unicode_version: "15.0.0",
+        uca_version: "9.0.0",
+        uca_keys_sha256: "uca-1",
+        sqlite_version: "3.50.2",
+        sag_rank_sha256: "rank-1",
+        sag2_rs_version: "0.1.0",
+        chunk_policy_version: "desktop-sentences-v1",
     };
 
     /// The §3.3 v1 key set in the order `check_versions` requires it.
@@ -752,63 +811,8 @@ mod tests {
     }
 
     #[test]
-    fn pending_build_versions_reject_a_rust_built_index() {
-        let rust = existing(Some(EXPECTED), Some(current_metadata()));
-        for policy in [
-            RebuildPolicy::Strict,
-            RebuildPolicy::OnCorpusChange,
-            RebuildPolicy::Always,
-        ] {
-            match rejection(decide(policy, &rust, EXPECTED, &RUNTIME_VERSIONS)) {
-                OpenError::IncompatibleIndex { field, runtime, .. } => {
-                    assert_eq!(field, "tokenizer_version");
-                    assert_eq!(runtime, PENDING_BUILD_RUNTIME);
-                }
-                other => panic!("unexpected {other}"),
-            }
-        }
-    }
-
-    /// The build must certify everything except the P1/P2-owned values; this
-    /// list has to reach zero before P1's Gate D.
-    #[test]
-    fn pending_build_fields_are_exactly_the_pipeline_owned_ones() {
-        let fields = [
-            ("tokenizer_version", RUNTIME_VERSIONS.tokenizer_version),
-            (
-                "chunk_policy_version",
-                RUNTIME_VERSIONS.chunk_policy_version,
-            ),
-            ("jieba_dict_sha256", RUNTIME_VERSIONS.jieba_dict_sha256),
-            ("unicode_version", RUNTIME_VERSIONS.unicode_version),
-            ("uca_version", RUNTIME_VERSIONS.uca_version),
-            ("uca_keys_sha256", RUNTIME_VERSIONS.uca_keys_sha256),
-            ("sqlite_version", RUNTIME_VERSIONS.sqlite_version),
-            ("sag_rank_sha256", RUNTIME_VERSIONS.sag_rank_sha256),
-            ("sag2_rs_version", RUNTIME_VERSIONS.sag2_rs_version),
-        ];
-        let pending: Vec<&str> = fields
-            .iter()
-            .filter(|(_, check)| check.certified().is_none())
-            .map(|(field, _)| *field)
-            .collect();
-        assert_eq!(
-            pending,
-            [
-                "tokenizer_version",
-                "jieba_dict_sha256",
-                "uca_keys_sha256",
-                "sag_rank_sha256"
-            ]
-        );
-    }
-
-    #[test]
     fn certified_sqlite_version_matches_the_bundled_amalgamation() {
-        assert_eq!(
-            RUNTIME_VERSIONS.sqlite_version.certified(),
-            Some(crate::sqlite_version())
-        );
+        assert_eq!(RUNTIME_VERSIONS.sqlite_version, crate::sqlite_version());
     }
 
     #[test]

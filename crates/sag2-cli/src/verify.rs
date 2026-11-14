@@ -18,12 +18,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use rusqlite::{Connection, OpenFlags};
 use sag2_index::{open_readonly, CorpusIndex, QueryError, QueryOptions};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Generator version this verifier understands.
-const GENERATOR_VERSION: &str = "0.3.0";
+const GENERATOR_VERSION: &str = "0.4.0";
 
 /// Minimum interpreter the goldens may come from (design §11 divergence D5).
 const REQUIRED_PYTHON: (u64, u64) = (3, 12);
@@ -62,6 +63,23 @@ struct Manifest {
     unicode_tables: BTreeMap<String, UnicodeTableSpec>,
     #[serde(default)]
     unicode_sparse: BTreeMap<String, UnicodeSparseSpec>,
+    #[serde(default)]
+    chunks: Option<ChunksSpec>,
+    #[serde(default)]
+    index_expected: Option<IndexExpectedSpec>,
+}
+
+/// Gate D's chunk-golden document count (`chunks.jsonl`).
+#[derive(Deserialize)]
+struct ChunksSpec {
+    documents: usize,
+    chunks: usize,
+}
+
+/// Gate D's Rust-vs-Python index baseline count (`index_expected.jsonl`).
+#[derive(Deserialize)]
+struct IndexExpectedSpec {
+    fixtures: usize,
 }
 
 /// Gate D's segment count (`tokenizer.jsonl`).
@@ -160,6 +178,8 @@ struct Options {
     filter: Option<String>,
     reference: PathBuf,
     fixtures: Option<Vec<String>>,
+    /// Keep the indexes `--gate D --fixtures index` builds here.
+    index_dir: Option<PathBuf>,
 }
 
 impl Default for Options {
@@ -172,6 +192,7 @@ impl Default for Options {
             filter: None,
             reference: PathBuf::from(DEFAULT_REFERENCE),
             fixtures: None,
+            index_dir: None,
         }
     }
 }
@@ -193,6 +214,7 @@ impl Options {
                 "--report" => options.report = PathBuf::from(value),
                 "--filter" => options.filter = Some(value),
                 "--reference" => options.reference = PathBuf::from(value),
+                "--index-dir" => options.index_dir = Some(PathBuf::from(value)),
                 "--fixtures" => {
                     options.fixtures = Some(
                         value
@@ -249,8 +271,9 @@ pub fn verify(args: &[String]) -> ExitCode {
 }
 
 pub fn usage() -> &'static str {
-    "usage: sag2-cli verify --gate A|D --golden golden/ [--fixtures tokenizer] \
-     [--reference <scripts>] [--index-cache <dir>] [--filter <substring>] \
+    "usage: sag2-cli verify --gate A|D --golden golden/ \
+     [--fixtures tokenizer,chunks,index] [--reference <scripts>] \
+     [--index-cache <dir>] [--index-dir <dir>] [--filter <substring>] \
      [--report report.json]"
 }
 
@@ -262,18 +285,10 @@ struct Toolchain {
 }
 
 fn certified_toolchain() -> Result<Toolchain, String> {
-    let uca = sag2_index::RUNTIME_VERSIONS
-        .uca_version
-        .certified()
-        .ok_or_else(|| "unsupported: this build does not certify uca_version".to_owned())?;
-    let unicode = sag2_index::RUNTIME_VERSIONS
-        .unicode_version
-        .certified()
-        .ok_or_else(|| "unsupported: this build does not certify unicode_version".to_owned())?;
     Ok(Toolchain {
         jieba: CERTIFIED_JIEBA,
-        uca,
-        unicode,
+        uca: sag2_index::UCA_VERSION,
+        unicode: sag2_index::UNICODE_VERSION,
     })
 }
 
@@ -572,23 +587,14 @@ fn run_gate_a(options: &Options) -> Result<ExitCode, String> {
 /// Gate D `tokenizer`: segment sequences, exhaustive Unicode tables and the
 /// ASCII cross product (design §4.4).  `token_positions_diff` must be exactly
 /// zero - a tolerance is not allowed here.
-fn run_gate_d(options: &Options) -> Result<ExitCode, String> {
-    let fixtures = options
-        .fixtures
-        .clone()
-        .unwrap_or_else(|| vec!["tokenizer".to_owned()]);
-    for fixture in &fixtures {
-        if fixture != "tokenizer" {
-            return Err(format!(
-                "gate D fixture {fixture} is not implemented; only 'tokenizer' has goldens"
-            ));
-        }
-    }
-
-    let manifest = preflight(options)?;
+fn gate_d_tokenizer(
+    options: &Options,
+    manifest: &Manifest,
+    failures: &mut Vec<Failure>,
+) -> Result<serde_json::Value, String> {
     verify_manifest_files(
         options,
-        &manifest,
+        manifest,
         &[
             "tokenizer.jsonl",
             "ascii_runs.jsonl",
@@ -601,9 +607,9 @@ fn run_gate_d(options: &Options) -> Result<ExitCode, String> {
             "unicode_compose.bin.gz",
         ],
     )?;
+    let failures_before = failures.len();
 
-    let mut failures: Vec<Failure> = Vec::new();
-    let segments = compare_token_lines(&options.golden.join("tokenizer.jsonl"), &mut failures)?;
+    let segments = compare_token_lines(&options.golden.join("tokenizer.jsonl"), failures)?;
     let expected_segments = manifest
         .tokenizer
         .as_ref()
@@ -615,7 +621,7 @@ fn run_gate_d(options: &Options) -> Result<ExitCode, String> {
             segments.total, expected_segments
         ));
     }
-    let runs = compare_token_lines(&options.golden.join("ascii_runs.jsonl"), &mut failures)?;
+    let runs = compare_token_lines(&options.golden.join("ascii_runs.jsonl"), failures)?;
     let expected_runs = manifest
         .ascii_runs
         .as_ref()
@@ -650,10 +656,10 @@ fn run_gate_d(options: &Options) -> Result<ExitCode, String> {
             .get(name)
             .ok_or_else(|| format!("manifest has no unicode table {name}"))?;
         let path = options.golden.join(&spec.path);
-        let bytes = fs::read(&path)
-            .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+        let bytes =
+            fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
         let data = gunzip(&path, &bytes)?;
-        let counts = gate_d_table(name, spec, &data, &mut failures)?;
+        let counts = gate_d_table(name, spec, &data, failures)?;
         codepoints_checked += counts.codepoints;
         codepoint_diffs += counts.diffs;
         tables.insert(
@@ -670,7 +676,7 @@ fn run_gate_d(options: &Options) -> Result<ExitCode, String> {
     let nfkc_bytes = fs::read(&nfkc_path)
         .map_err(|error| format!("cannot read {}: {error}", nfkc_path.display()))?;
     let nfkc_data = gunzip(&nfkc_path, &nfkc_bytes)?;
-    let nfkc_counts = gate_d_sparse_table("nfkc", nfkc, &nfkc_data, &mut failures)?;
+    let nfkc_counts = gate_d_sparse_table("nfkc", nfkc, &nfkc_data, failures)?;
     codepoints_checked += nfkc_counts.codepoints;
     codepoint_diffs += nfkc_counts.diffs;
     tables.insert(
@@ -696,10 +702,835 @@ fn run_gate_d(options: &Options) -> Result<ExitCode, String> {
         codepoints_checked,
         codepoint_diffs
     );
+    let passed = failures_before == failures.len()
+        && segments.diff == 0
+        && segments.equal == segments.total
+        && runs.diff == 0
+        && runs.equal == runs.total
+        && codepoint_diffs == 0;
+    Ok(serde_json::json!({
+        "segments_total": segments.total,
+        "segments_equal": segments.equal,
+        "token_positions_total": segments.positions,
+        "token_positions_diff": segments.diff,
+        "ascii_runs_total": runs.total,
+        "ascii_runs_equal": runs.equal,
+        "ascii_run_positions_diff": runs.diff,
+        "codepoints_checked": codepoints_checked,
+        "codepoint_diffs": codepoint_diffs,
+        "tables": tables,
+        "passed": passed,
+    }))
+}
+
+/// One `chunks.jsonl` line (`export_golden.py` `_chunk_case`).
+#[derive(Deserialize)]
+struct ChunkGolden {
+    doc_id: String,
+    fixture: String,
+    title: String,
+    source: String,
+    path: Option<String>,
+    #[serde(default)]
+    idx: Option<String>,
+    chunk_path: Option<String>,
+    target: usize,
+    chunks: Vec<ChunkExpectation>,
+}
+
+#[derive(Deserialize)]
+struct ChunkExpectation {
+    heading: String,
+    spans: Vec<(usize, usize)>,
+    content: String,
+}
+
+/// One `index_expected.jsonl` line (`export_golden.py` `index_expectation`).
+#[derive(Deserialize)]
+struct IndexGolden {
+    fixture: String,
+    index: String,
+    fingerprint: String,
+    chunk_chars: usize,
+    metadata_rows: usize,
+    signature: String,
+    chunks: Vec<ChunkRowGolden>,
+    fts_vocabulary: BTreeMap<String, Vec<(String, i64)>>,
+    statistics_signature: String,
+    statistics: String,
+    rust_index_metadata_keys: Vec<String>,
+}
+
+/// `SELECT * FROM chunks` in column order (`sag2.py:236-245`).
+#[derive(Deserialize)]
+struct ChunkRowGolden {
+    id: i64,
+    document_id: i64,
+    title: String,
+    heading: String,
+    content: String,
+    full_doc: String,
+    spans: String,
+    characters: i64,
+    source_id: String,
+}
+
+/// Gate D `chunks`: `chunk_document` over every fixture document, the desktop
+/// reference cases and the `tests/test_chunking.py` scenarios.
+fn gate_d_chunks(
+    options: &Options,
+    manifest: &Manifest,
+    failures: &mut Vec<Failure>,
+) -> Result<serde_json::Value, String> {
+    verify_manifest_files(options, manifest, &["chunks.jsonl"])?;
+    let entries = read_chunk_goldens(options)?;
+    let mut documents = 0_usize;
+    let mut chunks_total = 0_usize;
+    let mut chunks_equal = 0_usize;
+    let mut chunk_diffs = 0_usize;
+
+    for entry in &entries {
+        documents += 1;
+        let actual =
+            sag2_core::chunk_document(&entry.source, entry.target, entry.chunk_path.as_deref());
+        if actual.len() != entry.chunks.len() {
+            chunk_diffs += 1;
+            push_gate_failure(
+                failures,
+                &entry.doc_id,
+                "chunk_count",
+                entry.chunks.len().to_string(),
+                actual.len().to_string(),
+            );
+        }
+        let positions = entry.chunks.len().max(actual.len());
+        for position in 0..positions {
+            chunks_total += 1;
+            let expected = entry.chunks.get(position);
+            let got = actual.get(position);
+            let mut equal = true;
+            match (expected, got) {
+                (Some(expected), Some(got)) => {
+                    if expected.heading != got.heading {
+                        equal = false;
+                        push_gate_failure(
+                            failures,
+                            &entry.doc_id,
+                            format!("chunks[{position}].heading"),
+                            display_text(&expected.heading),
+                            display_text(&got.heading),
+                        );
+                    }
+                    if expected.spans != got.spans {
+                        equal = false;
+                        push_gate_failure(
+                            failures,
+                            &entry.doc_id,
+                            format!("chunks[{position}].spans"),
+                            serialise_spans_usize(&expected.spans),
+                            serialise_spans_usize(&got.spans),
+                        );
+                    }
+                    if expected.content != got.content {
+                        equal = false;
+                        push_gate_failure(
+                            failures,
+                            &entry.doc_id,
+                            format!("chunks[{position}].content"),
+                            display_text(&expected.content),
+                            display_text(&got.content),
+                        );
+                    }
+                }
+                (Some(expected), None) => {
+                    equal = false;
+                    push_gate_failure(
+                        failures,
+                        &entry.doc_id,
+                        format!("chunks[{position}]"),
+                        display_text(&expected.content),
+                        "<missing>",
+                    );
+                }
+                (None, Some(got)) => {
+                    equal = false;
+                    push_gate_failure(
+                        failures,
+                        &entry.doc_id,
+                        format!("chunks[{position}]"),
+                        "<missing>",
+                        display_text(&got.content),
+                    );
+                }
+                (None, None) => unreachable!("position < max(len)"),
+            }
+            if equal {
+                chunks_equal += 1;
+            } else {
+                chunk_diffs += 1;
+            }
+        }
+    }
+
+    let spec = manifest
+        .chunks
+        .as_ref()
+        .ok_or_else(|| "manifest has no chunks section".to_owned())?;
+    if documents != spec.documents || chunks_total != spec.chunks {
+        return Err(format!(
+            "golden inconsistency: chunks.jsonl holds {documents} documents / \
+             {chunks_total} chunks, manifest says {} / {}",
+            spec.documents, spec.chunks
+        ));
+    }
+    let passed = chunk_diffs == 0;
     println!(
-        "gate D (tokenizer): {}/{} segments, {}/{} ascii runs, \
-         token_positions_diff={}, codepoint_diffs={}",
-        segments.equal, segments.total, runs.equal, runs.total, segments.diff, codepoint_diffs
+        "{:<12} {:>9} {:>9} {:>9} {:>7}",
+        "fixture", "documents", "chunks", "equal", "diff"
+    );
+    println!(
+        "{:<12} {:>9} {:>9} {:>9} {:>7}",
+        "chunks", documents, chunks_total, chunks_equal, chunk_diffs
+    );
+    Ok(serde_json::json!({
+        "documents": documents,
+        "chunks": chunks_total,
+        "chunks_equal": chunks_equal,
+        "chunk_diffs": chunk_diffs,
+        "passed": passed,
+    }))
+}
+
+/// A failure while reading or comparing a built index (tooling error, exit 3).
+#[derive(Debug)]
+struct GateError(String);
+
+impl From<rusqlite::Error> for GateError {
+    fn from(error: rusqlite::Error) -> Self {
+        GateError(format!("sqlite: {error}"))
+    }
+}
+
+impl From<String> for GateError {
+    fn from(message: String) -> Self {
+        GateError(message)
+    }
+}
+
+/// A failure buffer that always counts, even after the report buffer is full.
+struct GateFailures<'a> {
+    failures: &'a mut Vec<Failure>,
+    diffs: usize,
+}
+
+impl<'a> GateFailures<'a> {
+    fn new(failures: &'a mut Vec<Failure>) -> Self {
+        GateFailures { failures, diffs: 0 }
+    }
+
+    fn push(
+        &mut self,
+        case_id: &str,
+        path: impl Into<String>,
+        expected: impl Into<String>,
+        actual: impl Into<String>,
+    ) {
+        self.diffs += 1;
+        if self.failures.len() < MAX_FAILURES {
+            self.failures.push(Failure {
+                case_id: case_id.to_owned(),
+                path: path.into(),
+                expected: expected.into(),
+                actual: actual.into(),
+                delta: None,
+            });
+        }
+    }
+}
+
+/// Gate D `index`: build the same corpus with this crate and compare the
+/// observable index contents against the Python build (design §1.4 D1-D3).
+fn gate_d_index(
+    options: &Options,
+    manifest: &Manifest,
+    failures: &mut Vec<Failure>,
+) -> Result<serde_json::Value, GateError> {
+    verify_manifest_files(options, manifest, &["index_expected.jsonl", "chunks.jsonl"])?;
+    let spec = manifest
+        .index_expected
+        .as_ref()
+        .ok_or_else(|| "manifest has no index_expected section".to_owned())?;
+    let chunks = read_chunk_goldens(options)?;
+    let goldens = read_index_goldens(options)?;
+    if goldens.len() != spec.fixtures {
+        return Err(format!(
+            "golden inconsistency: index_expected.jsonl holds {} fixtures, manifest says {}",
+            goldens.len(),
+            spec.fixtures
+        )
+        .into());
+    }
+    for golden in &goldens {
+        let fixture = manifest
+            .fixtures
+            .iter()
+            .find(|fixture| fixture.fixture == golden.fixture)
+            .ok_or_else(|| {
+                format!(
+                    "golden inconsistency: {} is absent from the manifest fixtures",
+                    golden.fixture
+                )
+            })?;
+        if fixture.signature != golden.signature
+            || fixture.index != golden.index
+            || fixture.chunks != golden.chunks.len()
+        {
+            return Err(format!(
+                "golden inconsistency: manifest and index_expected disagree for {}",
+                golden.fixture
+            )
+            .into());
+        }
+    }
+
+    let mut gate = GateFailures::new(failures);
+    let temporary;
+    let directory: &Path = match &options.index_dir {
+        Some(directory) => {
+            fs::create_dir_all(directory)
+                .map_err(|error| format!("cannot create {}: {error}", directory.display()))?;
+            directory
+        }
+        None => {
+            temporary = tempfile::tempdir()
+                .map_err(|error| format!("cannot create the index build directory: {error}"))?;
+            temporary.path()
+        }
+    };
+    let expected_metadata = expected_rust_metadata();
+    let mut fixtures_equal = 0_usize;
+    let mut fixtures_total = 0_usize;
+    for golden in &goldens {
+        fixtures_total += 1;
+        let before = gate.diffs;
+        let documents: Vec<sag2_index::Document> = chunks
+            .iter()
+            .filter(|entry| entry.fixture == golden.fixture)
+            .map(|entry| sag2_index::Document {
+                title: &entry.title,
+                text: &entry.source,
+                path: entry.path.as_deref(),
+                idx: entry.idx.as_deref(),
+            })
+            .collect();
+        if documents.is_empty() {
+            gate.push(&golden.fixture, "corpus", "at least one document", "none");
+            continue;
+        }
+        let path = directory.join(&golden.index);
+        let opened = sag2_index::CorpusIndex::open(
+            &path,
+            &documents,
+            &golden.fingerprint,
+            sag2_index::IndexOptions {
+                chunk_chars: golden.chunk_chars,
+                source_dir: None,
+                rebuild: sag2_index::RebuildPolicy::Always,
+            },
+        );
+        let outcome = match opened {
+            Ok((index, outcome)) => {
+                drop(index);
+                outcome
+            }
+            Err(error) => {
+                gate.push(
+                    &golden.fixture,
+                    "build",
+                    "a built index",
+                    format!("{error}"),
+                );
+                continue;
+            }
+        };
+        if outcome.action == sag2_index::OpenAction::Reused {
+            gate.push(
+                &golden.fixture,
+                "build/action",
+                "Built or Rebuilt",
+                format!("{:?}", outcome.action),
+            );
+        }
+        let db = Connection::open_with_flags(&path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .map_err(|error| format!("cannot reopen {}: {error}", path.display()))?;
+        compare_index(
+            &db,
+            golden,
+            &expected_metadata,
+            &golden.rust_index_metadata_keys,
+            &mut gate,
+        )?;
+        if gate.diffs == before {
+            fixtures_equal += 1;
+        }
+    }
+    println!(
+        "{:<12} {:>9} {:>9} {:>9}",
+        "fixture", "fixtures", "equal", "failed"
+    );
+    println!(
+        "{:<12} {:>9} {:>9} {:>9}",
+        "index",
+        fixtures_total,
+        fixtures_equal,
+        fixtures_total - fixtures_equal
+    );
+    Ok(serde_json::json!({
+        "fixtures": fixtures_total,
+        "fixtures_equal": fixtures_equal,
+        "passed": gate.diffs == 0,
+    }))
+}
+
+fn read_chunk_goldens(options: &Options) -> Result<Vec<ChunkGolden>, String> {
+    let path = options.golden.join("chunks.jsonl");
+    let text = fs::read_to_string(&path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let mut entries = Vec::new();
+    for (line_index, line) in text.lines().enumerate() {
+        entries.push(
+            serde_json::from_str(line)
+                .map_err(|error| format!("{}:{}: {error}", path.display(), line_index + 1))?,
+        );
+    }
+    Ok(entries)
+}
+
+fn read_index_goldens(options: &Options) -> Result<Vec<IndexGolden>, String> {
+    let path = options.golden.join("index_expected.jsonl");
+    let text = fs::read_to_string(&path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let mut entries = Vec::new();
+    for (line_index, line) in text.lines().enumerate() {
+        entries.push(
+            serde_json::from_str(line)
+                .map_err(|error| format!("{}:{}: {error}", path.display(), line_index + 1))?,
+        );
+    }
+    Ok(entries)
+}
+
+/// The `rust_index_metadata` rows this build writes (design §3.3).
+fn expected_rust_metadata() -> BTreeMap<&'static str, &'static str> {
+    let versions = &sag2_index::RUNTIME_VERSIONS;
+    [
+        ("format_version", sag2_index::FORMAT_VERSION_STR),
+        ("tokenizer_version", versions.tokenizer_version),
+        ("chunk_policy_version", versions.chunk_policy_version),
+        ("jieba_dict_sha256", versions.jieba_dict_sha256),
+        ("unicode_version", versions.unicode_version),
+        ("uca_version", versions.uca_version),
+        ("uca_keys_sha256", versions.uca_keys_sha256),
+        ("sqlite_version", versions.sqlite_version),
+        ("sag_rank_sha256", versions.sag_rank_sha256),
+        ("sag2_rs_version", versions.sag2_rs_version),
+    ]
+    .into_iter()
+    .collect()
+}
+
+/// Compare a Rust-built index with the Python build.
+fn compare_index(
+    db: &Connection,
+    golden: &IndexGolden,
+    expected_metadata: &BTreeMap<&'static str, &'static str>,
+    golden_keys: &[String],
+    gate: &mut GateFailures<'_>,
+) -> Result<(), GateError> {
+    let fixture = golden.fixture.as_str();
+    let metadata_rows: i64 = db.query_row("SELECT COUNT(*) FROM metadata", [], |row| row.get(0))?;
+    if metadata_rows != golden.metadata_rows as i64 {
+        gate.push(
+            fixture,
+            "metadata/rows",
+            golden.metadata_rows.to_string(),
+            metadata_rows.to_string(),
+        );
+    }
+    let signature: String = db.query_row("SELECT signature FROM metadata LIMIT 1", [], |row| {
+        row.get(0)
+    })?;
+    if signature != golden.signature {
+        gate.push(
+            fixture,
+            "metadata/signature",
+            golden.signature.clone(),
+            signature,
+        );
+    }
+
+    let mut statement = db.prepare(
+        "SELECT id,document_id,title,heading,content,full_doc,spans,characters,source_id \
+         FROM chunks ORDER BY id",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut position = 0_usize;
+    while let Some(row) = rows.next()? {
+        let actual = ChunkRowGolden {
+            id: row.get(0)?,
+            document_id: row.get(1)?,
+            title: row.get(2)?,
+            heading: row.get(3)?,
+            content: row.get(4)?,
+            full_doc: row.get(5)?,
+            spans: row.get(6)?,
+            characters: row.get(7)?,
+            source_id: row.get(8)?,
+        };
+        match golden.chunks.get(position) {
+            Some(expected) => compare_chunk_row(fixture, position, expected, &actual, gate),
+            None => gate.push(
+                fixture,
+                format!("chunks[{position}]"),
+                "<missing>",
+                format!("id {}", actual.id),
+            ),
+        }
+        position += 1;
+    }
+    if position != golden.chunks.len() {
+        gate.push(
+            fixture,
+            "chunks/length",
+            golden.chunks.len().to_string(),
+            position.to_string(),
+        );
+    }
+    drop(rows);
+    drop(statement);
+
+    db.execute(
+        "CREATE VIRTUAL TABLE temp.vocab USING fts5vocab(main,chunk_fts,'col')",
+        [],
+    )?;
+    for (column, expected) in &golden.fts_vocabulary {
+        let mut statement =
+            db.prepare("SELECT term, doc FROM temp.vocab WHERE col=? ORDER BY term")?;
+        let actual: Vec<(String, i64)> = statement
+            .query_map([column], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<Result<_, _>>()?;
+        if &actual != expected {
+            let first = expected
+                .iter()
+                .zip(&actual)
+                .position(|(left, right)| left != right)
+                .unwrap_or(expected.len().min(actual.len()));
+            let expected_at = expected.get(first).map(|value| format!("{value:?}"));
+            let actual_at = actual.get(first).map(|value| format!("{value:?}"));
+            gate.push(
+                fixture,
+                format!("chunk_fts/{column}"),
+                format!(
+                    "{} terms, first difference at {first}: {}",
+                    expected.len(),
+                    expected_at.unwrap_or_else(|| "<missing>".to_owned())
+                ),
+                format!(
+                    "{} terms: {}",
+                    actual.len(),
+                    actual_at.unwrap_or_else(|| "<missing>".to_owned())
+                ),
+            );
+        }
+    }
+
+    let (statistics_signature, statistics): (String, String) =
+        db.query_row("SELECT signature, data FROM index_statistics", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+    if statistics_signature != golden.statistics_signature {
+        gate.push(
+            fixture,
+            "index_statistics/signature",
+            golden.statistics_signature.clone(),
+            statistics_signature,
+        );
+    }
+    let expected: serde_json::Value = serde_json::from_str(&golden.statistics)
+        .map_err(|error| format!("{}: golden statistics is not JSON: {error}", golden.fixture))?;
+    let actual: serde_json::Value = serde_json::from_str(&statistics)
+        .map_err(|error| format!("{}: built statistics is not JSON: {error}", golden.fixture))?;
+    compare_statistics(fixture, "index_statistics.data.", &expected, &actual, gate);
+
+    let mut actual_metadata: BTreeMap<String, String> = BTreeMap::new();
+    {
+        let mut statement = db.prepare("SELECT key, value FROM rust_index_metadata")?;
+        let mut rows = statement.query([])?;
+        while let Some(row) = rows.next()? {
+            actual_metadata.insert(row.get(0)?, row.get(1)?);
+        }
+    }
+    let mut expected_keys: Vec<&str> = expected_metadata.keys().copied().collect();
+    expected_keys.sort_unstable();
+    let mut actual_keys: Vec<&str> = actual_metadata.keys().map(String::as_str).collect();
+    actual_keys.sort_unstable();
+    let mut golden_keys: Vec<&str> = golden_keys.iter().map(String::as_str).collect();
+    golden_keys.sort_unstable();
+    if actual_keys != expected_keys || expected_keys != golden_keys {
+        gate.push(
+            fixture,
+            "rust_index_metadata/keys",
+            format!("{golden_keys:?}"),
+            format!("{actual_keys:?}"),
+        );
+    }
+    for (key, expected) in expected_metadata {
+        match actual_metadata.get(*key) {
+            Some(value) if value == expected => {}
+            Some(value) => gate.push(
+                fixture,
+                format!("rust_index_metadata/{key}"),
+                (*expected).to_owned(),
+                value.clone(),
+            ),
+            None => gate.push(
+                fixture,
+                format!("rust_index_metadata/{key}"),
+                (*expected).to_owned(),
+                "<missing>",
+            ),
+        }
+    }
+    Ok(())
+}
+
+fn compare_chunk_row(
+    fixture: &str,
+    position: usize,
+    expected: &ChunkRowGolden,
+    actual: &ChunkRowGolden,
+    gate: &mut GateFailures<'_>,
+) {
+    let field = |name: &str| format!("chunks[{position}].{name}");
+    if expected.id != actual.id {
+        gate.push(
+            fixture,
+            field("id"),
+            expected.id.to_string(),
+            actual.id.to_string(),
+        );
+    }
+    if expected.document_id != actual.document_id {
+        gate.push(
+            fixture,
+            field("document_id"),
+            expected.document_id.to_string(),
+            actual.document_id.to_string(),
+        );
+    }
+    for (name, left, right) in [
+        ("title", &expected.title, &actual.title),
+        ("heading", &expected.heading, &actual.heading),
+        ("content", &expected.content, &actual.content),
+        ("full_doc", &expected.full_doc, &actual.full_doc),
+        ("spans", &expected.spans, &actual.spans),
+        ("source_id", &expected.source_id, &actual.source_id),
+    ] {
+        if left != right {
+            gate.push(
+                fixture,
+                field(name),
+                display_text(left),
+                display_text(right),
+            );
+        }
+    }
+    if expected.characters != actual.characters {
+        gate.push(
+            fixture,
+            field("characters"),
+            expected.characters.to_string(),
+            actual.characters.to_string(),
+        );
+    }
+}
+
+/// Compare the seven-key `index_statistics.data` structure (design §1.4 D2).
+fn compare_statistics(
+    fixture: &str,
+    prefix: &str,
+    expected: &serde_json::Value,
+    actual: &serde_json::Value,
+    gate: &mut GateFailures<'_>,
+) {
+    let (Some(expected), Some(actual)) = (expected.as_object(), actual.as_object()) else {
+        gate.push(
+            fixture,
+            prefix.trim_end_matches('.'),
+            "object",
+            format!("{actual}"),
+        );
+        return;
+    };
+    let mut keys: BTreeSet<&str> = expected.keys().map(String::as_str).collect();
+    keys.extend(actual.keys().map(String::as_str));
+    for key in keys {
+        let path = format!("{prefix}{key}");
+        match (expected.get(key), actual.get(key)) {
+            (None, Some(value)) => gate.push(fixture, path, "<missing>", format!("{value}")),
+            (Some(value), None) => gate.push(fixture, path, format!("{value}"), "<missing>"),
+            (Some(left), Some(right)) if key == "diversity_idf" => {
+                compare_float_map(fixture, &path, left, right, gate)
+            }
+            (Some(left), Some(right)) => compare_json_exact(fixture, &path, left, right, gate),
+            (None, None) => {}
+        }
+    }
+}
+
+fn compare_float_map(
+    fixture: &str,
+    prefix: &str,
+    expected: &serde_json::Value,
+    actual: &serde_json::Value,
+    gate: &mut GateFailures<'_>,
+) {
+    let (Some(expected), Some(actual)) = (expected.as_object(), actual.as_object()) else {
+        gate.push(fixture, prefix, "object", format!("{actual}"));
+        return;
+    };
+    let mut keys: BTreeSet<&str> = expected.keys().map(String::as_str).collect();
+    keys.extend(actual.keys().map(String::as_str));
+    for key in keys {
+        let path = format!("{prefix}.{key}");
+        match (
+            expected.get(key).and_then(serde_json::Value::as_f64),
+            actual.get(key).and_then(serde_json::Value::as_f64),
+        ) {
+            (Some(left), Some(right)) if within_tolerance(left, right) => {}
+            (Some(left), Some(right)) => {
+                gate.push(fixture, path, format!("{left:?}"), format!("{right:?}"))
+            }
+            _ => gate.push(
+                fixture,
+                path,
+                expected
+                    .get(key)
+                    .map_or("<missing>".to_owned(), |value| format!("{value}")),
+                actual
+                    .get(key)
+                    .map_or("<missing>".to_owned(), |value| format!("{value}")),
+            ),
+        }
+    }
+}
+
+fn compare_json_exact(
+    fixture: &str,
+    prefix: &str,
+    expected: &serde_json::Value,
+    actual: &serde_json::Value,
+    gate: &mut GateFailures<'_>,
+) {
+    if expected == actual {
+        return;
+    }
+    match (expected, actual) {
+        (serde_json::Value::Object(expected), serde_json::Value::Object(actual)) => {
+            let mut keys: BTreeSet<&str> = expected.keys().map(String::as_str).collect();
+            keys.extend(actual.keys().map(String::as_str));
+            for key in keys {
+                let path = format!("{prefix}.{key}");
+                match (expected.get(key), actual.get(key)) {
+                    (None, Some(value)) => {
+                        gate.push(fixture, path, "<missing>", format!("{value}"))
+                    }
+                    (Some(value), None) => {
+                        gate.push(fixture, path, format!("{value}"), "<missing>")
+                    }
+                    (Some(left), Some(right)) => {
+                        compare_json_exact(fixture, &path, left, right, gate)
+                    }
+                    (None, None) => {}
+                }
+            }
+        }
+        (serde_json::Value::Array(expected), serde_json::Value::Array(actual))
+            if expected.len() == actual.len() =>
+        {
+            for (position, (left, right)) in expected.iter().zip(actual).enumerate() {
+                compare_json_exact(fixture, &format!("{prefix}[{position}]"), left, right, gate);
+            }
+        }
+        _ => gate.push(fixture, prefix, format!("{expected}"), format!("{actual}")),
+    }
+}
+
+fn push_gate_failure(
+    failures: &mut Vec<Failure>,
+    case_id: &str,
+    path: impl Into<String>,
+    expected: impl Into<String>,
+    actual: impl Into<String>,
+) {
+    if failures.len() < MAX_FAILURES {
+        failures.push(Failure {
+            case_id: case_id.to_owned(),
+            path: path.into(),
+            expected: expected.into(),
+            actual: actual.into(),
+            delta: None,
+        });
+    }
+}
+
+/// Spans are code point offsets (`chunking.py:153-178`); the report only needs
+/// the serialised form.
+fn serialise_spans_usize(spans: &[(usize, usize)]) -> String {
+    let spans: Vec<(u64, u64)> = spans
+        .iter()
+        .map(|&(start, end)| (start as u64, end as u64))
+        .collect();
+    serialise_spans(&spans)
+}
+
+fn run_gate_d(options: &Options) -> Result<ExitCode, String> {
+    let fixtures = options
+        .fixtures
+        .clone()
+        .unwrap_or_else(|| vec!["tokenizer".to_owned()]);
+    for fixture in &fixtures {
+        if !matches!(fixture.as_str(), "tokenizer" | "chunks" | "index") {
+            return Err(format!(
+                "gate D fixture {fixture} is not implemented; use tokenizer, chunks or index"
+            ));
+        }
+    }
+    let manifest = preflight(options)?;
+    let mut failures: Vec<Failure> = Vec::new();
+    let mut sections = serde_json::Map::new();
+    let mut passed = true;
+
+    if fixtures.iter().any(|fixture| fixture == "tokenizer") {
+        let section = gate_d_tokenizer(options, &manifest, &mut failures)?;
+        passed &= section["passed"].as_bool().unwrap_or(false);
+        sections.insert("tokenizer".to_owned(), section);
+    }
+    if fixtures.iter().any(|fixture| fixture == "chunks") {
+        let section = gate_d_chunks(options, &manifest, &mut failures)?;
+        passed &= section["passed"].as_bool().unwrap_or(false);
+        sections.insert("chunks".to_owned(), section);
+    }
+    if fixtures.iter().any(|fixture| fixture == "index") {
+        let section = gate_d_index(options, &manifest, &mut failures).map_err(|error| error.0)?;
+        passed &= section["passed"].as_bool().unwrap_or(false);
+        sections.insert("index".to_owned(), section);
+    }
+    passed &= failures.is_empty();
+    println!(
+        "gate D ({}): {} failures",
+        fixtures.join(","),
+        failures.len()
     );
     for failure in failures.iter().take(10) {
         println!(
@@ -708,12 +1539,6 @@ fn run_gate_d(options: &Options) -> Result<ExitCode, String> {
         );
     }
 
-    let passed = failures.is_empty()
-        && segments.diff == 0
-        && segments.equal == segments.total
-        && runs.diff == 0
-        && runs.equal == runs.total
-        && codepoint_diffs == 0;
     let report = serde_json::json!({
         "golden": {
             "dir": options.golden.display().to_string(),
@@ -735,16 +1560,7 @@ fn run_gate_d(options: &Options) -> Result<ExitCode, String> {
         "tolerances": {"level": "S", "f64": "bits", "ids": "exact"},
         "gates": {"D": {
             "fixtures": fixtures,
-            "segments_total": segments.total,
-            "segments_equal": segments.equal,
-            "token_positions_total": segments.positions,
-            "token_positions_diff": segments.diff,
-            "ascii_runs_total": runs.total,
-            "ascii_runs_equal": runs.equal,
-            "ascii_run_positions_diff": runs.diff,
-            "codepoints_checked": codepoints_checked,
-            "codepoint_diffs": codepoint_diffs,
-            "tables": tables,
+            "sections": sections,
         }},
         "excluded_fields": [],
         "excluded_checks": ["db_physical_bytes"],
@@ -779,8 +1595,8 @@ struct TokenCounts {
 /// Compare one JSONL token golden against `sag2_core::tokenize`.  The first
 /// differing token per segment is reported with its position.
 fn compare_token_lines(path: &Path, failures: &mut Vec<Failure>) -> Result<TokenCounts, String> {
-    let text =
-        fs::read_to_string(path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let text = fs::read_to_string(path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     let mut counts = TokenCounts::default();
     for (line_index, line) in text.lines().enumerate() {
         let entry: TokenLine = serde_json::from_str(line)
@@ -856,7 +1672,10 @@ fn gate_d_table(
     failures: &mut Vec<Failure>,
 ) -> Result<TableCounts, String> {
     if data.len() < 8 || &data[..8] != spec.magic.as_bytes() {
-        return Err(format!("{} does not start with the manifest magic", spec.path));
+        return Err(format!(
+            "{} does not start with the manifest magic",
+            spec.path
+        ));
     }
     let expected_len = 8 + spec.codepoints * spec.record_bytes;
     if data.len() != expected_len {
@@ -885,7 +1704,13 @@ fn gate_d_table(
                     let identity = mapped == [scalar];
                     if !identity {
                         counts.diffs += 1;
-                        push_table_failure(failures, name, cp, format!("{mapped:?}"), "<surrogate>".to_owned());
+                        push_table_failure(
+                            failures,
+                            name,
+                            cp,
+                            format!("{mapped:?}"),
+                            "<surrogate>".to_owned(),
+                        );
                     }
                     continue;
                 }
@@ -905,7 +1730,13 @@ fn gate_d_table(
                 if surrogate {
                     if class != 0 {
                         counts.diffs += 1;
-                        push_table_failure(failures, name, cp, class.to_string(), "<surrogate>".to_owned());
+                        push_table_failure(
+                            failures,
+                            name,
+                            cp,
+                            class.to_string(),
+                            "<surrogate>".to_owned(),
+                        );
                     }
                     continue;
                 }
@@ -919,7 +1750,13 @@ fn gate_d_table(
                 if surrogate {
                     if mask != 0 {
                         counts.diffs += 1;
-                        push_table_failure(failures, name, cp, mask.to_string(), "<surrogate>".to_owned());
+                        push_table_failure(
+                            failures,
+                            name,
+                            cp,
+                            mask.to_string(),
+                            "<surrogate>".to_owned(),
+                        );
                     }
                     continue;
                 }
