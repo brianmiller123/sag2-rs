@@ -456,25 +456,44 @@ fn run_gate_a(options: &Options) -> Result<ExitCode, String> {
         ));
     }
 
+    // Design §7.3: Gate A may replay against indexes built by this crate
+    // (`--index-dir`) instead of the Python reference bytes.  There is never a
+    // silent fallback: a fixture missing from `--index-dir` is a tooling
+    // failure, and the report records the bytes each case actually ran against.
+    let index_directory = options
+        .index_dir
+        .clone()
+        .unwrap_or_else(|| options.golden.join("indexes"));
     let mut indexes: BTreeMap<String, CorpusIndex> = BTreeMap::new();
+    let mut index_provenance: Vec<serde_json::Value> = Vec::new();
     for fixture in &manifest.fixtures {
         if !cases.iter().any(|case| case.fixture == fixture.fixture) {
             continue;
         }
-        let source = options.golden.join("indexes").join(&fixture.index);
-        let bytes = fs::read(&source)
-            .map_err(|error| format!("cannot read {}: {error}", source.display()))?;
-        let Some(expected_digest) = &fixture.index_sha256 else {
-            return Err(format!(
-                "{} is used by Gate A but has no manifest sha256",
-                fixture.index
-            ));
-        };
-        if sha256_hex(&bytes) != *expected_digest {
-            return Err(format!(
-                "{} does not match the manifest sha256",
-                fixture.index
-            ));
+        let source = index_directory.join(&fixture.index);
+        let bytes = fs::read(&source).map_err(|error| {
+            if options.index_dir.is_some() {
+                format!(
+                    "fixture {} has no index at {} (--index-dir): {error}",
+                    fixture.fixture,
+                    source.display()
+                )
+            } else {
+                format!("cannot read {}: {error}", source.display())
+            }
+        })?;
+        let digest = sha256_hex(&bytes);
+        let manifest_verified = fixture.index_sha256.as_deref() == Some(digest.as_str());
+        // The reference bytes must match the manifest exactly; a rebuild
+        // legitimately differs, so its digest is recorded as provenance.
+        if options.index_dir.is_none() && !manifest_verified {
+            return Err(match &fixture.index_sha256 {
+                Some(_) => format!("{} does not match the manifest sha256", fixture.index),
+                None => format!(
+                    "{} is used by Gate A but has no manifest sha256",
+                    fixture.index
+                ),
+            });
         }
         fs::create_dir_all(&options.cache)
             .map_err(|error| format!("cannot create {}: {error}", options.cache.display()))?;
@@ -492,8 +511,25 @@ fn run_gate_a(options: &Options) -> Result<ExitCode, String> {
                 fixture.chunks
             ));
         }
+        index_provenance.push(serde_json::json!({
+            "fixture": fixture.fixture,
+            "path": source.display().to_string(),
+            "sha256": digest,
+            "manifest_sha256": fixture.index_sha256,
+            "manifest_verified": manifest_verified,
+        }));
         indexes.insert(fixture.fixture.clone(), index);
     }
+    let verified = index_provenance
+        .iter()
+        .filter(|entry| entry["manifest_verified"] == serde_json::Value::Bool(true))
+        .count();
+    println!(
+        "indexes: {} ({} fixtures, {verified}/{} match the manifest sha256)",
+        index_directory.display(),
+        index_provenance.len(),
+        index_provenance.len()
+    );
 
     let mut failures: Vec<Failure> = Vec::new();
     let mut ulp_flips: Vec<serde_json::Value> = Vec::new();
@@ -582,6 +618,11 @@ fn run_gate_a(options: &Options) -> Result<ExitCode, String> {
             "passed": passed,
             "failed": cases.len() - passed,
             "ulp_flips": ulp_flips.len(),
+            "indexes": {
+                "dir": index_directory.display().to_string(),
+                "source": if options.index_dir.is_some() { "index_dir" } else { "golden" },
+                "fixtures": index_provenance,
+            },
             "fixtures": per_fixture.iter().map(|(fixture, (total, passed))| {
                 serde_json::json!({"fixture": fixture, "cases": total, "passed": passed})
             }).collect::<Vec<_>>(),
