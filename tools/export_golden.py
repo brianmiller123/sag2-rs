@@ -233,10 +233,19 @@ def fixture_c0(reference, sag2):
         return out
 
     # Gate D4 (design §1.4): 12 probes, every C0 expression in its plain and
-    # its `term`-qualified form.  "alice" is a corpus term, so the qualified
-    # probes bind non-empty row sets (an empty probe asserts almost nothing).
-    probes = [
-        (expression, term) for _, expression in exprs for term in (None, "alice")
+    # its `term`-qualified form.  Each term is chosen to co-occur with its
+    # expression, so no probe is vacuous (an empty probe asserts nothing).
+    qualified_terms = {
+        '"anchor" OR "birthplace" OR "depicts"': "alice",
+        '"anchor"': "alice",
+        '"alston" OR "born"': "born",
+        '"rene" OR "descartes" OR "born"': "born",
+        '"alice paul" OR "bob smith"': "alice",
+        'title : "anchor"': "alice",
+    }
+    probes = [(expression, None) for _, expression in exprs]
+    probes += [
+        (expression, qualified_terms[expression]) for _, expression in exprs
     ]
     return Fixture("C0", C0_FINGERPRINT, corpus, 2200, cases, probes=probes)
 
@@ -539,12 +548,20 @@ def fixture_c6(sag2):
     def cases(_db):
         return []
 
+    # Gate D4 must also exercise the contentless index: these three
+    # expressions bind real rows there (the FTS5 `content=''` table stores the
+    # term index even though it returns NULL column values).
+    probes = [
+        (sag2.match_query(query), None)
+        for query in ("gate", "corpus", "release")
+    ]
     return Fixture(
         "C6-source",
         "source",
         corpus,
         C6_CHUNK_CHARS,
         cases,
+        probes=probes,
         source_relative=C6_SOURCE_RELATIVE,
     )
 
@@ -795,6 +812,16 @@ def index_expectation(fixture, index, sag2):
         )
     ]
     limit = index.db.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+    source_files = (
+        [
+            {"document_id": document_id, "path": path, "sha256": sha256}
+            for document_id, path, sha256 in index.db.execute(
+                "SELECT document_id, path, sha256 FROM source_files ORDER BY document_id"
+            )
+        ]
+        if fixture.source_dir is not None
+        else []
+    )
     probes = []
     for expression, term in fixture.probes:
         query = (
@@ -805,6 +832,11 @@ def index_expectation(fixture, index, sag2):
         # The reference path, not a re-typed SQL string: `retrieve` is the
         # Gate A entry point and ranks through `sag_bm25` (`sag2.py:477-521`).
         hits = index.retrieve(expression, set(), limit, term)
+        if not hits:
+            raise SystemExit(
+                f"{fixture.name}: D4 probe {query!r} binds no rows; "
+                "a vacuous probe asserts nothing"
+            )
         probes.append(
             {
                 "expression": expression,
@@ -845,6 +877,7 @@ def index_expectation(fixture, index, sag2):
         "schema": schema,
         "chunks": chunks,
         "fts_rows": fts_rows,
+        "source_files": source_files,
         "fts_vocabulary": vocabulary,
         "probes": probes,
         "statistics_signature": _normalise_source_signature(

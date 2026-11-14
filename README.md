@@ -61,9 +61,10 @@ cargo run -p sag2-cli -- verify --gate D --fixtures tokenizer,chunks,index --gol
   `golden/sources/C6-source`, so the contentless schema, `start_char`/`end_char`
   and `source_files` are gate-covered too.
 
-`--index-dir <dir>` replays both gates against indexes built by this crate: the
-directory is read as-is and never falls back to `golden/indexes` (a fixture
-missing from it is an exit-`3` tooling failure), and `report.json` records each
+`--index-dir <dir>` also lets Gate D build into a chosen directory instead of a
+temporary one. Gate D *creates* that directory and builds every fixture there;
+Gate A only *reads* it as-is (never falling back to `golden/indexes`; a fixture
+missing from it is an exit-`3` tooling failure). `report.json` records each
 fixture's path and `sha256` plus whether it matches the manifest digest — so a
 Gate A run against rebuilds is self-describing.
 

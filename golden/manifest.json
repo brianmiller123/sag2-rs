@@ -41,7 +41,7 @@
     },
     {
       "path": "index_expected.jsonl",
-      "sha256": "4e4543971824cb33060f07a181b36dcda38c8dbb02915fda57519a32914e1fca",
+      "sha256": "083e1bab5914c911f9c653e7a5ac7f7e250117ee2478d573eda7f3996adfb778",
       "lines": 7
     },
     {
@@ -195,7 +195,7 @@
   },
   "index_expected": {
     "fixtures": 7,
-    "probes": 24,
+    "probes": 27,
     "golden": "index_expected.jsonl"
   },
   "fixtures": [

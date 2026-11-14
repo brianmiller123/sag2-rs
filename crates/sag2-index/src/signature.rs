@@ -108,16 +108,32 @@ mod tests {
     }
 
     #[test]
-    fn relative_source_dir_is_signed_as_an_absolute_path() {
+    fn relative_source_dir_is_signed_as_the_canonical_absolute_path() {
+        // F-007: `sag2.py:203` signs `Path.resolve()`, so a relative
+        // `--source-dir` must not leak into the signature.  This test signs a
+        // *relative* path from two different working directories; with the
+        // `resolve()` call removed it fails (`"sub"` instead of the absolute
+        // form), so it actually exercises the branch it names.
         let directory = tempfile::tempdir().expect("temp dir");
-        let absolute = std::fs::canonicalize(directory.path()).expect("canonicalize");
-        let signed = signature("fix", 2200, Some(directory.path()));
+        let root = std::fs::canonicalize(directory.path()).expect("canonicalize");
+        let sub = root.join("sub");
+        std::fs::create_dir(&sub).expect("create sub");
         let expected = format!(
             "[\"fix\",2200,5,\"{}\",\"desktop-sentences-v1\"]",
-            absolute.to_string_lossy()
+            sub.to_string_lossy()
         );
-        assert_eq!(signed, expected);
-        assert_eq!(signature("fix", 2200, Some(&absolute)), expected);
+
+        let previous = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&root).expect("enter the temporary root");
+        let from_root = signature("fix", 2200, Some(std::path::Path::new("sub")));
+        std::env::set_current_dir(&sub).expect("enter the sub directory");
+        let from_sub = signature("fix", 2200, Some(std::path::Path::new(".")));
+        std::env::set_current_dir(&previous).expect("restore the working directory");
+
+        assert!(from_root.contains(&*sub.to_string_lossy()));
+        assert_eq!(from_root, expected);
+        // Two working directories, the same real directory, one signature.
+        assert_eq!(from_sub, from_root);
     }
 
     #[test]

@@ -822,6 +822,9 @@ struct IndexGolden {
     /// D3: every `chunk_fts` row; `[rowid,title,heading,body]`, or
     /// `[rowid,title,heading]` under `content=''` (design §1.4 D3).
     fts_rows: Vec<Vec<serde_json::Value>>,
+    /// D3: `source_files` rows, empty for a materialised index.
+    #[serde(default)]
+    source_files: Vec<SourceFileGolden>,
     fts_vocabulary: BTreeMap<String, Vec<(String, i64)>>,
     /// D4: `(rowid, bm25)` rows of the reference ranking SQL.
     probes: Vec<ProbeGolden>,
@@ -837,6 +840,14 @@ struct SchemaGolden {
     kind: String,
     name: String,
     sql: Option<String>,
+}
+
+/// One `source_files` row (`sag2.py:246`, `content=''` schema only).
+#[derive(Deserialize, PartialEq, Eq, Debug)]
+struct SourceFileGolden {
+    document_id: i64,
+    path: String,
+    sha256: String,
 }
 
 /// One D4 probe: the reference `MATCH` expression and its ranked rows.
@@ -1223,13 +1234,28 @@ fn gate_d_index(
         fixtures_equal,
         fixtures_total - fixtures_equal
     );
+    // The tallies must show work (N-003): an empty count means the comparison
+    // silently covered nothing, so a green report could advertise checks that
+    // never ran.
+    for (name, count) in [
+        ("D1 sqlite_master rows", subchecks.d1_entries),
+        ("D3 chunk_fts rows", subchecks.d3_rows),
+        ("D3 source_files rows", subchecks.d3_source_files),
+        ("D4 probes", subchecks.d4_probes),
+        ("D4 ranked rows", subchecks.d4_rows),
+    ] {
+        if count == 0 {
+            gate.push("subchecks", name.to_string(), ">= 1", count.to_string());
+        }
+    }
     println!(
-        "sub-checks: D1 {} fixtures / {} sqlite_master rows, D3 {} fixtures / {} chunk_fts rows, \
-         D4 {} fixtures / {} probes / {} ranked rows",
+        "sub-checks: D1 {} fixtures / {} sqlite_master rows, D3 {} fixtures / {} chunk_fts rows \
+         / {} source_files rows, D4 {} fixtures / {} probes / {} ranked rows",
         subchecks.d1_fixtures,
         subchecks.d1_entries,
         subchecks.d3_fixtures,
         subchecks.d3_rows,
+        subchecks.d3_source_files,
         subchecks.d4_fixtures,
         subchecks.d4_probes,
         subchecks.d4_rows
@@ -1245,6 +1271,10 @@ fn gate_d_index(
             "D3_chunk_fts_rows": {
                 "fixtures": subchecks.d3_fixtures,
                 "rows": subchecks.d3_rows,
+            },
+            "D3_source_files_rows": {
+                "fixtures": subchecks.d3_fixtures,
+                "rows": subchecks.d3_source_files,
             },
             "D4_probes": {
                 "fixtures": subchecks.d4_fixtures,
@@ -1310,6 +1340,7 @@ struct SubChecks {
     d1_entries: usize,
     d3_fixtures: usize,
     d3_rows: usize,
+    d3_source_files: usize,
     d4_fixtures: usize,
     d4_probes: usize,
     d4_rows: usize,
@@ -1476,8 +1507,8 @@ fn compare_index(
     drop(statement);
 
     // D3 (second half) — every `chunk_fts` row.  Under `content=''` FTS5
-    // stores no column values, so the design drops `body` and leaves the term
-    // binding to D4.
+    // stores no column values, so the design drops `body`; the rowid↔term
+    // binding is then covered by D4, which must bind rows for that fixture.
     {
         let mut statement = db.prepare(if contentless {
             "SELECT rowid,title,heading FROM chunk_fts ORDER BY rowid"
@@ -1523,6 +1554,48 @@ fn compare_index(
         }
     }
 
+    // D3 (third half) — the `source_files` provenance table of a `source_dir`
+    // build (`sag2.py:246`, `:284-290`), which is what the contentless
+    // statistics corpus is read back from.
+    if contentless {
+        let mut statement =
+            db.prepare("SELECT document_id, path, sha256 FROM source_files ORDER BY document_id")?;
+        let actual: Vec<SourceFileGolden> = statement
+            .query_map([], |row| {
+                Ok(SourceFileGolden {
+                    document_id: row.get(0)?,
+                    path: row.get(1)?,
+                    sha256: row.get(2)?,
+                })
+            })?
+            .collect::<Result<_, _>>()?;
+        subchecks.d3_source_files += actual.len();
+        if actual != golden.source_files {
+            let at = golden
+                .source_files
+                .iter()
+                .zip(&actual)
+                .position(|(left, right)| left != right)
+                .unwrap_or(golden.source_files.len().min(actual.len()));
+            gate.push(
+                fixture,
+                format!(
+                    "source_files[{at}]/{}",
+                    golden
+                        .source_files
+                        .get(at)
+                        .map_or("<missing>", |entry| entry.path.as_str())
+                ),
+                format!(
+                    "{} rows, first difference at {at}: {:?}",
+                    golden.source_files.len(),
+                    golden.source_files.get(at)
+                ),
+                format!("{} rows: {:?}", actual.len(), actual.get(at)),
+            );
+        }
+    }
+
     // D4 — replay the ranking SQL for every probe and compare
     // `(rowid, bm25 bits)` row for row (`sag2.py:484-492`).
     for (probe_index, probe) in golden.probes.iter().enumerate() {
@@ -1546,6 +1619,14 @@ fn compare_index(
             .collect::<Result<_, _>>()?;
         subchecks.d4_probes += 1;
         subchecks.d4_rows += actual.len();
+        if actual.is_empty() {
+            gate.push(
+                fixture,
+                format!("probe[{probe_index}]/{}", probe.query),
+                "at least one ranked row",
+                "none (vacuous probe)",
+            );
+        }
         if actual != probe.rows {
             let at = probe
                 .rows
