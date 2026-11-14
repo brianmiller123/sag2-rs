@@ -68,6 +68,38 @@ pub fn contains(word: &str) -> bool {
     contains_bytes(word.as_bytes())
 }
 
+/// Every entry the table stores, in its own byte order (`str` order).
+///
+/// Gate D compares this set against the reference's short `TOKENIZER.FREQ`
+/// keys, so a change to the table generation cannot hide: the whole 257k-entry
+/// set is checked, not a tokenizer sample.  Membership *lookups* are covered
+/// separately by that gate's anchor-position check.
+pub fn short_entries() -> Vec<&'static str> {
+    let mut entries = Vec::with_capacity(FREQ_ENTRIES);
+    let mut offset = 0_usize;
+    for _ in 0..FREQ_ENTRIES {
+        let (candidate, next) = entry(offset);
+        entries.push(std::str::from_utf8(candidate).expect("dictionary entries are UTF-8"));
+        offset = next;
+    }
+    entries
+}
+
+/// `FREQ_ENTRIES`: how many short keys the table holds.
+pub fn short_entry_count() -> usize {
+    FREQ_ENTRIES
+}
+
+/// `ANCHOR_EVERY`: the stride of the binary search's anchor records.
+pub fn anchor_every() -> usize {
+    ANCHOR_EVERY
+}
+
+/// `FREQ_MAX_CHARS`: the codepoint length cap rule 5 looks up.
+pub fn max_key_chars() -> usize {
+    FREQ_MAX_CHARS
+}
+
 /// Same question for a 2- or 3-codepoint substring, without allocating.
 pub fn contains_chars(chars: &[char]) -> bool {
     let mut buffer = [0_u8; 16];

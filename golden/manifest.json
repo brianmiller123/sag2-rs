@@ -1,5 +1,5 @@
 {
-  "generator_version": "0.7.0",
+  "generator_version": "0.7.1",
   "python": "3.12.11",
   "sqlite": "3.50.4",
   "jieba": "0.42.1",
@@ -121,6 +121,17 @@
       "path": "expansion.jsonl",
       "sha256": "03b58b1d583f495c49901119878b90d1f253ca2da40a75c038b5008618a141fd",
       "lines": 184
+    },
+    {
+      "path": "freq_keys.txt.gz",
+      "sha256": "fc05fab68c9aa52b3476e483cdd8547fc36a9a2044d190a094c167c8d31bd526",
+      "records": 257096,
+      "gzip_bytes": 854211
+    },
+    {
+      "path": "freq_probes.jsonl",
+      "sha256": "23382516e03af027fd50daa1fa8f42795a745c21ebd633a1eee91df78d5bda9a",
+      "lines": 5000
     }
   ],
   "tokenizer": {
@@ -301,6 +312,16 @@
       }
     ],
     "golden": "expansion.jsonl"
+  },
+  "freq": {
+    "keys": 257096,
+    "max_chars": 3,
+    "anchor_every": 64,
+    "anchor_entries": 4018,
+    "probes": 5000,
+    "corpus_probes": 640,
+    "golden": "freq_keys.txt.gz",
+    "probes_golden": "freq_probes.jsonl"
   },
   "fixtures": [
     {

@@ -22,7 +22,7 @@ fn reference(digest: &str) -> Value {
 
 fn write_manifest(dir: &Path, sqlite: &str, reference: Option<Value>) {
     let mut manifest = json!({
-        "generator_version": "0.7.0",
+        "generator_version": "0.7.1",
         "python": "3.12.11",
         "sqlite": sqlite,
         "jieba": "0.42.1",
@@ -179,7 +179,7 @@ fn write_index_dir_golden(root: &Path) -> (std::path::PathBuf, std::path::PathBu
     );
     fs::write(golden.join("index_dump.jsonl"), &dump).expect("index dump");
     let manifest = json!({
-        "generator_version": "0.7.0",
+        "generator_version": "0.7.1",
         "python": "3.12.11",
         "sqlite": "3.50.4",
         "jieba": "0.42.1",

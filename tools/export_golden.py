@@ -49,6 +49,12 @@ Outputs (all under ``--out``, default ``golden/``):
     carrying the replay inputs (seeds, base expression, excluded ids, limits)
     and the ordered ``terms`` / ``term_scores`` / ``queries`` / ``hits`` the
     reference produced for that hop
+``freq_keys.txt.gz``, ``freq_probes.jsonl``
+    Gate D's `freq` section (design §4.1 rule 5): every short (<= 3 code point)
+    positive ``TOKENIZER.FREQ`` key in UTF-8 byte order, and sampled keys with
+    the reference ``tokenize`` output.  The sample includes every anchor
+    position and every short key the gate corpora contain, so the anchor
+    boundary of the compiled table cannot go untested again.
 """
 
 from __future__ import annotations
@@ -101,7 +107,7 @@ if os.environ.get("PYTHONHASHSEED") != "0":
     )
 
 DEFAULT_REFERENCE = Path("../SAG-Benchmark/sag2/scripts")
-GENERATOR_VERSION = "0.7.0"
+GENERATOR_VERSION = "0.7.1"
 
 # Design §3.3: the v1 `rust_index_metadata` key set.  A Rust-built index must
 # carry exactly these keys; the values are compared against the runtime.
@@ -925,15 +931,20 @@ C7_REPAIR_TEXTS = (
 C7_REPAIR_EXCLUSIONS = ([], [1])
 
 
-def export_named_expansion(sag2, work_dir):
-    """The C7 sub-cases: direct `retrieve_expansion` and `repair_names` calls."""
-    fixture = Fixture(
+def c7_fixture():
+    """The C7 alias/grounding corpus (shared by the expansion and freq exports)."""
+    return Fixture(
         "C7",
         C7_FINGERPRINT,
         [{"title": title, "text": text} for title, text in C7_CORPUS],
         C7_CHUNK_CHARS,
         lambda _db: [],
     )
+
+
+def export_named_expansion(sag2, work_dir):
+    """The C7 sub-cases: direct `retrieve_expansion` and `repair_names` calls."""
+    fixture = c7_fixture()
     db_path = work_dir / f"{fixture.name}.sqlite"
     index = sag2.CorpusIndex(
         db_path, fixture.corpus, fixture.fingerprint, chunk_chars=fixture.chunk_chars
@@ -984,6 +995,79 @@ def export_named_expansion(sag2, work_dir):
         },
         lines,
     )
+
+
+# --------------------------------------------------------------------------
+# Gate D `freq` - rule 5's decision table (design §4.1).  The compiled table
+# stores one entry per short positive `TOKENIZER.FREQ` key and finds it with a
+# binary search over anchors every `ANCHOR_EVERY` entries.  A lookup that scans
+# only one side of an anchor silently drops 1/ANCHOR_EVERY of the dictionary
+# (P2b found exactly that: 4,017 of 257,096 entries), and the P1 tokenizer
+# goldens contained no anchor key at all, so Gate D could not see it.  This
+# export ships the whole key set and a probe sample that covers every anchor
+# position by construction.
+# --------------------------------------------------------------------------
+
+FREQ_PROBE_COUNT = 5000
+FREQ_PROBE_SEED = 20261115
+
+
+def freq_constants():
+    """`FREQ_MAX_CHARS` / `ANCHOR_EVERY`, read from the table generator."""
+    source = (
+        Path(__file__).resolve().parent.parent
+        / "crates"
+        / "sag2-core"
+        / "build.rs"
+    ).read_text()
+    values = {}
+    for name in ("FREQ_MAX_CHARS", "ANCHOR_EVERY"):
+        match = re.search(rf"const {name}: usize = (\d+);", source)
+        if match is None:
+            raise SystemExit(f"cannot find {name} in sag2-core/build.rs")
+        values[name] = int(match.group(1))
+    return values["FREQ_MAX_CHARS"], values["ANCHOR_EVERY"]
+
+
+def export_freq(sag2, fixtures):
+    """The short `TOKENIZER.FREQ` key set and deterministic tokenizer probes."""
+    max_chars, stride = freq_constants()
+    # `TOKENIZER.FREQ` is built lazily on the first cut (`jieba.Tokenizer`).
+    sag2.tokenize("")
+    keys = sorted(
+        key
+        for key, value in sag2.TOKENIZER.FREQ.items()
+        if len(key) <= max_chars and value > 0
+    )
+    key_set = set(keys)
+    # Every anchor position, so the probe list cannot miss one by sampling.
+    probes = {key for position, key in enumerate(keys) if position % stride == 0}
+    anchors = len(probes)
+    # Every short key the gate corpora contain, so real text is covered too.
+    for fixture in fixtures:
+        for document in fixture.corpus:
+            for text in (document["title"], document["text"]):
+                probes.update(
+                    token for token in sag2.tokenize(text) if token in key_set
+                )
+    corpus_probes = len(probes) - anchors
+    remaining = [key for key in keys if key not in probes]
+    random.Random(FREQ_PROBE_SEED).shuffle(remaining)
+    probes.update(remaining[: max(0, FREQ_PROBE_COUNT - len(probes))])
+    ordered = sorted(probes)
+    lines = [{"key": key, "tokens": sag2.tokenize(key)} for key in ordered]
+    text = "".join(json.dumps(line, ensure_ascii=False) + "\n" for line in lines)
+    blob = _gzip_bytes(("\n".join(keys) + "\n").encode("utf-8"))
+    return blob, text, {
+        "keys": len(keys),
+        "max_chars": max_chars,
+        "anchor_every": stride,
+        "anchor_entries": anchors,
+        "probes": len(lines),
+        "corpus_probes": corpus_probes,
+        "golden": "freq_keys.txt.gz",
+        "probes_golden": "freq_probes.jsonl",
+    }
 
 
 # --------------------------------------------------------------------------
@@ -1862,6 +1946,7 @@ def build_manifest(
     index_expected,
     sortkeys,
     expansion,
+    freq,
 ):
     corpus_digest = hashlib.sha256()
     for fixture in fixtures:
@@ -1887,6 +1972,7 @@ def build_manifest(
         "index_expected": index_expected,
         "sortkeys": sortkeys,
         "expansion": expansion,
+        "freq": freq,
         "fixtures": [
             {
                 "fixture": entry["fixture"],
@@ -2113,6 +2199,23 @@ def main(argv=None):
             json.dumps(line, ensure_ascii=False) + "\n" for line in expansion_lines
         )
 
+        # Gate D `freq` (design §4.1 rule 5): the table's whole short key set
+        # plus tokenizer probes covering every anchor position and the corpus.
+        freq_blob, freq_text, freq_metadata = export_freq(
+            sag2,
+            [
+                next(fixture for fixture in fixtures if fixture.name == "C0"),
+                c4,
+                c7_fixture(),
+            ],
+        )
+        print(
+            f"freq: {freq_metadata['keys']} short keys, "
+            f"{freq_metadata['anchor_entries']} anchor positions, "
+            f"{freq_metadata['probes']} probes "
+            f"({freq_metadata['corpus_probes']} corpus keys)"
+        )
+
         files = [
             {"path": "retrieve.jsonl", "sha256": _sha256_bytes(retrieve_text.encode()),
              "lines": len(retrieve_lines)},
@@ -2180,6 +2283,21 @@ def main(argv=None):
                 "lines": len(expansion_lines),
             }
         )
+        files.append(
+            {
+                "path": "freq_keys.txt.gz",
+                "sha256": _sha256_bytes(freq_blob),
+                "records": freq_metadata["keys"],
+                "gzip_bytes": len(freq_blob),
+            }
+        )
+        files.append(
+            {
+                "path": "freq_probes.jsonl",
+                "sha256": _sha256_bytes(freq_text.encode()),
+                "lines": freq_metadata["probes"],
+            }
+        )
         manifest = build_manifest(
             fixtures,
             {
@@ -2229,6 +2347,7 @@ def main(argv=None):
                 "fixtures": expansion_fixtures,
                 "golden": "expansion.jsonl",
             },
+            freq_metadata,
         )
 
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -2253,6 +2372,8 @@ def main(argv=None):
         (out_dir / "chunks.jsonl").write_text(chunk_text)
         (out_dir / "index_expected.jsonl").write_text(index_expected_text)
         (out_dir / "expansion.jsonl").write_text(expansion_text)
+        (out_dir / "freq_keys.txt.gz").write_bytes(freq_blob)
+        (out_dir / "freq_probes.jsonl").write_text(freq_text)
         for entry in expansion_fixtures:
             shutil.copyfile(work_dir / entry["index"], index_dir / entry["index"])
         for name, spec in UNICODE_TABLES.items():
@@ -2273,7 +2394,9 @@ def main(argv=None):
             f"tables, {sortkey_lines} sort-key terms, "
             f"{sortkey_metadata['codepoints']['codepoints']} sort-key code points, "
             f"{sortkey_metadata['pairs']['pairs']} sort-key pairs, "
-            f"{len(expansion_lines)} expansion records and "
+            f"{len(expansion_lines)} expansion records, "
+            f"{freq_metadata['keys']} short FREQ keys, "
+            f"{freq_metadata['probes']} FREQ probes and "
             f"{len(fixture_stats)} indexes to {out_dir}"
         )
     finally:

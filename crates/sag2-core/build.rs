@@ -119,6 +119,7 @@ fn write_freq_tables(out_dir: &Path, total: u64, freq: &BTreeMap<String, u32>) {
 
     let mut source = String::new();
     writeln!(source, "pub const DICT_TOTAL: u64 = {total};").expect("write consts");
+    writeln!(source, "pub const FREQ_MAX_CHARS: usize = {FREQ_MAX_CHARS};").expect("write consts");
     writeln!(source, "pub const FREQ_ENTRIES: usize = {entries};").expect("write consts");
     writeln!(source, "pub const ANCHOR_EVERY: usize = {ANCHOR_EVERY};").expect("write consts");
     writeln!(source, "pub static ASCII_WORDS: &[(&str, u32)] = &[").expect("write consts");

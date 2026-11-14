@@ -19,6 +19,9 @@ mod unicode;
 
 pub use chunk::{chunk_document, source_content, utf16_length, Chunk, DEFAULT_CHUNK_CHARS};
 pub use collate::sort_key;
+pub use dict::{
+    anchor_every, contains as freq_contains, max_key_chars, short_entries, short_entry_count,
+};
 pub use tokenize::tokenize;
 pub use unicode::{
     casefold, combining_class, is_letter, is_mark, is_number, is_space, is_uppercase, is_word, lower,

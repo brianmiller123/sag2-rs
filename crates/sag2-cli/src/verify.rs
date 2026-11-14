@@ -34,7 +34,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Generator version this verifier understands.
-const GENERATOR_VERSION: &str = "0.7.0";
+const GENERATOR_VERSION: &str = "0.7.1";
 
 /// Minimum interpreter the goldens may come from (design §11 divergence D5).
 const REQUIRED_PYTHON: (u64, u64) = (3, 12);
@@ -81,6 +81,8 @@ struct Manifest {
     sortkeys: Option<SortkeysSpec>,
     #[serde(default)]
     expansion: Option<ExpansionSpec>,
+    #[serde(default)]
+    freq: Option<FreqSpec>,
 }
 
 /// Gate B's sort-key goldens (design §5.5).
@@ -118,6 +120,30 @@ struct SortkeysPairs {
 struct ChunksSpec {
     documents: usize,
     chunks: usize,
+}
+
+/// Gate D's `freq` section: rule 5's short-key table (design §4.1).
+#[derive(Deserialize)]
+struct FreqSpec {
+    /// Short positive `TOKENIZER.FREQ` keys (`freq_keys.txt.gz`).
+    keys: usize,
+    /// `FREQ_MAX_CHARS` of the table generator.
+    max_chars: usize,
+    /// `ANCHOR_EVERY` of the table generator.
+    anchor_every: usize,
+    /// How many of those keys sit on an anchor position.
+    anchor_entries: usize,
+    /// `freq_probes.jsonl` line count.
+    probes: usize,
+    #[serde(default)]
+    corpus_probes: Option<usize>,
+}
+
+/// One `freq_probes.jsonl` line: a key and the reference's `tokenize` output.
+#[derive(Deserialize)]
+struct FreqProbe {
+    key: String,
+    tokens: Vec<String>,
 }
 
 /// Gate B's expansion goldens (design §1.2).
@@ -444,7 +470,7 @@ pub fn verify(args: &[String]) -> ExitCode {
 
 pub fn usage() -> &'static str {
     "usage: sag2-cli verify --gate A|B|D --golden golden/ \
-     [--fixtures tokenizer,chunks,index|sortkeys|expansion] [--reference <scripts>] \
+     [--fixtures tokenizer,chunks,index,freq|sortkeys|expansion] [--reference <scripts>] \
      [--index-cache <dir>] [--index-dir <dir>] [--filter <substring>] \
      [--report report.json]"
 }
@@ -3199,15 +3225,219 @@ fn compare_bits(
     }
 }
 
+/// Gate D `freq`: rule 5's short-key table and its tokenizer probes
+/// (design §4.1 rule 5, §4.3).
+///
+/// Three checks, because the table is a decision structure rather than data:
+/// set equality over every stored key (no missing, no extra), an explicit
+/// anchor-position tally (the boundary case that a one-sided window silently
+/// drops), and `tokenize(key)` against the reference for the probe sample.
+fn gate_d_freq(
+    options: &Options,
+    manifest: &Manifest,
+    failures: &mut Vec<Failure>,
+) -> Result<serde_json::Value, String> {
+    verify_manifest_files(options, manifest, &["freq_keys.txt.gz", "freq_probes.jsonl"])?;
+    let spec = manifest
+        .freq
+        .as_ref()
+        .ok_or_else(|| "manifest has no freq section".to_owned())?;
+    let failures_before = failures.len();
+    if sag2_core::max_key_chars() != spec.max_chars {
+        return Err(format!(
+            "unsupported: this build indexes FREQ keys up to {} code points, golden says {}",
+            sag2_core::max_key_chars(),
+            spec.max_chars
+        ));
+    }
+    if sag2_core::anchor_every() != spec.anchor_every {
+        return Err(format!(
+            "unsupported: this build anchors every {} entries, golden says {}",
+            sag2_core::anchor_every(),
+            spec.anchor_every
+        ));
+    }
+
+    let keys_path = options.golden.join("freq_keys.txt.gz");
+    let compressed = fs::read(&keys_path)
+        .map_err(|error| format!("cannot read {}: {error}", keys_path.display()))?;
+    let text = String::from_utf8(gunzip(&keys_path, &compressed)?)
+        .map_err(|error| format!("{} is not UTF-8: {error}", keys_path.display()))?;
+    let golden: Vec<&str> = text.lines().collect();
+    if golden.len() != spec.keys {
+        return Err(format!(
+            "golden inconsistency: freq_keys.txt.gz holds {} keys, manifest says {}",
+            golden.len(),
+            spec.keys
+        ));
+    }
+
+    // Set equality over the whole table.
+    let entries = sag2_core::short_entries();
+    let entries_set: BTreeSet<&str> = entries.iter().copied().collect();
+    let golden_set: BTreeSet<&str> = golden.iter().copied().collect();
+    let missing: Vec<&&str> = golden_set.difference(&entries_set).collect();
+    let extra: Vec<&&str> = entries_set.difference(&golden_set).collect();
+    if entries.len() != golden.len() {
+        push_gate_failure(
+            failures,
+            "freq/keys",
+            "count",
+            golden.len().to_string(),
+            entries.len().to_string(),
+        );
+    }
+    for key in missing.iter().take(10) {
+        push_gate_failure(
+            failures,
+            "freq/keys",
+            "missing",
+            format!("{key:?} is in the golden"),
+            "absent from the compiled table".to_owned(),
+        );
+    }
+    for key in extra.iter().take(10) {
+        push_gate_failure(
+            failures,
+            "freq/keys",
+            "extra",
+            "absent from the golden".to_owned(),
+            format!("{key:?} is in the compiled table"),
+        );
+    }
+    if missing.is_empty() && extra.is_empty() {
+        // Both sides are in UTF-8 byte order, so equal sets must be equal
+        // sequences; the binary search depends on that order.
+        for (position, (expected, actual)) in golden.iter().zip(&entries).enumerate() {
+            if expected != actual {
+                push_gate_failure(
+                    failures,
+                    "freq/keys",
+                    format!("order[{position}]"),
+                    format!("{expected:?}"),
+                    format!("{actual:?}"),
+                );
+                break;
+            }
+        }
+    }
+
+    // Anchor coverage: every anchor-position key must be *findable* through
+    // the public lookup (the entry is in the blob either way; the binary
+    // search is what the anchor boundary breaks), and the tally must not
+    // silently become zero on a future rebuild.
+    let stride = spec.anchor_every;
+    let mut anchors = 0_usize;
+    let mut anchor_missing = 0_usize;
+    for (position, key) in golden.iter().enumerate() {
+        if position % stride != 0 {
+            continue;
+        }
+        anchors += 1;
+        if !sag2_core::freq_contains(key) {
+            anchor_missing += 1;
+            if anchor_missing <= 10 {
+                push_gate_failure(
+                    failures,
+                    "freq/anchors",
+                    format!("anchor[{position}]"),
+                    format!("{key:?} is findable"),
+                    "the lookup reports it absent".to_owned(),
+                );
+            }
+        }
+    }
+    if anchors != spec.anchor_entries {
+        return Err(format!(
+            "golden inconsistency: {} anchor positions, manifest says {}",
+            anchors, spec.anchor_entries
+        ));
+    }
+    if anchors == 0 {
+        push_gate_failure(
+            failures,
+            "freq/anchors",
+            "count",
+            "> 0 anchor entries",
+            "0".to_owned(),
+        );
+    }
+
+    // Probes: `tokenize(key)` must equal the reference's token list.
+    let probes_path = options.golden.join("freq_probes.jsonl");
+    let probes_text = fs::read_to_string(&probes_path)
+        .map_err(|error| format!("cannot read {}: {error}", probes_path.display()))?;
+    let mut probes: Vec<FreqProbe> = Vec::new();
+    for (number, line) in probes_text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        probes.push(
+            serde_json::from_str(line)
+                .map_err(|error| format!("{}:{}: {error}", probes_path.display(), number + 1))?,
+        );
+    }
+    if probes.len() != spec.probes {
+        return Err(format!(
+            "golden inconsistency: freq_probes.jsonl holds {} probes, manifest says {}",
+            probes.len(),
+            spec.probes
+        ));
+    }
+    let mut probe_diffs = 0_usize;
+    for probe in &probes {
+        let actual = sag2_core::tokenize(&probe.key);
+        if actual == probe.tokens {
+            continue;
+        }
+        probe_diffs += 1;
+        if probe_diffs <= 10 {
+            push_gate_failure(
+                failures,
+                "freq/probes",
+                format!("tokenize({:?})", probe.key),
+                format!("{:?}", probe.tokens),
+                format!("{actual:?}"),
+            );
+        }
+    }
+
+    let passed = failures.len() == failures_before;
+    println!(
+        "freq: {} keys ({} missing, {} extra), {} anchors ({} missing), {} probes ({} diffs)",
+        golden.len(),
+        missing.len(),
+        extra.len(),
+        anchors,
+        anchor_missing,
+        probes.len(),
+        probe_diffs
+    );
+    Ok(serde_json::json!({
+        "keys": golden.len(),
+        "missing": missing.len(),
+        "extra": extra.len(),
+        "anchors": anchors,
+        "anchor_missing": anchor_missing,
+        "probes": probes.len(),
+        "corpus_probes": spec.corpus_probes,
+        "probe_diffs": probe_diffs,
+        "passed": passed,
+    }))
+}
+
 fn run_gate_d(options: &Options) -> Result<ExitCode, String> {
     let fixtures = options
         .fixtures
         .clone()
         .unwrap_or_else(|| vec!["tokenizer".to_owned()]);
     for fixture in &fixtures {
-        if !matches!(fixture.as_str(), "tokenizer" | "chunks" | "index") {
+        if !matches!(
+            fixture.as_str(),
+            "tokenizer" | "chunks" | "index" | "freq"
+        ) {
             return Err(format!(
-                "gate D fixture {fixture} is not implemented; use tokenizer, chunks or index"
+                "gate D fixture {fixture} is not implemented; use tokenizer, chunks, index or freq"
             ));
         }
     }
@@ -3216,6 +3446,16 @@ fn run_gate_d(options: &Options) -> Result<ExitCode, String> {
     let mut sections = serde_json::Map::new();
     let mut passed = true;
 
+    // `freq` is rule 5 of the tokenizer, so `tokenizer` always runs it; naming
+    // `freq` alone is how a table change is checked by itself.
+    if fixtures
+        .iter()
+        .any(|fixture| fixture == "tokenizer" || fixture == "freq")
+    {
+        let section = gate_d_freq(options, &manifest, &mut failures)?;
+        passed &= section["passed"].as_bool().unwrap_or(false);
+        sections.insert("freq".to_owned(), section);
+    }
     if fixtures.iter().any(|fixture| fixture == "tokenizer") {
         let section = gate_d_tokenizer(options, &manifest, &mut failures)?;
         passed &= section["passed"].as_bool().unwrap_or(false);

@@ -62,8 +62,15 @@ cargo run -p sag2-cli -- verify --gate D --fixtures tokenizer,chunks,index --gol
 
 `--fixtures` selects any subset:
 
-* `tokenizer` - the frozen tokenizer lines, the ASCII cross product and the
-  exhaustive per-code-point Unicode tables (§4.4).
+* `tokenizer` — the frozen tokenizer lines, the ASCII cross product, the
+  exhaustive per-code-point Unicode tables (§4.4) and the `freq` table (below).
+* `freq` — rule 5's short (`<= 3` code point) `TOKENIZER.FREQ` key set against
+  `golden/freq_keys.txt.gz`: exact set equality (no missing, no extra key), an
+  explicit anchor-position tally (every 64th entry of the compiled table is a
+  binary-search anchor, and a one-sided window drops exactly those), and
+  `tokenize(key)` for the `golden/freq_probes.jsonl` sample, which by
+  construction contains every anchor key plus every short key the C0/C4/C7
+  corpora contain.
 * `chunks` - `golden/chunks.jsonl`: every fixture document plus the desktop
   reference cases and the `tests/test_chunking.py` scenarios, compared on
   heading, spans (code point offsets) and content bytes.  Both §9 R13 defaults
