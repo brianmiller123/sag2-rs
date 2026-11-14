@@ -37,7 +37,12 @@ pub fn py_repr(value: f64) -> String {
         return "nan".to_owned();
     }
     if value.is_infinite() {
-        return if value.is_sign_positive() { "inf" } else { "-inf" }.to_owned();
+        return if value.is_sign_positive() {
+            "inf"
+        } else {
+            "-inf"
+        }
+        .to_owned();
     }
 
     let negative = value.is_sign_negative();

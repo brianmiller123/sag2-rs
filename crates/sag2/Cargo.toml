@@ -4,6 +4,15 @@ description = "SAG2 orchestration: rank_dpp, the judge payload builder and searc
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
+
+[features]
+default = ["tiktoken"]
+# The payload builder and its token budget (`BatchedJudge`, `Payload`, the
+# 32000/64000-token packing).  Without it only a custom `Judge` can score.
+tiktoken = ["dep:tiktoken-rs"]
+# Async wrappers (`AsyncIndex`, `async_search`) on tokio's blocking pool.
+async = ["dep:tokio", "dep:futures-core"]
 
 [dependencies]
 sag2-core = { path = "../sag2-core" }
@@ -12,7 +21,19 @@ sag2-json = { path = "../sag2-json" }
 serde_json = "1"
 # `o200k_base` is embedded in the crate (`include_str!`), so the token budget
 # needs no network or data file (design §2.4 `tiktoken`).
-tiktoken-rs = "0.6"
+tiktoken-rs = { version = "0.6", optional = true }
+# `spawn_blocking` and the bounded-concurrency `Semaphore` are all the async
+# feature uses; no reactor, no executor and no I/O driver.
+tokio = { version = "1", features = ["rt", "sync"], optional = true }
+futures-core = { version = "0.3", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+tokio = { version = "1", features = ["rt", "sync"] }
+
+[[example]]
+name = "bm25_only"
+
+[[example]]
+name = "oracle_search"
+required-features = ["tiktoken"]

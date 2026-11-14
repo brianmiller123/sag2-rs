@@ -4,6 +4,7 @@ description = "Byte-exact CPython 3.12 JSON codec used by the SAG2 Rust port"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 
 [dependencies]
 ryu = "1"

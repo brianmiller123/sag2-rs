@@ -38,24 +38,22 @@ fn cases() -> Vec<(&'static str, Value)> {
         ),
         (
             "empty_containers",
-            object(&[
-                ("object", object(&[])),
-                ("array", Value::Array(vec![])),
-            ]),
+            object(&[("object", object(&[])), ("array", Value::Array(vec![]))]),
         ),
         ("empty_string", object(&[("s", Value::Str(String::new()))])),
         (
             "string_escapes",
             object(&[(
                 "s",
-                Value::Str(
-                    "a\"b\\c\nd\re\tf\u{8}g\u{c}h\0i\u{1}j\u{1f}k\u{7f}l/m".to_owned(),
-                ),
+                Value::Str("a\"b\\c\nd\re\tf\u{8}g\u{c}h\0i\u{1}j\u{1f}k\u{7f}l/m".to_owned()),
             )]),
         ),
         (
             "unicode_passthrough",
-            object(&[("s", Value::Str("中文 😀 café ẞ \u{2028}\u{2029}".to_owned()))]),
+            object(&[(
+                "s",
+                Value::Str("中文 😀 café ẞ \u{2028}\u{2029}".to_owned()),
+            )]),
         ),
         (
             "key_escapes",
@@ -171,9 +169,6 @@ fn compact_json_matches_cpython() {
 fn compact_object_has_no_whitespace_and_keeps_order() {
     assert_eq!(compact_json(&object(&[("a", Value::Int(1))])), "{\"a\":1}");
 
-    let nested = object(&[(
-        "z",
-        object(&[("b", Value::Int(1)), ("a", Value::Int(2))]),
-    )]);
+    let nested = object(&[("z", object(&[("b", Value::Int(1)), ("a", Value::Int(2))]))]);
     assert_eq!(compact_json(&nested), "{\"z\":{\"b\":1,\"a\":2}}");
 }

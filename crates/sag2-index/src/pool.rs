@@ -187,11 +187,7 @@ impl Reader {
             self.rank_stats
                 .insert(expression.to_owned(), blob.flatten().unwrap_or_default());
         }
-        let stats = self
-            .rank_stats
-            .get(expression)
-            .cloned()
-            .unwrap_or_default();
+        let stats = self.rank_stats.get(expression).cloned().unwrap_or_default();
 
         let query = match term {
             Some(term) => format!("({expression}) AND {}", quote_term(term)),
@@ -224,10 +220,7 @@ impl Reader {
                         .filter(|(index, _)| !selected.contains(index))
                         .map(|(_, idf)| *idf),
                 );
-            if possible.len() == limit
-                && possible
-                    .last()
-                    .is_some_and(|(_, score)| -*score > bound)
+            if possible.len() == limit && possible.last().is_some_and(|(_, score)| -*score > bound)
             {
                 return Ok(possible);
             }
@@ -302,6 +295,11 @@ impl QueryPool {
             readers,
             next: AtomicUsize::new(0),
         })
+    }
+
+    /// The number of read-only connections (`QueryOptions::workers`).
+    pub(crate) fn workers(&self) -> usize {
+        self.readers.len()
     }
 
     pub(crate) fn retrieve(

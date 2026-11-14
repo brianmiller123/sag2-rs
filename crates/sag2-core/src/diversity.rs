@@ -11,6 +11,8 @@
 
 use crate::{casefold, is_letter, is_number};
 
+/// `Counter(diversity_tokens(content))`'s key stream: folded letter/number
+/// runs in left-to-right order (`sag2.py:136-140`).
 pub fn diversity_tokens(text: &str) -> Vec<String> {
     let folded = casefold(text);
     let mut tokens = Vec::new();

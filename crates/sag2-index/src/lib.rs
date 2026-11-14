@@ -9,6 +9,7 @@
 //! cached seven-key statistics and the `rust_index_metadata` provenance rows.
 
 #![deny(unsafe_code)]
+#![deny(missing_docs)]
 
 mod build;
 mod expand;
@@ -41,7 +42,6 @@ pub use retrieve::{Hit, QueryError, BASE_SQL, SAG_STATS_SQL};
 pub use sag2_core::DEFAULT_CHUNK_CHARS;
 pub use signature::{changed_field, signature, CHUNK_POLICY, INDEX_SCHEMA};
 pub use statistics::{Statistics, StatisticsError};
-
 impl std::fmt::Debug for CorpusIndex {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -50,6 +50,43 @@ impl std::fmt::Debug for CorpusIndex {
             .field("signature", &self.signature)
             .field("total", &self.statistics.total)
             .finish_non_exhaustive()
+    }
+}
+
+/// A SQLite failure behind an opaque wrapper.
+///
+/// `rusqlite` stays an implementation detail of this crate: the error types
+/// that cross the crate boundary carry this wrapper, so a downstream library
+/// never has to name a `rusqlite` type to match on a failure.  The message and
+/// [`std::error::Error::source`] chain are preserved.
+#[derive(Debug)]
+pub struct SqliteError(rusqlite::Error);
+
+impl SqliteError {
+    /// The SQLite error code, when the failure carries one.
+    pub fn code(&self) -> Option<i32> {
+        match &self.0 {
+            rusqlite::Error::SqliteFailure(error, _) => Some(error.code as i32),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for SqliteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "{}", self.0)
+    }
+}
+
+impl std::error::Error for SqliteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+impl From<rusqlite::Error> for SqliteError {
+    fn from(error: rusqlite::Error) -> Self {
+        SqliteError(error)
     }
 }
 
@@ -103,6 +140,15 @@ impl CorpusIndex {
     /// Corpus statistics loaded from `index_statistics`.
     pub fn statistics(&self) -> &Statistics {
         &self.statistics
+    }
+
+    /// The number of read-only connections in this index's query pool
+    /// (`QueryOptions::workers` when it was opened).
+    ///
+    /// This is the natural backpressure limit for concurrent retrieval: more
+    /// in-flight queries than connections only queue on the pool's mutexes.
+    pub fn query_workers(&self) -> usize {
+        self.pool.workers()
     }
 
     /// `CorpusIndex.retrieve` (`sag2.py:454-464`).

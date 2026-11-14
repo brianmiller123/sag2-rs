@@ -33,26 +33,40 @@ const CHUNKS_SQL: &str = "SELECT id,document_id,title,heading,content,full_doc,s
 /// A retrieved chunk with its BM25 score (`sag2.py:525-532`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hit {
+    /// The `chunks.id` row id.
     pub id: i64,
+    /// The document the chunk belongs to.
     pub document_id: i64,
+    /// The document title.
     pub title: String,
+    /// The chunk's heading (`""` when none).
     pub heading: String,
+    /// The chunk text (materialised from `spans` in `source_dir` mode).
     pub content: String,
+    /// The whole document, when the index stores it.
     pub full_doc: Option<String>,
+    /// Code-point spans into the source text.
     pub spans: Vec<(u64, u64)>,
+    /// Character count the chunk reports.
     pub characters: u32,
+    /// The source identifier the index built.
     pub source_id: String,
+    /// The `sag_bm25` score (negative; lower is better).
     pub score: f64,
 }
 
 /// A failure of the read path.
 #[derive(Debug)]
 pub enum QueryError {
-    Sqlite(rusqlite::Error),
+    /// SQLite rejected a statement or the file.
+    Sqlite(crate::SqliteError),
     /// The `sag_stats` blob is not a sequence of `f64`s.
     InvalidRankStats,
     /// A `chunks` row does not decode into [`Hit`].
-    MalformedRow { column: &'static str },
+    MalformedRow {
+        /// The column that failed to decode.
+        column: &'static str,
+    },
     /// A ranked id has no `chunks` row (Python would raise `KeyError`).
     MissingChunk(i64),
 }
@@ -62,7 +76,10 @@ impl std::fmt::Display for QueryError {
         match self {
             QueryError::Sqlite(error) => write!(formatter, "{error}"),
             QueryError::InvalidRankStats => {
-                write!(formatter, "sag_stats returned a blob that is not a sequence of f64")
+                write!(
+                    formatter,
+                    "sag_stats returned a blob that is not a sequence of f64"
+                )
             }
             QueryError::MalformedRow { column } => {
                 write!(formatter, "chunks.{column} does not decode")
@@ -76,7 +93,7 @@ impl std::error::Error for QueryError {}
 
 impl From<rusqlite::Error> for QueryError {
     fn from(error: rusqlite::Error) -> Self {
-        QueryError::Sqlite(error)
+        QueryError::Sqlite(error.into())
     }
 }
 
@@ -158,7 +175,9 @@ pub(crate) fn run_query(
 ) -> Result<Vec<(i64, f64)>, rusqlite::Error> {
     let mut statement = db.prepare_cached(sql)?;
     let mut rows = match subset {
-        Some(subset) => statement.query(params![stats, query, excluded_json, subset, limit as i64])?,
+        Some(subset) => {
+            statement.query(params![stats, query, excluded_json, subset, limit as i64])?
+        }
         None => statement.query(params![stats, query, excluded_json, limit as i64])?,
     };
     let mut ranked = Vec::new();
@@ -174,10 +193,7 @@ pub(crate) fn pruned_sql() -> String {
 }
 
 /// `sag2.py:525-532`: read the `chunks` rows for `ranked` and attach scores.
-pub(crate) fn materialize(
-    db: &Connection,
-    ranked: &[(i64, f64)],
-) -> Result<Vec<Hit>, QueryError> {
+pub(crate) fn materialize(db: &Connection, ranked: &[(i64, f64)]) -> Result<Vec<Hit>, QueryError> {
     if ranked.is_empty() {
         return Ok(Vec::new());
     }
@@ -199,8 +215,9 @@ pub(crate) fn materialize(
             full_doc: Some(row.get(5)?),
             spans: serde_json::from_str(&spans)
                 .map_err(|_| QueryError::MalformedRow { column: "spans" })?,
-            characters: u32::try_from(characters)
-                .map_err(|_| QueryError::MalformedRow { column: "characters" })?,
+            characters: u32::try_from(characters).map_err(|_| QueryError::MalformedRow {
+                column: "characters",
+            })?,
             source_id: row.get(8)?,
             score: 0.0,
         };
@@ -208,9 +225,7 @@ pub(crate) fn materialize(
     }
     let mut hits = Vec::with_capacity(ranked.len());
     for (id, score) in ranked {
-        let mut hit = by_id
-            .remove(id)
-            .ok_or(QueryError::MissingChunk(*id))?;
+        let mut hit = by_id.remove(id).ok_or(QueryError::MissingChunk(*id))?;
         hit.score = *score;
         hits.push(hit);
     }

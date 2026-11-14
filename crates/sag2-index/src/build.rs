@@ -28,8 +28,11 @@ use crate::signature::signature;
 /// deliberately not unified (design §9 R13).
 #[derive(Debug, Clone, Copy)]
 pub struct Document<'a> {
+    /// The document title.
     pub title: &'a str,
+    /// The document text.
     pub text: &'a str,
+    /// The raw row path; `None` becomes `"document.txt"` at build time.
     pub path: Option<&'a str>,
     /// `sag2.py:187`: `source_id` is `str(doc.get("idx", position)).rsplit("_", 1)[0]`.
     pub idx: Option<&'a str>,
@@ -38,18 +41,28 @@ pub struct Document<'a> {
 /// The `source_dir` build requires the corpus row to name its file.
 #[derive(Debug)]
 pub enum BuildError {
-    Sqlite(rusqlite::Error),
+    /// SQLite rejected a statement or the file.
+    Sqlite(crate::SqliteError),
+    /// A corpus source file could not be read.
     Io {
+        /// The file that failed.
         path: PathBuf,
+        /// The underlying I/O error.
         error: std::io::Error,
     },
+    /// A corpus source file is not valid UTF-8.
     NotUtf8 {
+        /// The file that failed.
         path: PathBuf,
     },
+    /// `source_dir` is set but the corpus row has no `path`.
     MissingPath {
+        /// The corpus row position.
         position: usize,
     },
+    /// The corpus row has an empty title or text.
     EmptyDocument {
+        /// The corpus row position.
         position: usize,
     },
 }
@@ -80,7 +93,7 @@ impl std::error::Error for BuildError {}
 
 impl From<rusqlite::Error> for BuildError {
     fn from(error: rusqlite::Error) -> Self {
-        BuildError::Sqlite(error)
+        BuildError::Sqlite(error.into())
     }
 }
 

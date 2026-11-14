@@ -1,12 +1,114 @@
 # sag2-rs
 
-Rust port of the SAG2 retrieval core. This workspace lives outside the
-`SAG-Benchmark` reference repository and is verified against it: the reference
-checkout stays read-only, and every observable output must match the Python
-implementation byte for byte.
+Rust port of the SAG2 retrieval core, usable as a library and verified against
+the reference implementation. The reference checkout stays read-only, and every
+observable output must match the Python implementation byte for byte.
 
 Design authority: `../SAG2-Rust-移植设计.md` (§1.0 comparison functions,
 §2 crate layout, §3 index contract, §13 hard constraints).
+
+## Use it as a library
+
+The crate is not published yet; depend on it by path (or git) for now:
+
+```toml
+[dependencies]
+sag2 = { path = "../sag2-rs/crates/sag2" }
+```
+
+sag2 re-exports everything a consumer needs, so no `sag2-index` or `sag2-json`
+dependency is required.
+
+### BM25-only recall
+
+No judge, no payload builder, no async runtime. This path also builds with
+`default-features = false`:
+
+```rust
+let index = sag2::open_existing("index.sqlite")?;      // read-only, signature-checked
+let expression = index.match_query("anchor birthplace depicts")?;
+let hits = index.retrieve(&expression, &Default::default(), 5, None)?;
+for hit in hits {
+    println!("{} {} {:.6}", hit.id, hit.title, hit.score);
+}
+```
+
+`examples/bm25_only.rs` runs this against the committed C0 fixture:
+
+```sh
+cargo run --example bm25_only
+```
+
+### Full SAG2 search
+
+Add a judge. `BatchedJudge<T: Transport>` builds the byte-exact payloads and
+applies the 32000/64000-token budget; `OracleJudge` is the deterministic
+fixture transport the gates replay (a real deployment implements `Judge` or
+`Transport`; HTTP arrives in P3):
+
+```rust
+let index = sag2::open_existing("index.sqlite")?;
+let judge = sag2::BatchedJudge::new(sag2::OracleJudge::new());
+let result = sag2::search(&index, &judge, "anchor birthplace depicts", &SearchOptions::default())?;
+for candidate in result.candidates.iter().take(5) {
+    println!("{} {} {}", candidate.hit.id, candidate.hit.title, candidate.jev_score);
+}
+```
+
+```sh
+cargo run --example oracle_search
+```
+
+### Async
+
+Enable the `async` feature to run retrieval and the search loop on tokio's
+blocking pool. `AsyncIndex` caps in-flight work at the index's query-worker
+count, so overload becomes async waiting instead of unbounded blocking threads:
+
+```rust
+let index = sag2::AsyncIndex::open("index.sqlite").await?;
+let judge: std::sync::Arc<dyn sag2::Judge> =
+    std::sync::Arc::new(sag2::BatchedJudge::new(sag2::OracleJudge::new()));
+let result = index.search(judge, "anchor birthplace depicts", SearchOptions::default()).await?;
+```
+
+`Judge` stays synchronous on purpose. The search loop holds no async state and
+the crate must not force one executor on its consumers, so a judge that needs to
+await (an HTTP provider, say) wraps itself — `tokio::task::block_in_place` plus
+`Handle::block_on` on a multi-thread runtime, or its own runtime. That keeps the
+async decision in the layer that performs I/O.
+
+### Feature matrix
+
+| feature | default | enabled by it | without it |
+|---|---|---|---|
+| `tiktoken` | on | `BatchedJudge`, `Payload`, `Question`, `Instructions`, `Criteria`, `Answer`, `Transport`, `Response`, `OracleJudge`, the token-budget constants (`CONTEXT_BUDGET`, `BATCH_BUDGET`, `STATE_OVERHEAD`, `QUESTION_OVERHEAD` and the prompt notes) | only a custom `Judge` can score; `search`, retrieval and expansion still work. The accounting types (`BatchDetail`, `RoundUsage`, `UsageBatch`, `Usage`) stay: `Judge::score` and `SearchResult` return them |
+| `async` | off | `AsyncIndex`, `AsyncError`, `async_index::search`; pulls in tokio (`rt`, `sync`) and futures-core | no tokio, no futures-core, no async code is compiled |
+
+```sh
+cargo build -p sag2                        # BM25 + full SAG2
+cargo build -p sag2 --no-default-features  # BM25 only
+cargo build -p sag2 --features async       # + async wrappers
+```
+
+### SQLite integration modes
+
+`sag2-index` is the only crate that depends on `rusqlite`; the facade never
+exposes a `rusqlite` type. There are three integration modes:
+
+1. **No SQLite at all** — depend on `sag2-core` for the tokenizer, chunker and
+   UCA collation, as a host with its own storage does (`chunking.py:1`).
+2. **Bundled SQLite (default)** — `sag2`/`sag2-index` link `rusqlite`'s bundled
+   amalgamation, SQLite 3.50.2. This is the only configuration the gates
+   certify, and there is deliberately no "use the system SQLite" feature.
+3. **A host that already links SQLite** — for example via `sqlx` or `diesel`.
+   `libsqlite3-sys` declares `links = "sqlite3"`, so cargo refuses any dependency
+   graph with two versions of it (`multiple packages link to native library
+   'sqlite3'`). The host must unify on the `libsqlite3-sys` 0.35.x line that
+   `rusqlite` 0.37 uses; no crate here declares `links = "sqlite3"`, and adding
+   a second SQLite wrapper is unsupported.
+
+## Workspace crates
 
 | crate | purpose |
 |---|---|
@@ -14,14 +116,19 @@ Design authority: `../SAG2-Rust-移植设计.md` (§1.0 comparison functions,
 | `sag2-rank-sys` | vendored `sag_rank.c` (FTS5 `sag_stats`/`sag_bm25`) built with `-DSQLITE_CORE -DSAG_STATIC` into a static archive, plus a safe `register` wrapper |
 | `sag2-linktest` | independent downstream package proving the static archive links against `rusqlite`'s bundled SQLite 3.50.2 |
 | `sag2-index` | index access and construction: `metadata.signature`, the §3.4 open decision table, the Python schema/statistics/provenance build, cached statistics and `retrieve` with the reference pruning, LRU and epoch semantics |
-| `sag2` | orchestration: `rank_dpp` (§9 R5 compensated sums), the judge payload builder and `search_sag2` (§1.3, §8) |
-| `sag2-cli` | `verify --gate A|B|C|D`: replay of the golden retrieve/search cases and the tokenizer/chunk/index gates |
+| `sag2` | library facade: `rank_dpp` (§9 R5 compensated sums), the judge payload builder, `search_sag2` (§1.3, §8) and the optional async wrappers |
+| `sag2-cli` | `verify --gate A\|B\|C\|D`: replay of the golden retrieve/search cases and the tokenizer/chunk/index gates |
 
 ```sh
 cargo build --workspace
 cargo test --workspace
 cargo run -p sag2-linktest
 ```
+
+CI (`.github/workflows/ci.yml`) runs `fmt --check`, `clippy -D warnings`, the
+test suite on Linux/macOS/Windows, the `--no-default-features` build of every
+crate, and all four gates against the committed `golden/` fixtures.
+
 
 ## Gate A (design §1.1)
 
@@ -133,3 +240,9 @@ Gate A run against rebuilds is self-describing.
 
 The codec fixtures under `crates/sag2-json/tests/fixtures/` are generated from
 CPython 3.12 with `python3.12 crates/sag2-json/tests/fixtures/generate.py`.
+
+## Licence
+
+MIT — see [`LICENSE`](LICENSE). The port tracks the MIT-licensed
+`SAG-Benchmark` reference (`sag2/pyproject.toml`: `license = { text = "MIT" }`);
+every crate in this workspace declares `license = "MIT"`.

@@ -28,6 +28,7 @@
 //! covers every integer the retrieval path can produce (ids, counts, ranks).
 
 #![forbid(unsafe_code)]
+#![deny(missing_docs)]
 
 mod float;
 
@@ -47,14 +48,19 @@ pub fn compact_json(value: &Value) -> String {
 /// A JSON value that preserves object key insertion order.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Value {
+    /// `None` / `null`.
     Null,
+    /// `True` / `False`.
     Bool(bool),
     /// A Python `int` within `i64` range.
     Int(i64),
     /// A Python `float`, encoded through [`py_repr`].
     Float(f64),
+    /// A string, escaped like Python's `json.dumps`.
     Str(String),
+    /// A list.
     Array(Vec<Value>),
+    /// An insertion-ordered dict.
     Object(Object),
 }
 
@@ -152,6 +158,7 @@ pub struct Object {
 }
 
 impl Object {
+    /// An empty object.
     pub fn new() -> Self {
         Self::default()
     }
@@ -168,6 +175,7 @@ impl Object {
         None
     }
 
+    /// The value stored under `key`.
     pub fn get(&self, key: &str) -> Option<&Value> {
         self.entries
             .iter()
@@ -175,16 +183,21 @@ impl Object {
             .map(|(_, value)| value)
     }
 
+    /// The number of entries.
     pub fn len(&self) -> usize {
         self.entries.len()
     }
 
+    /// Whether the object has no entries.
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
 
+    /// Iterate `(key, value)` in insertion order.
     pub fn iter(&self) -> impl Iterator<Item = (&str, &Value)> {
-        self.entries.iter().map(|(key, value)| (key.as_str(), value))
+        self.entries
+            .iter()
+            .map(|(key, value)| (key.as_str(), value))
     }
 }
 

@@ -31,8 +31,11 @@ const CLOSERS: [char; 8] = ['"', '\'', '”', '’', '）', ')', ']', '}'];
 /// One `chunk_document` result (`chunking.py:153-178`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Chunk {
+    /// The heading the chunk sits under (`""` when the document has none).
     pub heading: String,
+    /// Code-point spans into the source text.
     pub spans: Vec<(usize, usize)>,
+    /// `source_content(source, spans)`.
     pub content: String,
 }
 

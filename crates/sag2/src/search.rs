@@ -18,18 +18,24 @@
 use std::collections::BTreeSet;
 use std::time::Instant;
 
-use sag2_index::{CorpusIndex, ExpansionQuery, ExpansionTerm, QueryError, Seed};
-
 use crate::judge::{BatchDetail, Judge, JudgeError, RoundUsage};
-use crate::{rank_dpp, DppError, Usage, UsageBatch};
+use crate::{
+    rank_dpp, CorpusIndex, DppError, ExpansionError, ExpansionQuery, ExpansionTerm, Hit,
+    QueryError, Seed, Usage, UsageBatch,
+};
 
 /// One candidate: the retrieved chunk plus what the search loop adds.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Candidate {
-    pub hit: sag2_index::Hit,
+    /// The retrieved chunk and its BM25 score.
+    pub hit: Hit,
+    /// The expansion round that produced or last re-scored it (0..=2).
     pub hop: u32,
+    /// `1 / (61 + i)` over the retrieval order.
     pub fusion_score: f64,
+    /// The judge's `noul` score; `0.0` until a round scores the candidate.
     pub jev_score: f64,
+    /// The model that returned `jev_score`, when a judge set one.
     pub jev_model: Option<String>,
     /// Set only on hop 2's evidence (`sag2.py:1011`).
     pub previous_jev_score: Option<f64>,
@@ -38,9 +44,16 @@ pub struct Candidate {
 /// `sag2.py:935-940`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchOptions {
+    /// Retrieved candidates per round and in the final result
+    /// ([`crate::DEFAULT_CANDIDATE_K`]).
     pub candidate_k: usize,
+    /// Frontier seeds carried into the next hop ([`crate::DEFAULT_SEED_K`]).
     pub seed_k: usize,
+    /// Expansion rounds; `0..=2`, anything else is [`SearchError::Hops`]
+    /// ([`crate::DEFAULT_MAX_HOPS`]).
     pub max_hops: u8,
+    /// Expansion terms requested per hop
+    /// ([`crate::DEFAULT_EXPANSION_TERM_LIMIT`]).
     pub expansion_term_limit: usize,
     /// `context` (`sag2.py:939`): `Some` turns on the history branches of the
     /// judge state.
@@ -62,13 +75,14 @@ impl Default for SearchOptions {
 /// The multi-turn search context (`sag2.py:831-846`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SearchContext {
+    /// The question all earlier turns answered.
     pub original_question: String,
     /// `context["evidence"]`, merged with the current round's evidence.
     pub evidence: Vec<Candidate>,
-    /// `context["search_history"]`, carried verbatim.
-    pub search_history: Vec<sag2_json::Value>,
-    /// `context["previous_decisions"]`, carried verbatim.
-    pub previous_decisions: sag2_json::Value,
+    /// `context["search_history"]`, carried verbatim into the judge state.
+    pub search_history: Vec<crate::Value>,
+    /// `context["previous_decisions"]`, carried verbatim into the judge state.
+    pub previous_decisions: crate::Value,
 }
 
 /// One `bm25`/`expansion` trace record (`sag2.py:969-980`).
@@ -76,22 +90,34 @@ pub struct SearchContext {
 pub struct RetrievalTrace {
     /// `"bm25"` for hop 0, `"expansion"` afterwards.
     pub stage: &'static str,
+    /// The expansion round this record belongs to.
     pub hop: u32,
+    /// Number of candidates retrieved.
     pub count: usize,
+    /// `document_id` of every candidate, in retrieval order.
     pub candidate_document_ids: Vec<i64>,
+    /// Chunk id of every candidate, in retrieval order.
     pub candidate_ids: Vec<i64>,
+    /// The expansion terms used (`[]` at hop 0).
     pub terms: Vec<String>,
+    /// The scored expansion terms, in the reference's order.
     pub term_scores: Vec<ExpansionTerm>,
+    /// One record per per-term query (`[]` at hop 0).
     pub expansion_queries: Vec<ExpansionQuery>,
 }
 
 /// One `jev` trace record (`sag2.py:1014-1031`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct JudgeTrace {
+    /// The round this record belongs to.
     pub hop: u32,
+    /// Number of candidates the judge scored.
     pub count: usize,
+    /// Candidates carried in from the previous frontier.
     pub carried_seed_count: usize,
+    /// Hop-0 candidates protected from pruning (the first five).
     pub protected_bm25_count: usize,
+    /// Evidence chunk ids passed with the round.
     pub evidence_ids: Vec<i64>,
     /// `ranked()` at the moment the round finished.
     pub scores: Vec<TraceScore>,
@@ -99,16 +125,21 @@ pub struct JudgeTrace {
     pub batches: Vec<BatchDetail>,
 }
 
+/// One `scores` entry of a [`JudgeTrace`].
 #[derive(Debug, Clone, PartialEq)]
 pub struct TraceScore {
+    /// The chunk id.
     pub id: i64,
+    /// The judge's `noul` score for it.
     pub score: f64,
 }
 
 /// A trace record, in emission order.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TraceEntry {
+    /// A `bm25` or `expansion` retrieval record.
     Retrieval(RetrievalTrace),
+    /// A `jev` scoring record.
     Judge(JudgeTrace),
 }
 
@@ -117,10 +148,15 @@ pub enum TraceEntry {
 pub struct SearchResult {
     /// Already DPP-reordered for the first ten.
     pub candidates: Vec<Candidate>,
+    /// Hop 0's BM25 order before any judge touched it (`baseline_ids`).
     pub baseline: Vec<Candidate>,
+    /// Every retrieval and judge record, in emission order.
     pub trace: Vec<TraceEntry>,
+    /// Aggregated judge accounting.
     pub usage: Usage,
+    /// Wall-clock duration; excluded from the gate comparison.
     pub elapsed_ms: u64,
+    /// Always `"SAG2"`.
     pub algorithm: &'static str,
 }
 
@@ -129,9 +165,13 @@ pub struct SearchResult {
 pub enum SearchError {
     /// `sag2.py:941-942`.
     Hops(u8),
+    /// `CorpusIndex::match_query` or a retrieval call failed.
     Query(QueryError),
-    Expansion(sag2_index::ExpansionError),
+    /// Whole-query expansion failed.
+    Expansion(ExpansionError),
+    /// The judge rejected the round.
     Judge(JudgeError),
+    /// The final DPP reordering failed.
     Dpp(DppError),
 }
 
@@ -139,7 +179,10 @@ impl std::fmt::Display for SearchError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             SearchError::Hops(hops) => {
-                write!(formatter, "SAG2 supports at most two expansion rounds (got {hops})")
+                write!(
+                    formatter,
+                    "SAG2 supports at most two expansion rounds (got {hops})"
+                )
             }
             SearchError::Query(error) => write!(formatter, "{error}"),
             SearchError::Expansion(error) => write!(formatter, "{error}"),
@@ -253,11 +296,7 @@ fn merged(first: &[Candidate], second: &[Candidate]) -> Vec<Candidate> {
 }
 
 /// The pool of a non-zero hop.
-fn merged_pool(
-    protected: &IdMap,
-    carried: &IdMap,
-    candidates: &[Candidate],
-) -> Vec<Candidate> {
+fn merged_pool(protected: &IdMap, carried: &IdMap, candidates: &[Candidate]) -> Vec<Candidate> {
     let mut map = IdMap::from_candidates(protected.values().cloned());
     map.extend(carried.values().cloned());
     map.extend(candidates.iter().cloned());
@@ -290,7 +329,10 @@ fn retrieval_trace(
             .iter()
             .map(|candidate| candidate.hit.document_id)
             .collect(),
-        candidate_ids: candidates.iter().map(|candidate| candidate.hit.id).collect(),
+        candidate_ids: candidates
+            .iter()
+            .map(|candidate| candidate.hit.id)
+            .collect(),
         terms: terms.iter().map(|term| term.term.clone()).collect(),
         term_scores: terms.to_vec(),
         expansion_queries: queries,
@@ -336,12 +378,8 @@ pub fn search(
             break;
         }
         let (hits, queries) = if hop > 0 {
-            let (hits, queries) = index.retrieve_expansion(
-                &expression,
-                &terms,
-                &seen,
-                options.candidate_k,
-            )?;
+            let (hits, queries) =
+                index.retrieve_expansion(&expression, &terms, &seen, options.candidate_k)?;
             (
                 hits.into_iter().map(|hit| hit.hit).collect::<Vec<_>>(),
                 queries,
@@ -385,7 +423,10 @@ pub fn search(
             candidates.clone()
         };
         let mut evidence = if hop > 0 {
-            merged(&carried.values().cloned().collect::<Vec<_>>(), &candidates[..options.seed_k.min(candidates.len())])
+            merged(
+                &carried.values().cloned().collect::<Vec<_>>(),
+                &candidates[..options.seed_k.min(candidates.len())],
+            )
         } else {
             Vec::new()
         };
@@ -410,10 +451,7 @@ pub fn search(
                     .then_with(|| left.hit.id.cmp(&right.hit.id))
             });
             let history = merged(&carried_candidates, &previous);
-            let keep = pool
-                .len()
-                .saturating_sub(incoming.len())
-                .min(history.len());
+            let keep = pool.len().saturating_sub(incoming.len()).min(history.len());
             let mut next = history[..keep].to_vec();
             next.extend(incoming);
             pool = next;
@@ -439,10 +477,7 @@ pub fn search(
             count: scored.len(),
             carried_seed_count: carried.len(),
             protected_bm25_count: protected.len(),
-            evidence_ids: evidence
-                .iter()
-                .map(|candidate| candidate.hit.id)
-                .collect(),
+            evidence_ids: evidence.iter().map(|candidate| candidate.hit.id).collect(),
             scores: ranked(&retained)
                 .iter()
                 .map(|candidate| TraceScore {

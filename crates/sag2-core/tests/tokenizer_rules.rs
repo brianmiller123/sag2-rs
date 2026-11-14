@@ -28,8 +28,21 @@ fn frozen_reference_tokenizer_lines() {
     assert_eq!(
         tokens("foo-bar-baz a_b foo.bar +test #tag C++ 3.14 1,000 -foo-"),
         [
-            "foo", "bar", "baz", "foo-bar-baz", "a_b", "foo", "bar", "foo.bar", "test", "tag",
-            "c++", "3.14", "1", "000", "foo"
+            "foo",
+            "bar",
+            "baz",
+            "foo-bar-baz",
+            "a_b",
+            "foo",
+            "bar",
+            "foo.bar",
+            "test",
+            "tag",
+            "c++",
+            "3.14",
+            "1",
+            "000",
+            "foo"
         ]
     );
 }
@@ -48,7 +61,14 @@ fn mixed_script_blocks_keep_one_hmm_buffer() {
     // `finalseg` (`%` left-end rule applies here too).
     assert_eq!(
         tokens("enterpriserag-bench共511 962"),
-        ["enterpriserag", "bench", "enterpriserag-bench", "共", "511", "962"]
+        [
+            "enterpriserag",
+            "bench",
+            "enterpriserag-bench",
+            "共",
+            "511",
+            "962"
+        ]
     );
 }
 
@@ -68,8 +88,18 @@ fn a_percent_ends_the_leftmost_ascii_run() {
     assert_eq!(
         tokens("See https://example.com/a%20b?q=1%2F2 for the mirrored copy."),
         [
-            "see", "https", "example", "com", "example.com", "a%", "20b", "q", "1%", "2f2",
-            "mirrored", "copy"
+            "see",
+            "https",
+            "example",
+            "com",
+            "example.com",
+            "a%",
+            "20b",
+            "q",
+            "1%",
+            "2f2",
+            "mirrored",
+            "copy"
         ]
     );
 }

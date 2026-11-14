@@ -21,13 +21,13 @@
 //! that sample equality rests on the platform libm rounding these operations
 //! identically to the reference build.
 
-use std::cmp::Ordering;
-use std::collections::{BTreeMap, BTreeSet};
 use sag2_core::{names, quote_term};
 use sag2_json::{compact_json, Value};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::retrieve::QueryError;
 use crate::pool::QUERY_WORKERS;
+use crate::retrieve::QueryError;
 use crate::CorpusIndex;
 
 /// `sag2.py:590,612` `" ".join(tokenize(...))`.
@@ -46,19 +46,25 @@ struct Sentence {
 /// `seed["content"]`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Seed {
+    /// The seed chunk's document id.
     pub document_id: i64,
+    /// The judge score the seed was ranked by.
     pub jev_score: f64,
+    /// The seed chunk's content.
     pub content: String,
 }
 
 /// `"name_phrase"` when the term came from a `NAMES` match (`sag2.py:649`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExpansionKind {
+    /// A term produced by a `NAMES` phrase match.
     NamePhrase,
+    /// A term produced by a seed sentence's word.
     Word,
 }
 
 impl ExpansionKind {
+    /// The wire name (`"name_phrase"` / `"word"`).
     pub fn as_str(self) -> &'static str {
         match self {
             ExpansionKind::NamePhrase => "name_phrase",
@@ -70,15 +76,25 @@ impl ExpansionKind {
 /// One entry of `expansion_terms`' ordered result.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExpansionTerm {
+    /// The expansion term.
     pub term: String,
+    /// The weighted score (`sag2.py:659`).
     pub score: f64,
+    /// The unweighted score before seed weighting.
     pub unweighted_score: f64,
+    /// The seed-derived weight.
     pub seed_weight: f64,
+    /// The seed's judge score.
     pub seed_jev_score: f64,
+    /// `self.frequency(term)`.
     pub term_frequency: i64,
+    /// The number of documents the term matches.
     pub document_frequency: i64,
+    /// The query-context multiplier for the term.
     pub query_context_score: f64,
+    /// The document the term was expanded from.
     pub seed_document_id: i64,
+    /// Whether the term came from a name phrase or a word.
     pub kind: ExpansionKind,
     /// The matched `NAMES` text verbatim, for `name_phrase` terms only.
     pub name: Option<String>,
@@ -87,20 +103,30 @@ pub struct ExpansionTerm {
 /// One `selected[]` entry of `retrieve_expansion`'s per-term record.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Selected {
+    /// The selected chunk's document id.
     pub document_id: i64,
+    /// Its rank in that term's BM25 retrieval.
     pub bm25_rank: usize,
+    /// Its BM25 score.
     pub bm25_score: f64,
 }
 
 /// One `queries[]` entry (`sag2.py:723-733`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExpansionQuery {
+    /// The expansion term this query was built for.
     pub term: String,
+    /// The term's rank in `expansion_terms`.
     pub term_rank: usize,
+    /// Whether the term came from a name phrase or a word.
     pub kind: ExpansionKind,
+    /// The FTS5 `MATCH` expression.
     pub match_expression: String,
+    /// The ranking expression the query ran with.
     pub ranking_expression: String,
+    /// How many rows the term retrieved.
     pub retrieved_count: usize,
+    /// The rows the reference selected, in order.
     pub selected: Vec<Selected>,
 }
 
@@ -112,18 +138,26 @@ pub struct ExpansionQuery {
 /// payload reads `title`/`heading`/`content`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExpansionHit {
+    /// The chunk id.
     pub id: i64,
+    /// The chunk's document id.
     pub document_id: i64,
+    /// The hit's score in the per-term retrieval.
     pub score: f64,
+    /// The expansion term that produced it.
     pub expansion_term: String,
+    /// The term's rank in `expansion_terms`.
     pub expansion_term_rank: usize,
+    /// The hit's rank in the term's BM25 retrieval.
     pub expansion_bm25_rank: usize,
+    /// The full retrieved chunk row.
     pub hit: crate::retrieve::Hit,
 }
 
 /// A failure of the expansion path.
 #[derive(Debug)]
 pub enum ExpansionError {
+    /// A retrieval call failed.
     Query(QueryError),
     /// `self.aliases[source.casefold()]` missed (`sag2.py:411` raises
     /// `KeyError`): the pattern matched text whose casefold is not a key.
@@ -476,8 +510,7 @@ impl CorpusIndex {
                     .expect("every counted word has a context score");
                 let top = (self.statistics.total - document_frequency) as f64 + 0.5;
                 let idf = (1.0 + top / (document_frequency as f64 + 0.5)).ln();
-                let unweighted =
-                    (1.0 + (*term_frequency as f64).ln()) * idf * (1.0 + context);
+                let unweighted = (1.0 + (*term_frequency as f64).ln()) * idf * (1.0 + context);
                 let score = unweighted * weight;
                 let record = ExpansionTerm {
                     term: term.clone(),
@@ -562,10 +595,7 @@ impl CorpusIndex {
                     }
                 }
                 if let Some(grounded) = matches.into_iter().min_by(|left, right| {
-                    right
-                        .len()
-                        .cmp(&left.len())
-                        .then_with(|| left.cmp(right))
+                    right.len().cmp(&left.len()).then_with(|| left.cmp(right))
                 }) {
                     let grounded = grounded.join(" ");
                     if self.has_match(&quote_term(&grounded), excluded)? {

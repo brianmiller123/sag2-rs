@@ -80,7 +80,9 @@ fn load_dict(path: &Path) -> (u64, BTreeMap<String, u32>) {
             .next()
             .unwrap_or_else(|| panic!("{}:{} has no frequency", path.display(), index + 1))
             .parse()
-            .unwrap_or_else(|_| panic!("{}:{} has an invalid frequency", path.display(), index + 1));
+            .unwrap_or_else(|_| {
+                panic!("{}:{} has an invalid frequency", path.display(), index + 1)
+            });
         total += u64::from(value);
         freq.insert(word.to_owned(), value);
     }
@@ -119,7 +121,11 @@ fn write_freq_tables(out_dir: &Path, total: u64, freq: &BTreeMap<String, u32>) {
 
     let mut source = String::new();
     writeln!(source, "pub const DICT_TOTAL: u64 = {total};").expect("write consts");
-    writeln!(source, "pub const FREQ_MAX_CHARS: usize = {FREQ_MAX_CHARS};").expect("write consts");
+    writeln!(
+        source,
+        "pub const FREQ_MAX_CHARS: usize = {FREQ_MAX_CHARS};"
+    )
+    .expect("write consts");
     writeln!(source, "pub const FREQ_ENTRIES: usize = {entries};").expect("write consts");
     writeln!(source, "pub const ANCHOR_EVERY: usize = {ANCHOR_EVERY};").expect("write consts");
     writeln!(source, "pub static ASCII_WORDS: &[(&str, u32)] = &[").expect("write consts");
@@ -164,8 +170,8 @@ fn crosses_ascii_cjk_boundary(word: &str) -> bool {
 }
 
 fn gunzip(path: &Path) -> Vec<u8> {
-    let compressed = fs::read(path)
-        .unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
+    let compressed =
+        fs::read(path).unwrap_or_else(|error| panic!("cannot read {}: {error}", path.display()));
     let mut data = Vec::new();
     flate2::read::GzDecoder::new(&compressed[..])
         .read_to_end(&mut data)
@@ -175,7 +181,10 @@ fn gunzip(path: &Path) -> Vec<u8> {
 
 fn table_body<'a>(data: &'a [u8], magic: &[u8], width: usize, path: &Path) -> &'a [u8] {
     if data.len() < 8 || &data[..8] != magic {
-        panic!("{} does not start with the documented magic tag", path.display());
+        panic!(
+            "{} does not start with the documented magic tag",
+            path.display()
+        );
     }
     let body = &data[8..];
     let expected = CODEPOINTS * width;
@@ -200,7 +209,8 @@ fn write_unicode_tables(golden: &Path, out_dir: &Path) {
             let base = cp * width;
             let length = body[base + 4] as usize;
             let identity = length == 1
-                && u32::from_le_bytes(body[base + 5..base + 9].try_into().expect("mapping")) as usize
+                && u32::from_le_bytes(body[base + 5..base + 9].try_into().expect("mapping"))
+                    as usize
                     == cp;
             if identity {
                 continue;
@@ -235,7 +245,12 @@ fn write_unicode_tables(golden: &Path, out_dir: &Path) {
     let path = golden.join("unicode_categories.bin.gz");
     let data = gunzip(&path);
     let body = table_body(&data, b"SAG2CATE", 5, &path);
-    let mut bitsets = [vec![0_u8; CODEPOINTS / 8], vec![0_u8; CODEPOINTS / 8], vec![0_u8; CODEPOINTS / 8], vec![0_u8; CODEPOINTS / 8]];
+    let mut bitsets = [
+        vec![0_u8; CODEPOINTS / 8],
+        vec![0_u8; CODEPOINTS / 8],
+        vec![0_u8; CODEPOINTS / 8],
+        vec![0_u8; CODEPOINTS / 8],
+    ];
     for cp in 0..CODEPOINTS {
         let mask = body[cp * 5 + 4];
         for (bit, bitset) in bitsets.iter_mut().enumerate() {
@@ -257,11 +272,13 @@ fn write_unicode_tables(golden: &Path, out_dir: &Path) {
         let path = golden.join(format!("{name}.bin.gz"));
         let data = gunzip(&path);
         if data.len() < 8 || &data[..8] != magic {
-            panic!("{} does not start with the documented magic tag", path.display());
+            panic!(
+                "{} does not start with the documented magic tag",
+                path.display()
+            );
         }
         let output = name.strip_prefix("unicode_").unwrap_or(name);
-        fs::write(out_dir.join(format!("{output}.bin")), &data[8..])
-            .expect("write sparse table");
+        fs::write(out_dir.join(format!("{output}.bin")), &data[8..]).expect("write sparse table");
     }
 }
 
@@ -301,10 +318,16 @@ fn write_ducet_tables(path: &Path, out_dir: &Path) {
         }
         if let Some(rest) = line.strip_prefix("@implicitweights") {
             let (range, base) = rest.split_once(';').unwrap_or_else(|| {
-                panic!("{}:{line_number}: malformed @implicitweights", path.display())
+                panic!(
+                    "{}:{line_number}: malformed @implicitweights",
+                    path.display()
+                )
             });
             let (start, end) = range.split_once("..").unwrap_or_else(|| {
-                panic!("{}:{line_number}: malformed @implicitweights range", path.display())
+                panic!(
+                    "{}:{line_number}: malformed @implicitweights range",
+                    path.display()
+                )
             });
             implicit.push((
                 ducet_codepoint(start, path, line_number),
@@ -319,9 +342,9 @@ fn write_ducet_tables(path: &Path, out_dir: &Path) {
                 path.display()
             );
         }
-        let (left, right) = line.split_once(';').unwrap_or_else(|| {
-            panic!("{}:{line_number}: DUCET line has no ';'", path.display())
-        });
+        let (left, right) = line
+            .split_once(';')
+            .unwrap_or_else(|| panic!("{}:{line_number}: DUCET line has no ';'", path.display()));
         let key: Vec<u32> = left
             .split_whitespace()
             .map(|field| ducet_codepoint(field, path, line_number))
@@ -413,9 +436,7 @@ fn parse_collation_elements(text: &str) -> Vec<[u16; 3]> {
             continue;
         }
         if let Some(fourth) = fields.get(3) {
-            if !(4..=5).contains(&fourth.len())
-                || !fourth.chars().all(|c| c.is_ascii_hexdigit())
-            {
+            if !(4..=5).contains(&fourth.len()) || !fourth.chars().all(|c| c.is_ascii_hexdigit()) {
                 continue;
             }
         }

@@ -22,8 +22,9 @@ static DICTIONARY: &[u8] = include_bytes!("../data/dict.txt");
 
 /// `\p{L}` or `\p{N}` - `sag2.py:61` `HAS_CONTENT`.
 fn has_content(word: &str) -> bool {
-    word.chars()
-        .any(|character| unicode::is_letter(character as u32) || unicode::is_number(character as u32))
+    word.chars().any(|character| {
+        unicode::is_letter(character as u32) || unicode::is_number(character as u32)
+    })
 }
 
 /// The 61 literal stopwords of `sag2.py:40-44`, sorted for `binary_search`.
@@ -170,7 +171,10 @@ fn emit_block(block: &str, inside: bool, out: &mut Vec<String>) {
     // `finalseg` over the whole buffer, so splitting at the script boundary
     // changes the HMM input ("最多20个" is one word + "20" + "个" only when the
     // digits stay in the buffer).
-    if block.chars().any(|character| matches!(class(character), Class::Cjk)) {
+    if block
+        .chars()
+        .any(|character| matches!(class(character), Class::Cjk))
+    {
         // Cut the block as one unit (the HMM buffer may span the script
         // boundary), then hand every contiguous ASCII stretch to the patched
         // `finalseg` model.  Python's finalseg splits a buffer at CJK runs and
@@ -179,7 +183,10 @@ fn emit_block(block: &str, inside: bool, out: &mut Vec<String>) {
         // depend on the CJK text after it, so re-cutting the stretch is exact.
         let mut ascii_run = String::new();
         for word in JIEBA.cut(block, true) {
-            if word.chars().all(|character| class(character) == Class::Ascii) {
+            if word
+                .chars()
+                .all(|character| class(character) == Class::Ascii)
+            {
                 ascii_run.push_str(word);
                 continue;
             }
@@ -202,10 +209,7 @@ fn emit_block(block: &str, inside: bool, out: &mut Vec<String>) {
 
 /// Rules 3-5 of design §4.1 for one cut word.
 fn post_process(word: &str, out: &mut Vec<String>) {
-    if word
-        .bytes()
-        .any(|byte| matches!(byte, b'.' | b'_' | b'-'))
-    {
+    if word.bytes().any(|byte| matches!(byte, b'.' | b'_' | b'-')) {
         for part in word.split(['.', '_', '-']) {
             if part.chars().count() >= 2 && part.bytes().any(|byte| byte.is_ascii_lowercase()) {
                 out.push(part.to_owned());

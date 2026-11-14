@@ -35,8 +35,12 @@ fn fixture_path(fixture: &str) -> PathBuf {
 
 #[test]
 fn opens_a_python_built_index_and_loads_its_statistics() {
-    let index = open_readonly(&fixture_path("C0"), &signature_of("C0"), QueryOptions::default())
-        .expect("C0 opens");
+    let index = open_readonly(
+        &fixture_path("C0"),
+        &signature_of("C0"),
+        QueryOptions::default(),
+    )
+    .expect("C0 opens");
     assert_eq!(
         index.signature(),
         "[\"fixture\",2200,5,null,\"desktop-sentences-v1\",\"plain-text-default\"]"
@@ -107,8 +111,12 @@ fn workers_one_and_eight_produce_identical_hits() {
     let mut compared = 0;
     for expression in &expressions {
         for limit in [1, 7, 100] {
-            let left = single.retrieve(expression, &excluded, limit, None).expect("single");
-            let right = many.retrieve(expression, &excluded, limit, None).expect("many");
+            let left = single
+                .retrieve(expression, &excluded, limit, None)
+                .expect("single");
+            let right = many
+                .retrieve(expression, &excluded, limit, None)
+                .expect("many");
             let shape = |hits: &[sag2_index::Hit]| {
                 hits.iter()
                     .map(|hit| (hit.id, hit.document_id, hit.score.to_bits()))

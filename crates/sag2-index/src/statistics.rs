@@ -29,7 +29,7 @@ pub enum StatisticsError {
     /// `index_statistics.data` is not valid JSON.
     Json(serde_json::Error),
     /// The SQLite read failed.
-    Sqlite(rusqlite::Error),
+    Sqlite(crate::SqliteError),
     /// The data object is missing a key of the seven-key contract.
     MissingKey(&'static str),
     /// The data object has a key outside the seven-key contract (design §3.2.7).
@@ -57,7 +57,10 @@ impl std::fmt::Display for StatisticsError {
                 write!(formatter, "index_statistics.data has unexpected key {key}")
             }
             StatisticsError::WrongType(key) => {
-                write!(formatter, "index_statistics.data key {key} has the wrong type")
+                write!(
+                    formatter,
+                    "index_statistics.data key {key} has the wrong type"
+                )
             }
             StatisticsError::NonFiniteIdf(term) => {
                 write!(formatter, "diversity_idf[{term}] is not a finite number")
@@ -97,7 +100,7 @@ pub fn load(db: &Connection, signature: &str) -> Result<Statistics, StatisticsEr
             |row| row.get(0),
         )
         .optional()
-        .map_err(StatisticsError::Sqlite)?;
+        .map_err(|error| StatisticsError::Sqlite(error.into()))?;
     let data = data.ok_or(StatisticsError::MissingRow)?;
     parse(&data)
 }
@@ -198,7 +201,9 @@ mod tests {
         let statistics = parse(SAMPLE).expect("sample parses");
         assert_eq!(statistics.total, 1);
         assert_eq!(statistics.document_count, 1);
-        assert!(statistics.title_phrases.contains(&vec!["alice".to_owned(), "paul".to_owned()]));
+        assert!(statistics
+            .title_phrases
+            .contains(&vec!["alice".to_owned(), "paul".to_owned()]));
         assert_eq!(statistics.diversity_idf.get("a"), Some(&1.5));
         assert!(!statistics.source_statistics_complete);
     }
@@ -212,6 +217,9 @@ mod tests {
     #[test]
     fn rejects_a_missing_key() {
         let text = SAMPLE.replace("\"total\":1,", "");
-        assert!(matches!(parse(&text), Err(StatisticsError::MissingKey("total"))));
+        assert!(matches!(
+            parse(&text),
+            Err(StatisticsError::MissingKey("total"))
+        ));
     }
 }

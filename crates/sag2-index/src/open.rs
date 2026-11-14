@@ -110,12 +110,15 @@ pub enum RebuildPolicy {
 /// Options for [`open`].
 #[derive(Debug, Clone)]
 pub struct IndexOptions {
+    /// Chunk target in characters ([`sag2_core::DEFAULT_CHUNK_CHARS`]).
     pub chunk_chars: usize,
     /// `index_workers` (`sag2.py:196`): documents are chunked and tokenised in
     /// this many threads.  The inserted rows are byte-identical for every
     /// value (design §2.5), so this is a throughput knob, not a format one.
     pub index_workers: usize,
+    /// Build the contentless `source_dir` layout against this directory.
     pub source_dir: Option<PathBuf>,
+    /// How hard the open may try to make the index match the corpus.
     pub rebuild: RebuildPolicy,
 }
 
@@ -133,23 +136,34 @@ impl Default for IndexOptions {
 /// What the open did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenAction {
+    /// The existing index was used as-is.
     Reused,
+    /// No index was present and the corpus was built.
     Built,
+    /// The index was rebuilt from the corpus.
     Rebuilt,
 }
 
 /// Why a rebuild happened; always surfaced, never silent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RebuildReason {
+    /// No index file was present.
     MissingIndex,
-    SignatureChanged { field: &'static str },
+    /// The corpus signature changed.
+    SignatureChanged {
+        /// The signature component that differs (`changed_field`'s name).
+        field: &'static str,
+    },
+    /// The file has index tables but no usable provenance row.
     CompiledIn,
 }
 
 /// The observable outcome of [`open`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct OpenOutcome {
+    /// What happened to the file.
     pub action: OpenAction,
+    /// Why it was rebuilt, when it was.
     pub rebuilt: Option<RebuildReason>,
 }
 
@@ -170,19 +184,35 @@ pub enum OpenError {
     /// The database has no `metadata` row, so its provenance is unknown.
     MissingSignature,
     /// The stored signature is not the one this corpus produces.
-    SignatureMismatch { expected: String, found: String },
+    SignatureMismatch {
+        /// The signature the corpus produces.
+        expected: String,
+        /// The signature stored in the file.
+        found: String,
+    },
     /// `metadata.signature` is for another corpus.
-    IndexSignatureMismatch { field: &'static str },
+    IndexSignatureMismatch {
+        /// The signature component that differs.
+        field: &'static str,
+    },
     /// `chunks`/`chunk_fts` exist without a `metadata` row (design §3.4, divergence D1).
     ForeignDatabase,
     /// `format_version` is not [`FORMAT_VERSION`]; never rebuilt.
-    UnsupportedIndexVersion { found: i64, supported: i64 },
+    UnsupportedIndexVersion {
+        /// The version found in the file.
+        found: i64,
+        /// The version this build reads and writes.
+        supported: i64,
+    },
     /// `rust_index_metadata` exists without the key.
     MissingVersionKey(&'static str),
     /// A version key does not match the running build; never rebuilt.
     IncompatibleIndex {
+        /// The provenance key that differs.
         field: &'static str,
+        /// The value stored in the index.
         index: String,
+        /// The value this build certifies.
         runtime: String,
     },
     /// The `chunks` schema is the `source_dir` variant, which P0 does not read.
@@ -196,7 +226,7 @@ pub enum OpenError {
     /// The cached statistics are unusable.
     Statistics(StatisticsError),
     /// SQLite itself failed.
-    Sqlite(rusqlite::Error),
+    Sqlite(crate::SqliteError),
 }
 
 impl std::fmt::Display for OpenError {
@@ -265,7 +295,7 @@ impl std::error::Error for OpenError {}
 
 impl From<rusqlite::Error> for OpenError {
     fn from(error: rusqlite::Error) -> Self {
-        OpenError::Sqlite(error)
+        OpenError::Sqlite(error.into())
     }
 }
 
@@ -284,11 +314,13 @@ impl From<BuildError> for OpenError {
 /// What is already on disk, as far as the decision table cares.
 #[derive(Debug, Clone, Default)]
 pub struct ExistingIndex {
+    /// Whether the path exists at all.
     pub file_exists: bool,
     /// Any of `chunks`, `chunk_fts`, `source_files` exists.
     pub has_index_tables: bool,
     /// The `metadata` table exists and holds a row.
     pub has_metadata_row: bool,
+    /// `metadata.signature`, when there is a row.
     pub signature: Option<String>,
     /// Present when the index was written by this port.
     pub rust_metadata: Option<BTreeMap<String, String>>,
@@ -297,9 +329,13 @@ pub struct ExistingIndex {
 /// The outcome of the decision table (design §3.4).
 #[derive(Debug)]
 pub enum Decision {
+    /// No usable index: build one.
     Build,
+    /// Reuse the existing index.
     Reuse,
+    /// Rebuild the existing index for the given reason.
     Rebuild(RebuildReason),
+    /// Refuse to touch the index.
     Reject(OpenError),
 }
 

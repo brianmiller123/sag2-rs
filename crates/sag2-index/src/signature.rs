@@ -139,8 +139,14 @@ mod tests {
     #[test]
     fn names_the_first_differing_field() {
         let left = signature("a", 2200, None);
-        assert_eq!(changed_field(&left, &signature("b", 2200, None)), "fingerprint");
-        assert_eq!(changed_field(&left, &signature("a", 10000, None)), "chunk_chars");
+        assert_eq!(
+            changed_field(&left, &signature("b", 2200, None)),
+            "fingerprint"
+        );
+        assert_eq!(
+            changed_field(&left, &signature("a", 10000, None)),
+            "chunk_chars"
+        );
         assert_eq!(
             changed_field(
                 &left,

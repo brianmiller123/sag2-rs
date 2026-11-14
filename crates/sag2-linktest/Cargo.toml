@@ -4,6 +4,7 @@ description = "Downstream link proof for the sag_rank static archive"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 publish = false
 
 [dependencies]

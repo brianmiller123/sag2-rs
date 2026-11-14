@@ -1,3 +1,5 @@
+#![cfg(feature = "tiktoken")]
+
 //! Search-level behaviour the goldens cannot reach: `max_hops = 0` still calls
 //! the judge (design §8.4), and the multi-turn context branches of the payload
 //! builder (`sag2.py:831-846`), which no fixture exercises.
@@ -120,7 +122,10 @@ fn max_hops_zero_still_scores_one_round() {
         .iter()
         .all(|candidate| candidate.jev_model.as_deref() == Some("oracle-jev")));
     assert_eq!(result.usage.requests, 1);
-    assert_eq!(result.usage.judgments, result.usage.batches[0].detail.candidate_count);
+    assert_eq!(
+        result.usage.judgments,
+        result.usage.batches[0].detail.candidate_count
+    );
 }
 
 #[test]
@@ -237,5 +242,8 @@ fn context_state_uses_the_history_branches_in_reference_order() {
     assert_eq!(rows[0]["passage_id"], 1);
     assert_eq!(rows[1]["passage_id"], 2);
     // The `previous_jev_score` branch writes the note only for `evidence`.
-    assert!(state["evidence_score_note"].as_str().expect("note").contains("tentative judgments"));
+    assert!(state["evidence_score_note"]
+        .as_str()
+        .expect("note")
+        .contains("tentative judgments"));
 }

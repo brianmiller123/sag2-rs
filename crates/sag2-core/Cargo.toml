@@ -4,6 +4,7 @@ description = "SAG2 text core: the §4 tokenizer and the Unicode tables it needs
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 
 [dependencies]
 # `default-features = false` drops the crate's bundled dictionary; the

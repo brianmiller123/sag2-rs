@@ -68,7 +68,10 @@ fn ulp(value: f64) -> f64 {
 }
 
 /// One candidate's normalised term vector, in first-occurrence order.
-fn vector(candidate: &Candidate, idf: &std::collections::BTreeMap<String, f64>) -> Result<Vec<(String, f64)>, DppError> {
+fn vector(
+    candidate: &Candidate,
+    idf: &std::collections::BTreeMap<String, f64>,
+) -> Result<Vec<(String, f64)>, DppError> {
     let mut counts: Vec<(String, i64)> = Vec::new();
     for term in diversity_tokens(&candidate.hit.content) {
         match counts.iter_mut().find(|(existing, _)| *existing == term) {
@@ -78,7 +81,10 @@ fn vector(candidate: &Candidate, idf: &std::collections::BTreeMap<String, f64>) 
     }
     let mut weighted = Vec::with_capacity(counts.len());
     for (term, count) in counts {
-        let weight = idf.get(&term).copied().ok_or(DppError::MissingIdf(term.clone()))?;
+        let weight = idf
+            .get(&term)
+            .copied()
+            .ok_or(DppError::MissingIdf(term.clone()))?;
         weighted.push((term, (1.0 + (count as f64).ln()) * weight));
     }
     if weighted.is_empty() {
@@ -105,7 +111,10 @@ pub fn rank_dpp(
     for candidate in candidates.iter() {
         vectors.push(vector(candidate, idf)?);
     }
-    let scores: Vec<f64> = candidates.iter().map(|candidate| candidate.jev_score).collect();
+    let scores: Vec<f64> = candidates
+        .iter()
+        .map(|candidate| candidate.jev_score)
+        .collect();
     if scores.is_empty() {
         return Ok(());
     }
@@ -279,7 +288,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn reorders_the_c0_head_like_the_reference() {
         // C0/Anchor's final three candidates, with the index's `diversity_idf`
@@ -349,7 +357,10 @@ mod tests {
             ("w1 w5 w2 w4", 0.99),
             ("w5 w3 w0 w0 w4", 0.5),
         ];
-        for (case, expected) in [(case_one, [4, 6, 3, 2, 7, 5, 8, 1]), (case_two, [7, 5, 4, 2, 1, 3, 6, 8])] {
+        for (case, expected) in [
+            (case_one, [4, 6, 3, 2, 7, 5, 8, 1]),
+            (case_two, [7, 5, 4, 2, 1, 3, 6, 8]),
+        ] {
             let mut candidates: Vec<Candidate> = case
                 .iter()
                 .enumerate()

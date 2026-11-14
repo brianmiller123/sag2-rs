@@ -2653,10 +2653,9 @@ fn gate_b_expansion(
         let cached = options.cache.join(&fixture.index);
         fs::write(&cached, &bytes)
             .map_err(|error| format!("cannot write {}: {error}", cached.display()))?;
-        let index = open_readonly(&cached, &fixture.signature, QueryOptions::default())
-            .map_err(|error| {
-                format!("cannot open expansion fixture {}: {error}", fixture.fixture)
-            })?;
+        let index = open_readonly(&cached, &fixture.signature, QueryOptions::default()).map_err(
+            |error| format!("cannot open expansion fixture {}: {error}", fixture.fixture),
+        )?;
         if index.statistics().total as usize != fixture.chunks {
             return Err(format!(
                 "fixture {} holds {} chunks, manifest says {}",
@@ -2698,7 +2697,10 @@ fn gate_b_expansion(
         *stages.entry(line.stage.clone()).or_insert(0) += 1;
     }
 
-    let passed_cases = per_fixture.values().map(|(_, passed)| passed).sum::<usize>();
+    let passed_cases = per_fixture
+        .values()
+        .map(|(_, passed)| passed)
+        .sum::<usize>();
     println!(
         "{:<12} {:>7} {:>7} {:>7}",
         "fixture", "cases", "passed", "failed"
@@ -2775,7 +2777,13 @@ fn check_expansion_record(
         .expansion_terms(query, &seeds, term_limit)
         .map_err(|error| format!("{}: expansion_terms: {error}", line.case_id))?;
     compare_terms(failures, &line.case_id, "terms", &line.terms, &terms);
-    compare_term_scores(failures, ulp_flips, &line.case_id, &line.term_scores, &terms);
+    compare_term_scores(
+        failures,
+        ulp_flips,
+        &line.case_id,
+        &line.term_scores,
+        &terms,
+    );
     let excluded: BTreeSet<i64> = line.excluded.iter().copied().collect();
     let (hits, queries) = index
         .retrieve_expansion(expression, &terms, &excluded, limit)
@@ -2987,7 +2995,11 @@ fn compare_term_scores(
                 &expected.unweighted_score_bits,
                 actual.unweighted_score,
             ),
-            ("seed_weight", &expected.seed_weight_bits, actual.seed_weight),
+            (
+                "seed_weight",
+                &expected.seed_weight_bits,
+                actual.seed_weight,
+            ),
             (
                 "seed_jev_score",
                 &expected.seed_jev_score_bits,
@@ -3248,7 +3260,11 @@ fn gate_d_freq(
     manifest: &Manifest,
     failures: &mut Vec<Failure>,
 ) -> Result<serde_json::Value, String> {
-    verify_manifest_files(options, manifest, &["freq_keys.txt.gz", "freq_probes.jsonl"])?;
+    verify_manifest_files(
+        options,
+        manifest,
+        &["freq_keys.txt.gz", "freq_probes.jsonl"],
+    )?;
     let spec = manifest
         .freq
         .as_ref()
@@ -3443,10 +3459,7 @@ fn run_gate_d(options: &Options) -> Result<ExitCode, String> {
         .clone()
         .unwrap_or_else(|| vec!["tokenizer".to_owned()]);
     for fixture in &fixtures {
-        if !matches!(
-            fixture.as_str(),
-            "tokenizer" | "chunks" | "index" | "freq"
-        ) {
+        if !matches!(fixture.as_str(), "tokenizer" | "chunks" | "index" | "freq") {
             return Err(format!(
                 "gate D fixture {fixture} is not implemented; use tokenizer, chunks, index or freq"
             ));
@@ -4285,8 +4298,8 @@ struct SearchCase {
 
 fn read_search_cases(options: &Options, spec: &SearchSpec) -> Result<Vec<SearchCase>, String> {
     let path = options.golden.join(&spec.golden);
-    let compressed = fs::read(&path)
-        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let compressed =
+        fs::read(&path).map_err(|error| format!("cannot read {}: {error}", path.display()))?;
     let data = gunzip(&path, &compressed)?;
     let text = String::from_utf8(data)
         .map_err(|error| format!("{} is not UTF-8: {error}", path.display()))?;
@@ -4341,7 +4354,10 @@ fn read_search_cases(options: &Options, spec: &SearchSpec) -> Result<Vec<SearchC
     Ok(cases)
 }
 
-fn read_search_corpora(options: &Options, spec: &SearchSpec) -> Result<BTreeMap<String, SearchCorpus>, String> {
+fn read_search_corpora(
+    options: &Options,
+    spec: &SearchSpec,
+) -> Result<BTreeMap<String, SearchCorpus>, String> {
     let path = options.golden.join(&spec.corpus_golden);
     let text = fs::read_to_string(&path)
         .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
@@ -4420,7 +4436,10 @@ fn trace_entry_value(entry: &sag2::TraceEntry) -> serde_json::Value {
 fn term_score_value(term: &sag2::ExpansionTerm) -> serde_json::Value {
     let mut object = serde_json::Map::new();
     object.insert("term".to_owned(), serde_json::json!(term.term));
-    object.insert("score_bits".to_owned(), serde_json::json!(hex_bits(term.score)));
+    object.insert(
+        "score_bits".to_owned(),
+        serde_json::json!(hex_bits(term.score)),
+    );
     object.insert(
         "unweighted_score_bits".to_owned(),
         serde_json::json!(hex_bits(term.unweighted_score)),
@@ -4512,8 +4531,7 @@ fn search_usage_value(usage: &sag2::Usage) -> serde_json::Value {
 }
 
 fn json_from_sag2(value: &sag2_json::Value) -> serde_json::Value {
-    serde_json::from_str(&sag2_json::compact_json(value))
-        .expect("sag2-json output is valid JSON")
+    serde_json::from_str(&sag2_json::compact_json(value)).expect("sag2-json output is valid JSON")
 }
 
 /// The inverse of [`json_from_sag2`], for the `context` fields the judge
@@ -4675,8 +4693,9 @@ fn compare_payloads(
         } else {
             diffs += 1;
             let offset = first_byte_difference(expected, actual).unwrap_or(0);
-            let pointer = first_json_pointer(&case.payloads[index], &String::from_utf8_lossy(actual))
-                .unwrap_or_else(|| "?".to_owned());
+            let pointer =
+                first_json_pointer(&case.payloads[index], &String::from_utf8_lossy(actual))
+                    .unwrap_or_else(|| "?".to_owned());
             push_gate_failure(
                 failures,
                 &case.case_id,
@@ -4901,8 +4920,7 @@ fn run_gate_c(options: &Options) -> Result<ExitCode, String> {
             }
         };
         let recorded = judge.transport().payloads();
-        let (compared, equal, digests, c1_diffs) =
-            compare_payloads(case, &recorded, &mut failures);
+        let (compared, equal, digests, c1_diffs) = compare_payloads(case, &recorded, &mut failures);
         payloads_compared += compared;
         payloads_equal += equal;
         digests_equal += digests;

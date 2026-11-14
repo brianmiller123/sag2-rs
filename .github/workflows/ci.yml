@@ -1,0 +1,87 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: default features
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: async feature
+        run: cargo clippy -p sag2 --features async --all-targets --locked -- -D warnings
+      - name: no default features
+        run: cargo clippy -p sag2 --no-default-features --all-targets --locked -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked
+      - name: async feature (linux)
+        if: runner.os == 'Linux'
+        run: cargo test -p sag2 --features async --locked
+
+  features:
+    name: feature matrix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: each crate without default features
+        run: |
+          for crate in sag2-json sag2-core sag2-rank-sys sag2-index sag2 sag2-cli sag2-linktest; do
+            cargo build --locked -p "$crate" --no-default-features
+          done
+      - name: sag2 feature combinations
+        run: |
+          cargo build --locked -p sag2
+          cargo build --locked -p sag2 --features async
+          cargo build --locked -p sag2 --no-default-features
+          cargo build --locked -p sag2 --no-default-features --features async
+
+  gates:
+    name: gates A-D (offline)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Gate A
+        run: cargo run --locked -p sag2-cli -- verify --gate A --golden golden/
+      - name: Gate B
+        run: cargo run --locked -p sag2-cli -- verify --gate B --fixtures sortkeys,expansion --golden golden/
+      - name: Gate C
+        run: cargo run --locked -p sag2-cli -- verify --gate C --fixtures search --golden golden/
+      - name: Gate D
+        run: cargo run --locked -p sag2-cli -- verify --gate D --fixtures tokenizer,chunks,index --golden golden/

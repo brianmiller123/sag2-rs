@@ -4,6 +4,7 @@ description = "Command line entry points for the SAG2 port; P0 provides gate ver
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+license.workspace = true
 
 [[bin]]
 name = "sag2-cli"

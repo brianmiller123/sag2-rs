@@ -18,6 +18,7 @@ pub fn quote_term(term: &str) -> String {
     quoted
 }
 
+/// `match_query`: the de-duplicated `OR` of quoted tokens (`sag2.py:69-89`).
 pub fn match_query(query: &str) -> String {
     let mut seen = HashSet::new();
     let mut terms = Vec::new();
@@ -49,6 +50,9 @@ mod tests {
         // `tokenize` lowercases and drops stopwords, so "the" disappears and
         // the repeated word keeps one occurrence.
         assert_eq!(match_query("Anchor anchor"), "\"anchor\"");
-        assert_eq!(match_query("Where was Alston born?"), "\"alston\" OR \"born\"");
+        assert_eq!(
+            match_query("Where was Alston born?"),
+            "\"alston\" OR \"born\""
+        );
     }
 }

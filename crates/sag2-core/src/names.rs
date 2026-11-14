@@ -246,7 +246,10 @@ mod tests {
         assert!(matched("Alice").is_empty());
         assert!(matched("2Alice Paul").is_empty());
         assert_eq!(matched("(Alice Paul)"), vec!["Alice Paul"]);
-        assert_eq!(matched("Alice Paul, Bob Smith"), vec!["Alice Paul", "Bob Smith"]);
+        assert_eq!(
+            matched("Alice Paul, Bob Smith"),
+            vec!["Alice Paul", "Bob Smith"]
+        );
     }
 
     #[test]
@@ -266,4 +269,3 @@ mod tests {
         assert_eq!(sentences(""), vec![""]);
     }
 }
-
