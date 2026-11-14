@@ -1,0 +1,9 @@
+[package]
+name = "sag2-rank-sys"
+description = "Vendored sag_rank.c FTS5 scoring functions, statically linked"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[build-dependencies]
+cc = "1.2"

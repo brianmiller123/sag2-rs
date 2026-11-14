@@ -1,0 +1,12 @@
+[package]
+name = "sag2-json"
+description = "Byte-exact CPython 3.12 JSON codec used by the SAG2 Rust port"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ryu = "1"
+
+[dev-dependencies]
+serde_json = "1"

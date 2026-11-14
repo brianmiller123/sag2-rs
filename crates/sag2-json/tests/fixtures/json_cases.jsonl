@@ -1,0 +1,13 @@
+{"case":"flat_object","compact":"{\"a\":1,\"b\":null,\"c\":true,\"d\":false}"}
+{"case":"empty_containers","compact":"{\"object\":{},\"array\":[]}"}
+{"case":"empty_string","compact":"{\"s\":\"\"}"}
+{"case":"string_escapes","compact":"{\"s\":\"a\\\"b\\\\c\\nd\\re\\tf\\bg\\fh\\u0000i\\u0001j\\u001fkl/m\"}"}
+{"case":"unicode_passthrough","compact":"{\"s\":\"中文 😀 café ẞ   \"}"}
+{"case":"key_escapes","compact":"{\"a\\\"b\":1,\"k\\\\2\":2}"}
+{"case":"nested","compact":"{\"outer\":{\"inner\":[1,2,{\"deep\":\"x\"}]},\"list\":[[],[{}],null]}"}
+{"case":"object_order","compact":"{\"z\":1,\"a\":2,\"m\":3}"}
+{"case":"key_order_after_update","compact":"{\"a\":3,\"b\":2}"}
+{"case":"floats","compact":"[0.1,1.0,-0.0,1e+16,1e-07,1e+300,1.7976931348623157e+308,5e-324,2.5e-10,1.2345678901234568e+17]"}
+{"case":"special_floats","compact":"[NaN,Infinity,-Infinity,-0.0,0.0]"}
+{"case":"ints","compact":"[0,-1,9223372036854775807,-9223372036854775808]"}
+{"case":"bools_and_null","compact":"[true,false,null]"}

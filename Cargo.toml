@@ -1,0 +1,12 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sag2-json",
+    "crates/sag2-rank-sys",
+    "crates/sag2-linktest",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
