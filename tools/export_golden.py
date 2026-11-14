@@ -27,6 +27,11 @@ Outputs (all under ``--out``, default ``golden/``):
 ``chunks.jsonl``
     every fixture document, the desktop reference cases and the
     ``tests/test_chunking.py`` scenarios with heading, spans and content
+``tokenizer.jsonl``
+    every tokenizer segment: the four frozen reference lines plus every
+    document title/text and every chunk content of the Gate A/D fixtures and
+    of C4 (the repository prose) and C7 (the alias/grounding corpus), so the
+    mixed CJK/ASCII HMM branch is covered by the tokenizer gate itself
 ``index_expected.jsonl``
     per fixture: the ``sqlite_master`` schema, ``metadata.signature``, every
     ``chunks`` row, every ``chunk_fts`` row, the 24 ``(rowid, bm25)`` probes,
@@ -113,7 +118,7 @@ if os.environ.get("PYTHONHASHSEED") != "0":
     )
 
 DEFAULT_REFERENCE = Path("../SAG-Benchmark/sag2/scripts")
-GENERATOR_VERSION = "0.8.0"
+GENERATOR_VERSION = "0.8.1"
 
 # Design §3.3: the v1 `rust_index_metadata` key set.  A Rust-built index must
 # carry exactly these keys; the values are compared against the runtime.
@@ -1771,6 +1776,31 @@ def fixture_segments(fixture, rows):
     return segments
 
 
+def tokenizer_segments_for(fixture, sag2, work_dir):
+    """Build `fixture` and return its title/text/chunk segments.
+
+    C4 (reference prose) and C7 (aliases and grounding) are not Gate A/D
+    fixtures, so `export_fixture` never produces their rows.  Building their
+    index here is what puts their text in `tokenizer.jsonl`; without it the
+    mixed CJK/ASCII HMM branch would only be exercised end to end by Gate C.
+    """
+    db_path = work_dir / f"{fixture.name}.sqlite"
+    index = sag2.CorpusIndex(
+        db_path,
+        fixture.corpus,
+        fixture.fingerprint,
+        chunk_chars=fixture.chunk_chars,
+    )
+    try:
+        rows = [
+            dict(row)
+            for row in index.db.execute("SELECT id,content FROM chunks ORDER BY id")
+        ]
+    finally:
+        index.close()
+    return fixture_segments(fixture, rows)
+
+
 def export_tokenizer(reference, fixture_segments_by_name, sag2):
     """`tokenizer.jsonl`: segment id, normalised text and the reference tokens."""
     segments = []
@@ -2329,6 +2359,14 @@ def main(argv=None):
             raise SystemExit(
                 f"only {len(retrieve_lines)} cases exported; Gate A needs at least 200"
             )
+
+        # The tokenizer gate covers every corpus whose text can reach the
+        # tokenizer, including the two that are not Gate A/D fixtures.
+        for extra in (c4, c7_fixture()):
+            segments_by_fixture[extra.name] = tokenizer_segments_for(
+                extra, sag2, work_dir
+            )
+            print(f"{extra.name}: {len(segments_by_fixture[extra.name])} tokenizer segments")
 
         retrieve_text = "".join(
             json.dumps(line, ensure_ascii=False) + "\n" for line in retrieve_lines

@@ -89,8 +89,11 @@ cargo run -p sag2-cli -- verify --gate D --fixtures tokenizer,chunks,index --gol
 
 `--fixtures` selects any subset:
 
-* `tokenizer` — the frozen tokenizer lines, the ASCII cross product, the
-  exhaustive per-code-point Unicode tables (§4.4) and the `freq` table (below).
+* `tokenizer` — the frozen tokenizer lines, every title/text/chunk segment of
+  the Gate A/D fixtures plus C4's repository prose and C7's alias corpus, the
+  ASCII cross product, the exhaustive per-code-point Unicode tables (§4.4) and
+  the `freq` table (below).  C4/C7 are here because they are the corpora whose
+  mixed CJK/ASCII blocks reach the HMM-buffer branch.
 * `freq` — rule 5's short (`<= 3` code point) `TOKENIZER.FREQ` key set against
   `golden/freq_keys.txt.gz`: exact set equality (no missing, no extra key), an
   explicit anchor-position tally (every 64th entry of the compiled table is a
