@@ -45,9 +45,13 @@ fn contains_bytes(word: &[u8]) -> bool {
             high = middle;
         }
     }
-    // `word` can only live in the 64-entry window ending at that anchor.
+    // The entry is in the window ending at `low` (when it lands before that
+    // anchor's own entry) or in the window starting at `low` (when it *is*
+    // that anchor's entry).  Both have to be scanned: an anchor's own entry is
+    // the first one the binary search reports as `>= word`, so a
+    // previous-window-only scan drops every 64th entry.
     let window_start = low.saturating_sub(1) * ANCHOR_EVERY;
-    let window_end = (window_start + ANCHOR_EVERY).min(FREQ_ENTRIES);
+    let window_end = ((low + 1) * ANCHOR_EVERY).min(FREQ_ENTRIES);
     let mut offset = anchor(window_start / ANCHOR_EVERY);
     for _ in window_start..window_end {
         let (candidate, next) = entry(offset);
@@ -93,4 +97,39 @@ pub fn crossing_word_at(suffix: &str) -> Option<&'static str> {
         }
     }
     best
+}
+
+#[cfg(test)]
+mod tests {
+    use super::contains;
+
+    /// Rule 5 asks `FREQ.get(word, 0) > 0` for every 2- and 3-codepoint
+    /// substring, so `contains` must agree with the dictionary for *every*
+    /// entry the table stores - including the ones that land exactly on an
+    /// anchor boundary (`FREQ_ENTRIES / ANCHOR_EVERY` ~ 4 000 of them).
+    #[test]
+    fn every_stored_short_entry_is_found() {
+        let mut missing = Vec::new();
+        let mut checked = 0_usize;
+        for line in include_str!("../data/dict.txt").lines() {
+            let mut fields = line.split_whitespace();
+            let (Some(word), Some(frequency)) = (fields.next(), fields.next()) else {
+                continue;
+            };
+            if word.chars().count() > 3 || frequency.parse::<u32>().unwrap_or(0) == 0 {
+                continue;
+            }
+            checked += 1;
+            if !contains(word) {
+                missing.push(word);
+            }
+        }
+        assert!(checked > 100_000, "only {checked} entries were checked");
+        assert!(
+            missing.is_empty(),
+            "{} entries are missing, e.g. {:?}",
+            missing.len(),
+            &missing[..missing.len().min(5)]
+        );
+    }
 }

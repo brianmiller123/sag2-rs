@@ -44,6 +44,11 @@ Outputs (all under ``--out``, default ``golden/``):
 ``sk_vocab.jsonl``, ``sk_cp.bin.gz``, ``sk_pairs.bin.gz``
     Gate B's sort-key goldens (design §5.5): the vocabulary keys, the key of
     every single-code-point string and 200,000 ordered comparison pairs
+``expansion.jsonl``
+    Gate B's expansion goldens (design §1.2): one line per ``(query, hop)``,
+    carrying the replay inputs (seeds, base expression, excluded ids, limits)
+    and the ordered ``terms`` / ``term_scores`` / ``queries`` / ``hits`` the
+    reference produced for that hop
 """
 
 from __future__ import annotations
@@ -59,6 +64,7 @@ if sys.version_info < (3, 12):  # pragma: no cover - exercised by the refusal te
     raise SystemExit(1)
 
 import argparse
+import asyncio
 import gzip
 import hashlib
 import io
@@ -95,7 +101,7 @@ if os.environ.get("PYTHONHASHSEED") != "0":
     )
 
 DEFAULT_REFERENCE = Path("../SAG-Benchmark/sag2/scripts")
-GENERATOR_VERSION = "0.6.0"
+GENERATOR_VERSION = "0.7.0"
 
 # Design §3.3: the v1 `rust_index_metadata` key set.  A Rust-built index must
 # carry exactly these keys; the values are compared against the runtime.
@@ -168,6 +174,7 @@ class Fixture:
         case_builder,
         probes=(),
         source_relative=None,
+        queries=(),
     ):
         self.name = name
         self.fingerprint = fingerprint
@@ -180,6 +187,9 @@ class Fixture:
         # `source_dir` mode (`content=''`, `start_char`/`end_char`).
         self.source_relative = source_relative
         self.source_dir = None
+        # The corpus' own natural queries, used by the Gate B expansion export
+        # (design §1.2 sample corpora).
+        self.queries = list(queries)
 
     def spec_digest_input(self):
         return {
@@ -359,7 +369,14 @@ def fixture_c3(sag2):
             out += _grid(f"C3/q{index:02d}", expression, limits=(7, 100), excluded=excluded)
         return out
 
-    return Fixture("C3", "scale", corpus, 10000, cases)
+    return Fixture(
+        "C3",
+        "scale",
+        corpus,
+        10000,
+        cases,
+        queries=[f"{left} {right}" for left, right in queries],
+    )
 
 
 # --------------------------------------------------------------------------
@@ -575,6 +592,398 @@ def fixture_c6(sag2):
 def probe_expressions(fixtures):
     """The design §1.4 D4 probe count (C0 12 + C5 12)."""
     return sum(len(fixture.probes) for fixture in fixtures)
+
+
+# --------------------------------------------------------------------------
+# C4 - real text, mixed scripts (design §1.0, §1.2): the repository's own
+#      prose, with the queries taken from the chunk headings.  C4 runs only in
+#      Gate B's expansion replay; it is not a Gate A/D fixture, so it stays out
+#      of `retrieve.jsonl`, `index_expected.jsonl` and the sort-key vocabulary.
+# --------------------------------------------------------------------------
+
+C4_CHUNK_CHARS = 350
+C4_DOCUMENTS = (
+    "README-CN.md",
+    "README.md",
+    "sag2/docs/agentic.md",
+    "sag2/docs/local-rerank.md",
+)
+C4_QUERY_LIMIT = 20
+
+
+def fixture_c4(reference_dir):
+    root = reference_dir.parent.parent
+    corpus = []
+    for relative in C4_DOCUMENTS:
+        text = (root / relative).read_text(encoding="utf-8")
+        title = next(
+            (line[2:].strip() for line in text.splitlines() if line.startswith("# ")),
+            Path(relative).name,
+        )
+        corpus.append({"title": title, "text": text, "path": relative})
+    return Fixture("C4", "realmix", corpus, C4_CHUNK_CHARS, lambda _db: [])
+
+
+def c4_queries(fixture, sag2):
+    """Twenty queries, one per distinct tokenizable chunk heading."""
+    import chunking  # noqa: PLC0415 - imported after `sys.path` gains the reference
+
+    queries, seen = [], set()
+    for document in fixture.corpus:
+        for chunk in chunking.chunk_document(
+            document["text"], fixture.chunk_chars, document["path"]
+        ):
+            heading = chunk["heading"].strip()
+            if not heading or heading in seen or not sag2.tokenize(heading):
+                continue
+            seen.add(heading)
+            queries.append(heading)
+            if len(queries) == C4_QUERY_LIMIT:
+                return queries
+    raise SystemExit(f"C4 offers only {len(queries)} heading queries; need {C4_QUERY_LIMIT}")
+
+
+# --------------------------------------------------------------------------
+# Gate B (expansion) - design §1.2.  The Python `search_sag2` run is the only
+# thing that can produce the `(query, hop)` inputs: hop `h`'s seeds are hop
+# `h-1`'s ranked frontier, and `seen` is the set of already-scored ids.  So the
+# export drives the real search with the tests' fixed `OracleJev`
+# (`tests/test_sag2.py:31-62`) and records the arguments and results of the two
+# calls design §1.2 makes accountable: `expansion_terms` and
+# `retrieve_expansion`.
+# --------------------------------------------------------------------------
+
+
+def oracle_jev(sag2):
+    """`tests/test_sag2.py:31-62` `OracleJev`, byte for byte."""
+
+    class OracleJev(sag2.JevClient):
+        """Fixed judgments used by the independent frozen SAG2 reference run."""
+
+        def __init__(self):
+            super().__init__(None, "http://localhost/decisions", "jev-latest", "local-test")
+            self.payloads = []
+
+        async def request(self, payload):
+            self.payloads.append(payload)
+            state = json.loads(payload["state"])
+            evidence = [row["title"] for row in state["previously_retrieved_evidence"]]
+            answers = {}
+            for key, question in payload["questions"].items():
+                title = question["instructions"]["candidate_title"]
+                score = 0.01
+                if title == "Anchor":
+                    score = 0.8
+                elif title == "Multiple":
+                    score = 0.95 if "Anchor" in evidence else 0.1
+                elif title == "Bridge":
+                    score = 0.99 if "Multiple" in evidence else 0.05
+                elif title == "High":
+                    score = 0.7
+                elif title == "Series":
+                    score = 0.08
+                answers[key] = {"type": "noul", "noul": score}
+            return {
+                "model": "oracle-jev",
+                "answers": answers,
+                "usage": {"input_tokens": 100, "output_tokens": 10},
+                "request_attempts": 1,
+            }
+
+    return OracleJev()
+
+
+def _serialise_term_scores(terms):
+    """`expansion_terms`' output, with every `f64` kept as raw bits (§1.0)."""
+    scores = []
+    for term in terms:
+        record = {
+            "term": term["term"],
+            "score_bits": _hex_bits(term["score"]),
+            "unweighted_score_bits": _hex_bits(term["unweighted_score"]),
+            "seed_weight_bits": _hex_bits(term["seed_weight"]),
+            "seed_jev_score_bits": _hex_bits(term["seed_jev_score"]),
+            "term_frequency": term["term_frequency"],
+            "document_frequency": term["document_frequency"],
+            "query_context_score_bits": _hex_bits(term["query_context_score"]),
+            "seed_document_id": term["seed_document_id"],
+            "kind": term["kind"],
+        }
+        if "name" in term:
+            record["name"] = term["name"]
+        scores.append(record)
+    return scores
+
+
+def _serialise_queries(queries):
+    """`retrieve_expansion`'s per-term records, `f64`s as raw bits (§1.0)."""
+    return [
+        {
+            "term": entry["term"],
+            "term_rank": entry["term_rank"],
+            "kind": entry["kind"],
+            "match_expression": entry["match_expression"],
+            "ranking_expression": entry["ranking_expression"],
+            "retrieved_count": entry["retrieved_count"],
+            "selected": [
+                {
+                    "document_id": selected["document_id"],
+                    "bm25_rank": selected["bm25_rank"],
+                    "bm25_score_bits": _hex_bits(selected["bm25_score"]),
+                }
+                for selected in entry["selected"]
+            ],
+        }
+        for entry in queries
+    ]
+
+
+def _serialise_hits(hits):
+    """The ordered interleaved hits, with only the fields §1.2 compares."""
+    return [
+        {
+            "id": hit["id"],
+            "document_id": hit["document_id"],
+            "score_bits": _hex_bits(hit["score"]),
+            "expansion_term": hit["expansion_term"],
+            "expansion_term_rank": hit["expansion_term_rank"],
+            "expansion_bm25_rank": hit["expansion_bm25_rank"],
+        }
+        for hit in hits
+    ]
+
+
+def _expansion_lines(index, sag2, name, position, query, options):
+    """One `(query, hop)` line per expansion round `search_sag2` performs."""
+    client = oracle_jev(sag2)
+    state = {"pending": None, "calls": []}
+    original_terms = index.expansion_terms
+    original_retrieve = index.retrieve_expansion
+
+    def expansion_terms(text, seeds, limit):
+        terms = original_terms(text, seeds, limit)
+        # `retrieve_expansion` copies each term before grounding it
+        # (`sag2.py:668`), so these values are the ones the trace records.
+        state["pending"] = {
+            "seeds": [
+                {key: seed[key] for key in ("document_id", "jev_score", "content")}
+                for seed in seeds
+            ],
+            "term_limit": limit,
+            "terms": [term["term"] for term in terms],
+            "term_scores": _serialise_term_scores(terms),
+        }
+        return terms
+
+    def retrieve_expansion(expression, terms, excluded, limit):
+        hits, queries = original_retrieve(expression, terms, excluded, limit)
+        pending = state["pending"]
+        state["pending"] = None
+        state["calls"].append(
+            {
+                **pending,
+                "expression": expression,
+                "excluded": sorted(excluded),
+                "limit": limit,
+                "queries": _serialise_queries(queries),
+                "hits": _serialise_hits(hits),
+            }
+        )
+        return hits, queries
+
+    index.expansion_terms = expansion_terms
+    index.retrieve_expansion = retrieve_expansion
+    try:
+        asyncio.run(sag2.search_sag2(index, client, query, **(options or {})))
+    finally:
+        del index.expansion_terms
+        del index.retrieve_expansion
+    if not state["calls"]:
+        raise SystemExit(f"{name}: query {query!r} produced no expansion round")
+    return [
+        {
+            "case_id": f"{name}/q{position:02d}/hop{hop}",
+            "stage": "expansion",
+            "fixture": name,
+            "query": query,
+            "hop": hop,
+            **call,
+        }
+        for hop, call in enumerate(state["calls"], start=1)
+    ]
+
+
+def export_expansion(fixture, queries, sag2, work_dir):
+    """Export Gate B's `(query, hop)` lines for one fixture's index."""
+    db_path = work_dir / f"{fixture.name}.sqlite"
+    index = sag2.CorpusIndex(
+        db_path, fixture.corpus, fixture.fingerprint, chunk_chars=fixture.chunk_chars
+    )
+    try:
+        signature = index.db.execute("SELECT signature FROM metadata").fetchone()[0]
+        chunks = index.db.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        lines = []
+        for position, (query, options) in enumerate(queries):
+            lines.extend(_expansion_lines(index, sag2, fixture.name, position, query, options))
+    finally:
+        index.close()
+    return (
+        {
+            "fixture": fixture.name,
+            "index": db_path.name,
+            "index_sha256": _sha256_bytes(db_path.read_bytes()),
+            "chunks": chunks,
+            "signature": signature,
+            "records": len(lines),
+        },
+        lines,
+    )
+
+
+# --------------------------------------------------------------------------
+# C7 - `repair_names` and `title_phrases` grounding (design §6.2, §6.3).
+#
+# Neither branch is reachable through `search_sag2` on a corpus whose own
+# terms are present in it: a term cut out of a seed sentence is by construction
+# an adjacent body phrase, so `has_match` is always true.  The reference tests
+# the two branches by calling `retrieve_expansion` with explicit terms
+# (`tests/test_sag2.py:150-165`), so Gate B does the same here, on an index
+# whose titles create real aliases ("Ångström"/"Zürich" fold to different
+# strings, "Alice Paul Smith" is a title phrase).
+# --------------------------------------------------------------------------
+
+C7_CHUNK_CHARS = 2200
+C7_FINGERPRINT = "names"
+C7_CORPUS = (
+    ("Ångström", "Ångström measures light at the guild."),
+    ("Zürich", "Zürich guild hall stands by the zurich plaza."),
+    ("Alice Paul Smith", "Alice Paul Smith spoke to the guild."),
+)
+
+# Direct `retrieve_expansion` calls: (input terms, exclusions, limit).
+C7_RETRIEVALS = (
+    (
+        "repair-changes-the-term",
+        [{"term": "angstrom unit", "kind": "word"}],
+        [],
+        5,
+    ),
+    (
+        "repair-keeps-a-present-name",
+        [{"term": "zurich plaza", "kind": "word"}],
+        [],
+        5,
+    ),
+    (
+        "grounds-a-name-phrase-on-a-title",
+        [{"term": "alice paul smith jones", "kind": "name_phrase"}],
+        [],
+        5,
+    ),
+    (
+        "present-term-skips-grounding",
+        [{"term": "alice paul smith", "kind": "name_phrase"}],
+        [],
+        5,
+    ),
+    (
+        "interleaves-two-terms",
+        [
+            {"term": "alice paul smith", "kind": "name_phrase"},
+            {"term": "guild", "kind": "word"},
+        ],
+        [],
+        4,
+    ),
+    (
+        "exclusion-blocks-the-original",
+        [{"term": "alice paul smith jones", "kind": "name_phrase"}],
+        [3],
+        3,
+    ),
+)
+
+# `repair_names` case matrix (design §6.2: 别名 × 大小写变体).
+C7_REPAIR_TEXTS = (
+    "Ångström",
+    "ångström",
+    "ÅNGSTRÖM",
+    "Angstrom",
+    "ANGSTROM",
+    "angstrom",
+    "aNgStRöM",
+    "Zürich",
+    "zurich",
+    "ZURICH",
+    "Zurich",
+    "Alice Paul Smith",
+    "alice paul smith",
+    "ALICE PAUL SMITH",
+    "tokens angstrom and zurich",
+    "no alias here",
+)
+C7_REPAIR_EXCLUSIONS = ([], [1])
+
+
+def export_named_expansion(sag2, work_dir):
+    """The C7 sub-cases: direct `retrieve_expansion` and `repair_names` calls."""
+    fixture = Fixture(
+        "C7",
+        C7_FINGERPRINT,
+        [{"title": title, "text": text} for title, text in C7_CORPUS],
+        C7_CHUNK_CHARS,
+        lambda _db: [],
+    )
+    db_path = work_dir / f"{fixture.name}.sqlite"
+    index = sag2.CorpusIndex(
+        db_path, fixture.corpus, fixture.fingerprint, chunk_chars=fixture.chunk_chars
+    )
+    try:
+        signature = index.db.execute("SELECT signature FROM metadata").fetchone()[0]
+        chunks = index.db.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        lines = []
+        for label, terms, excluded, limit in C7_RETRIEVALS:
+            hits, queries = index.retrieve_expansion(
+                sag2.match_query("guild"), [dict(term) for term in terms], set(excluded), limit
+            )
+            lines.append(
+                {
+                    "case_id": f"{fixture.name}/retrieve/{label}",
+                    "stage": "retrieve",
+                    "fixture": fixture.name,
+                    "expression": sag2.match_query("guild"),
+                    "excluded": sorted(excluded),
+                    "limit": limit,
+                    "input_terms": [dict(term) for term in terms],
+                    "queries": _serialise_queries(queries),
+                    "hits": _serialise_hits(hits),
+                }
+            )
+        for position, text in enumerate(C7_REPAIR_TEXTS):
+            for excluded in C7_REPAIR_EXCLUSIONS:
+                lines.append(
+                    {
+                        "case_id": f"{fixture.name}/repair/{position:02d}/excluded{len(excluded)}",
+                        "stage": "repair",
+                        "fixture": fixture.name,
+                        "text": text,
+                        "excluded": sorted(excluded),
+                        "repaired": index.repair_names(text, set(excluded)),
+                    }
+                )
+    finally:
+        index.close()
+    return (
+        {
+            "fixture": fixture.name,
+            "index": db_path.name,
+            "index_sha256": _sha256_bytes(db_path.read_bytes()),
+            "chunks": chunks,
+            "signature": signature,
+            "records": len(lines),
+        },
+        lines,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -1452,6 +1861,7 @@ def build_manifest(
     chunks,
     index_expected,
     sortkeys,
+    expansion,
 ):
     corpus_digest = hashlib.sha256()
     for fixture in fixtures:
@@ -1476,6 +1886,7 @@ def build_manifest(
         "chunks": chunks,
         "index_expected": index_expected,
         "sortkeys": sortkeys,
+        "expansion": expansion,
         "fixtures": [
             {
                 "fixture": entry["fixture"],
@@ -1564,6 +1975,9 @@ def main(argv=None):
         fixture_c5(sag2),
         fixture_c6(sag2),
     ]
+    # Gate B's real-text corpus (design §1.2): built and shipped, but not a
+    # Gate A/D fixture, so it does not enter those goldens.
+    c4 = fixture_c4(reference_dir)
 
     out_dir = args.out
     staging = Path(tempfile.mkdtemp(prefix="sag2-golden-"))
@@ -1667,6 +2081,38 @@ def main(argv=None):
             )
         )
 
+        # Gate B (expansion, design §1.2): C0's four frozen queries with their
+        # own options, C3's fifty generated queries and C4's twenty heading
+        # queries.  C4's index is built here and shipped with the goldens.
+        c3 = next(fixture for fixture in fixtures if fixture.name == "C3")
+        expansion_specs = [
+            (
+                next(fixture for fixture in fixtures if fixture.name == "C0"),
+                [(case["query"], case["options"]) for case in reference["cases"]],
+            ),
+            (c3, [(query, None) for query in c3.queries]),
+            (c4, [(query, None) for query in c4_queries(c4, sag2)]),
+        ]
+        expansion_fixtures, expansion_lines = [], []
+        for fixture, queries in expansion_specs:
+            entry, lines = export_expansion(fixture, queries, sag2, work_dir)
+            expansion_fixtures.append(entry)
+            expansion_lines.extend(lines)
+            print(
+                f"{fixture.name}: {len(queries)} expansion queries, "
+                f"{entry['records']} (query, hop) records, {entry['chunks']} chunks"
+            )
+        entry, lines = export_named_expansion(sag2, work_dir)
+        expansion_fixtures.append(entry)
+        expansion_lines.extend(lines)
+        print(
+            f"{entry['fixture']}: {entry['records']} repair/grounding sub-cases, "
+            f"{entry['chunks']} chunks"
+        )
+        expansion_text = "".join(
+            json.dumps(line, ensure_ascii=False) + "\n" for line in expansion_lines
+        )
+
         files = [
             {"path": "retrieve.jsonl", "sha256": _sha256_bytes(retrieve_text.encode()),
              "lines": len(retrieve_lines)},
@@ -1727,6 +2173,13 @@ def main(argv=None):
                 "gzip_bytes": len(sk_pairs_blob),
             }
         )
+        files.append(
+            {
+                "path": "expansion.jsonl",
+                "sha256": _sha256_bytes(expansion_text.encode()),
+                "lines": len(expansion_lines),
+            }
+        )
         manifest = build_manifest(
             fixtures,
             {
@@ -1771,6 +2224,11 @@ def main(argv=None):
                 "golden": "index_expected.jsonl",
             },
             sortkey_metadata,
+            {
+                "cases": len(expansion_lines),
+                "fixtures": expansion_fixtures,
+                "golden": "expansion.jsonl",
+            },
         )
 
         out_dir.mkdir(parents=True, exist_ok=True)
@@ -1794,6 +2252,9 @@ def main(argv=None):
         (out_dir / "ascii_runs.jsonl").write_text(ascii_text)
         (out_dir / "chunks.jsonl").write_text(chunk_text)
         (out_dir / "index_expected.jsonl").write_text(index_expected_text)
+        (out_dir / "expansion.jsonl").write_text(expansion_text)
+        for entry in expansion_fixtures:
+            shutil.copyfile(work_dir / entry["index"], index_dir / entry["index"])
         for name, spec in UNICODE_TABLES.items():
             (out_dir / spec["path"]).write_bytes(unicode_blobs[name])
         for name, spec in SPARSE_UNICODE_TABLES.items():
@@ -1811,7 +2272,8 @@ def main(argv=None):
             f"{len(UNICODE_TABLES)} dense + {len(SPARSE_UNICODE_TABLES)} sparse unicode "
             f"tables, {sortkey_lines} sort-key terms, "
             f"{sortkey_metadata['codepoints']['codepoints']} sort-key code points, "
-            f"{sortkey_metadata['pairs']['pairs']} sort-key pairs and "
+            f"{sortkey_metadata['pairs']['pairs']} sort-key pairs, "
+            f"{len(expansion_lines)} expansion records and "
             f"{len(fixture_stats)} indexes to {out_dir}"
         )
     finally:

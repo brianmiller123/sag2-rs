@@ -13,6 +13,7 @@ mod ascii_cut;
 mod chunk;
 mod collate;
 mod dict;
+pub mod names;
 mod tokenize;
 mod unicode;
 
@@ -20,5 +21,6 @@ pub use chunk::{chunk_document, source_content, utf16_length, Chunk, DEFAULT_CHU
 pub use collate::sort_key;
 pub use tokenize::tokenize;
 pub use unicode::{
-    casefold, combining_class, is_letter, is_mark, is_number, is_uppercase, lower, nfd, nfkc, nfkd,
+    casefold, combining_class, is_letter, is_mark, is_number, is_space, is_uppercase, is_word, lower,
+    nfd, nfkc, nfkd,
 };

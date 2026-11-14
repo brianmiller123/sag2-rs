@@ -1,5 +1,5 @@
 {
-  "generator_version": "0.6.0",
+  "generator_version": "0.7.0",
   "python": "3.12.11",
   "sqlite": "3.50.4",
   "jieba": "0.42.1",
@@ -116,6 +116,11 @@
       "sha256": "9bddd4ee7b5958086b9bdf35a55ac45fc09cc04e0a42ddf9145d1776d47744c8",
       "records": 200000,
       "gzip_bytes": 899327
+    },
+    {
+      "path": "expansion.jsonl",
+      "sha256": "03b58b1d583f495c49901119878b90d1f253ca2da40a75c038b5008618a141fd",
+      "lines": 184
     }
   ],
   "tokenizer": {
@@ -258,6 +263,44 @@
         "1": "sk_vocab.jsonl file order"
       }
     }
+  },
+  "expansion": {
+    "cases": 184,
+    "fixtures": [
+      {
+        "fixture": "C0",
+        "index": "C0.sqlite",
+        "index_sha256": "6c1acc8d09cb07b505d289e472ee3a46b5034eaaf843fd4a76e6999b92827d8a",
+        "chunks": 23,
+        "signature": "[\"fixture\",2200,5,null,\"desktop-sentences-v1\",\"plain-text-default\"]",
+        "records": 6
+      },
+      {
+        "fixture": "C3",
+        "index": "C3.sqlite",
+        "index_sha256": "7e8b49e2c712831bc42e101c6ec1d366bb82b992d1bb8f0ee0453523c04544a3",
+        "chunks": 2000,
+        "signature": "[\"scale\",10000,5,null,\"desktop-sentences-v1\",\"plain-text-default\"]",
+        "records": 100
+      },
+      {
+        "fixture": "C4",
+        "index": "C4.sqlite",
+        "index_sha256": "3bb67013b112343986be157ca76d11d2a98b6ca2d2da5a7b961aa0fcad624f02",
+        "chunks": 212,
+        "signature": "[\"realmix\",350,5,null,\"desktop-sentences-v1\",\"plain-text-default\"]",
+        "records": 40
+      },
+      {
+        "fixture": "C7",
+        "index": "C7.sqlite",
+        "index_sha256": "874c11d3552c73cc0382bb7625c85b6b96a172bc14d5e9ea38c07e5d5b20b393",
+        "chunks": 3,
+        "signature": "[\"names\",2200,5,null,\"desktop-sentences-v1\",\"plain-text-default\"]",
+        "records": 38
+      }
+    ],
+    "golden": "expansion.jsonl"
   },
   "fixtures": [
     {

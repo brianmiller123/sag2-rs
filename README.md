@@ -36,6 +36,24 @@ writes `golden/retrieve.jsonl` (ordered ids, document ids and the raw
 replay against. `verify` exits `0` when every case matches, `2` on a comparison
 failure (including any `ulp_flips`), and `3` when the golden cannot be trusted.
 
+## Gate B (design §1.2, §5.5, §6.2-§6.3)
+
+```sh
+cargo run -p sag2-cli -- verify --gate B --fixtures sortkeys,expansion --golden golden/
+```
+
+* `sortkeys` — pyuca 1.2's `sort_key` over the vocabulary, every code point and
+  200,000 ordered comparison pairs (§5.5).
+* `expansion` — `golden/expansion.jsonl`, one record per `(query, hop)` of a
+  frozen `search_sag2` run driven by the reference's fixed `OracleJev`
+  (`tests/test_sag2.py:31-62`): C0's four queries, C4's twenty heading queries
+  over the repository prose, C3's fifty generated queries, and C7's direct
+  `retrieve_expansion`/`repair_names` sub-cases (design §6.2's alias matrix and
+  the `title_phrases` grounding branch, neither of which `search_sag2` can
+  reach on a corpus that contains its own terms). Records compare the ordered
+  `terms`, `term_scores` (every `f64` by bits), `queries[].ranking_expression`
+  byte for byte, `selected[]` and the interleaved `hits`.
+
 ## Gate D (design §1.4, §4.4)
 
 ```sh

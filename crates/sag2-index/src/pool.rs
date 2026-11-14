@@ -241,6 +241,33 @@ impl Reader {
             None,
         )?)
     }
+
+    /// `self.frequency(term)` (`sag2.py:582-591`): the body column's row count.
+    fn frequency(&self, term: &str) -> Result<i64, QueryError> {
+        let expression = format!("body : {}", quote_term(term));
+        self.db
+            .query_row(
+                "SELECT COUNT(*) FROM chunk_fts WHERE chunk_fts MATCH ?",
+                [&expression],
+                |row| row.get(0),
+            )
+            .map_err(QueryError::from)
+    }
+
+    /// `self.has_match(expression, excluded)` (`sag2.py:444-452`).
+    fn has_match(&self, expression: &str, excluded_json: &str) -> Result<bool, QueryError> {
+        let found: Option<i64> = self
+            .db
+            .query_row(
+                "SELECT rowid FROM chunk_fts WHERE chunk_fts MATCH ? \
+                 AND rowid NOT IN (SELECT value FROM json_each(?)) LIMIT 1",
+                rusqlite::params![expression, excluded_json],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(QueryError::from)?;
+        Ok(found.is_some())
+    }
 }
 
 /// `load_rank_extension` (`sag2.py:424-425`) for one connection.
@@ -289,5 +316,27 @@ impl QueryPool {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         reader.retrieve(expression, excluded, excluded_json, limit, term)
+    }
+
+    /// The reference runs this on `self.db`, the writer connection; any reader
+    /// returns the same count.
+    pub(crate) fn frequency(&self, term: &str) -> Result<i64, QueryError> {
+        let slot = self.next.fetch_add(1, Ordering::Relaxed) % self.readers.len();
+        let reader = self.readers[slot]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        reader.frequency(term)
+    }
+
+    pub(crate) fn has_match(
+        &self,
+        expression: &str,
+        excluded_json: &str,
+    ) -> Result<bool, QueryError> {
+        let slot = self.next.fetch_add(1, Ordering::Relaxed) % self.readers.len();
+        let reader = self.readers[slot]
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        reader.has_match(expression, excluded_json)
     }
 }

@@ -11,6 +11,7 @@
 #![deny(unsafe_code)]
 
 mod build;
+mod expand;
 mod open;
 mod pool;
 mod py312;
@@ -18,12 +19,16 @@ mod retrieve;
 mod signature;
 mod statistics;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use sag2_json::{compact_json, Value};
 
 pub use build::{BuildError, Document};
+pub use expand::{
+    ExpansionError, ExpansionHit, ExpansionKind, ExpansionQuery, ExpansionTerm, Seed, Selected,
+};
 pub use open::{
     decide, inspect, open, open_readonly, Decision, ExistingIndex, IndexOptions, OpenAction,
     OpenError, OpenOutcome, RebuildPolicy, RebuildReason, RuntimeVersions, FORMAT_VERSION,
@@ -60,6 +65,10 @@ pub struct CorpusIndex {
     signature: String,
     statistics: Statistics,
     pool: pool::QueryPool,
+    /// `self.frequencies`, the mutable frequency memo (`sag2.py:551-583`).
+    frequencies: Mutex<BTreeMap<String, i64>>,
+    /// `self.name_pattern`, compiled on first use from the corpus aliases.
+    name_pattern: OnceLock<Option<expand::NamePattern>>,
 }
 
 impl CorpusIndex {
@@ -69,11 +78,14 @@ impl CorpusIndex {
         statistics: Statistics,
         pool: pool::QueryPool,
     ) -> Self {
+        let frequencies = statistics.frequencies.clone();
         CorpusIndex {
             path,
             signature,
             statistics,
             pool,
+            frequencies: Mutex::new(frequencies),
+            name_pattern: OnceLock::new(),
         }
     }
 

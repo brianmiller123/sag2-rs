@@ -164,6 +164,24 @@ pub fn is_mark(cp: u32) -> bool {
     bit_is_set(MARKS, cp)
 }
 
+/// `str.isspace()`, which is also what Python's `\s` matches.
+///
+/// The four file/group/record/unit separators count as whitespace there;
+/// Rust's `White_Space` property (behind `char::is_whitespace`) excludes them.
+pub fn is_space(character: char) -> bool {
+    character.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&character)
+}
+
+/// `\b`'s "word character" set (`_shared_word` in the reference modules).
+///
+/// Python's `regex` module and the `regex` crate both follow UTS#18 here:
+/// letters, marks, decimal numbers, connector punctuation and join controls.
+/// Join controls (U+200C/U+200D) are the only members that do not appear in
+/// the four generated tables, so they are spelled out.
+pub fn is_word(cp: u32) -> bool {
+    is_letter(cp) || is_mark(cp) || is_number(cp) || cp == 0x5F || cp == 0x200C || cp == 0x200D
+}
+
 /// One record of a sparse decomposition table for `cp`, plus the table's
 /// record width.  `table` is `nfd.bin` or `nfkd.bin`, which share the layout.
 fn sparse_record(table: &'static [u8], cp: u32) -> Option<(&'static [u8], usize)> {

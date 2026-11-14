@@ -9,6 +9,8 @@
 //! has its own default (`document.txt`, `sag2.py:182`); callers there must pass
 //! it explicitly (design §9 R13).
 
+use crate::unicode;
+
 /// `chunking.py:6` `DEFAULT_CHUNK_CHARS`.
 pub const DEFAULT_CHUNK_CHARS: usize = 2200;
 
@@ -372,10 +374,7 @@ fn sentence_ranges(
 
 /// `chunking.py:29-44` boundary predicate folded into [`sentence_ranges`].
 fn is_space(character: char) -> bool {
-    // `str.isspace()` also treats the four file/group/record/unit separators
-    // as whitespace; Rust's `White_Space` property (used by
-    // `char::is_whitespace`) excludes them.
-    character.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&character)
+    unicode::is_space(character)
 }
 
 /// `str.strip()` with no arguments.

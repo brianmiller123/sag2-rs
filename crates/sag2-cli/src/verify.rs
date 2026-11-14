@@ -27,12 +27,14 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
-use sag2_index::{open_readonly, CorpusIndex, QueryError, QueryOptions};
+use sag2_index::{
+    open_readonly, CorpusIndex, ExpansionQuery, ExpansionTerm, QueryError, QueryOptions, Seed,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 /// Generator version this verifier understands.
-const GENERATOR_VERSION: &str = "0.6.0";
+const GENERATOR_VERSION: &str = "0.7.0";
 
 /// Minimum interpreter the goldens may come from (design §11 divergence D5).
 const REQUIRED_PYTHON: (u64, u64) = (3, 12);
@@ -77,6 +79,8 @@ struct Manifest {
     index_expected: Option<IndexExpectedSpec>,
     #[serde(default)]
     sortkeys: Option<SortkeysSpec>,
+    #[serde(default)]
+    expansion: Option<ExpansionSpec>,
 }
 
 /// Gate B's sort-key goldens (design §5.5).
@@ -114,6 +118,129 @@ struct SortkeysPairs {
 struct ChunksSpec {
     documents: usize,
     chunks: usize,
+}
+
+/// Gate B's expansion goldens (design §1.2).
+#[derive(Deserialize)]
+struct ExpansionSpec {
+    /// Total `(query, hop)` records in `expansion.jsonl`.
+    cases: usize,
+    fixtures: Vec<ExpansionFixture>,
+}
+
+/// One expansion fixture: the Python index its records replay against.
+#[derive(Deserialize)]
+struct ExpansionFixture {
+    fixture: String,
+    index: String,
+    #[serde(default)]
+    index_sha256: Option<String>,
+    chunks: usize,
+    signature: String,
+    records: usize,
+}
+
+/// One `expansion.jsonl` line.  `stage` decides which fields are meaningful:
+/// `expansion` replays `search_sag2`'s hop, `retrieve` calls
+/// `retrieve_expansion` directly, `repair` calls `repair_names`.
+#[derive(Deserialize)]
+struct ExpansionLine {
+    case_id: String,
+    stage: String,
+    fixture: String,
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    seeds: Vec<SeedGolden>,
+    #[serde(default)]
+    terms: Vec<String>,
+    #[serde(default)]
+    term_scores: Vec<TermScoreGolden>,
+    #[serde(default)]
+    expression: Option<String>,
+    #[serde(default)]
+    excluded: Vec<i64>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    term_limit: Option<usize>,
+    #[serde(default)]
+    input_terms: Vec<InputTermGolden>,
+    #[serde(default)]
+    queries: Vec<QueryGolden>,
+    #[serde(default)]
+    hits: Vec<ExpansionHitGolden>,
+    #[serde(default)]
+    text: Option<String>,
+    #[serde(default)]
+    repaired: Option<String>,
+}
+
+/// A seed's replayed fields (`seed["document_id"]`, `["jev_score"]`,
+/// `["content"]`).  `jev_score` is a JSON number, and the exporter writes
+/// Python's shortest round-tripping `repr`, so it parses back bit-identically.
+#[derive(Deserialize)]
+struct SeedGolden {
+    document_id: i64,
+    jev_score: f64,
+    content: String,
+}
+
+/// One `term_scores[]` record, every `f64` as raw `struct.pack('<d')` bits.
+#[derive(Deserialize)]
+struct TermScoreGolden {
+    term: String,
+    score_bits: String,
+    unweighted_score_bits: String,
+    seed_weight_bits: String,
+    seed_jev_score_bits: String,
+    term_frequency: i64,
+    document_frequency: i64,
+    query_context_score_bits: String,
+    seed_document_id: i64,
+    kind: String,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// A `retrieve` record's input term (`term`, `kind`, optional `name`).
+#[derive(Deserialize)]
+struct InputTermGolden {
+    term: String,
+    kind: String,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// One `queries[]` record (`sag2.py:723-733`).
+#[derive(Deserialize)]
+struct QueryGolden {
+    term: String,
+    term_rank: usize,
+    kind: String,
+    match_expression: String,
+    ranking_expression: String,
+    retrieved_count: usize,
+    selected: Vec<SelectedGolden>,
+}
+
+/// One `selected[]` entry.
+#[derive(Deserialize)]
+struct SelectedGolden {
+    document_id: i64,
+    bm25_rank: usize,
+    bm25_score_bits: String,
+}
+
+/// One `hits[]` record: the interleaved order is the comparison.
+#[derive(Deserialize)]
+struct ExpansionHitGolden {
+    id: i64,
+    document_id: i64,
+    score_bits: String,
+    expansion_term: String,
+    expansion_term_rank: usize,
+    expansion_bm25_rank: usize,
 }
 
 /// Gate D's Rust-vs-Python index baseline count (`index_expected.jsonl`).
@@ -317,7 +444,7 @@ pub fn verify(args: &[String]) -> ExitCode {
 
 pub fn usage() -> &'static str {
     "usage: sag2-cli verify --gate A|B|D --golden golden/ \
-     [--fixtures tokenizer,chunks,index|sortkeys] [--reference <scripts>] \
+     [--fixtures tokenizer,chunks,index|sortkeys|expansion] [--reference <scripts>] \
      [--index-cache <dir>] [--index-dir <dir>] [--filter <substring>] \
      [--report report.json]"
 }
@@ -2036,42 +2163,47 @@ fn run_gate_b(options: &Options) -> Result<ExitCode, String> {
         .clone()
         .unwrap_or_else(|| vec!["sortkeys".to_owned()]);
     for fixture in &fixtures {
-        if fixture != "sortkeys" {
+        if fixture != "sortkeys" && fixture != "expansion" {
             return Err(format!(
-                "gate B fixture {fixture} is not implemented; only sortkeys has goldens"
+                "gate B fixture {fixture} is not implemented; sortkeys and expansion have goldens"
             ));
         }
     }
     let manifest = preflight(options)?;
-    verify_manifest_files(
-        options,
-        &manifest,
-        &[
-            "sk_vocab.jsonl",
-            "sk_cp.bin.gz",
-            "sk_pairs.bin.gz",
-            // The port's NFD must exist for `sort_key` to be pyuca's; the
-            // digest check makes the table part of this gate's inputs.
-            "unicode_nfd.bin.gz",
-        ],
-    )?;
-    let spec = manifest
-        .sortkeys
-        .as_ref()
-        .ok_or_else(|| "manifest has no sortkeys section".to_owned())?;
 
     let mut failures: Vec<Failure> = Vec::new();
+    let mut ulp_flips: Vec<serde_json::Value> = Vec::new();
     let mut sections = serde_json::Map::new();
     let mut passed = true;
     for fixture in &fixtures {
-        if fixture != "sortkeys" {
-            continue;
-        }
-        let section = gate_b_sortkeys(options, spec, &mut failures)?;
+        let section = match fixture.as_str() {
+            "sortkeys" => {
+                verify_manifest_files(
+                    options,
+                    &manifest,
+                    &[
+                        "sk_vocab.jsonl",
+                        "sk_cp.bin.gz",
+                        "sk_pairs.bin.gz",
+                        // The port's NFD must exist for `sort_key` to be
+                        // pyuca's; the digest check makes the table part of
+                        // this gate's inputs.
+                        "unicode_nfd.bin.gz",
+                    ],
+                )?;
+                let spec = manifest
+                    .sortkeys
+                    .as_ref()
+                    .ok_or_else(|| "manifest has no sortkeys section".to_owned())?;
+                gate_b_sortkeys(options, spec, &mut failures)?
+            }
+            "expansion" => gate_b_expansion(options, &manifest, &mut failures, &mut ulp_flips)?,
+            _ => unreachable!("fixture names were validated above"),
+        };
         passed &= section["passed"].as_bool().unwrap_or(false);
-        sections.insert("sortkeys".to_owned(), section);
+        sections.insert(fixture.clone(), section);
     }
-    passed &= failures.is_empty();
+    passed &= failures.is_empty() && ulp_flips.is_empty();
 
     println!(
         "gate B ({}): {} failures",
@@ -2111,7 +2243,7 @@ fn run_gate_b(options: &Options) -> Result<ExitCode, String> {
         "excluded_fields": [],
         "excluded_checks": ["db_physical_bytes"],
         "failures": failures,
-        "ulp_flips": [],
+        "ulp_flips": ulp_flips,
         "unsupported": [],
     });
     write_report(&options.report, &report);
@@ -2396,6 +2528,675 @@ fn gate_b_sortkeys(
         "pair_diffs": pair_diffs,
         "passed": passed,
     }))
+}
+
+/// Gate B `expansion`: replay `expansion_terms` + `retrieve_expansion` from
+/// the recorded `(query, hop)` inputs (design §1.2).
+///
+/// Every ordered field is compared: `terms`, `term_scores` (with `f64`s
+/// compared by bits), `queries[].ranking_expression` byte for byte,
+/// `queries[].term_rank`/`retrieved_count`/`selected[]`, and the interleaved
+/// `hits` sequence.  `repair` records add `repair_names` and `retrieve`
+/// records add direct `retrieve_expansion` calls, which is how design §6.2's
+/// alias matrix and the `title_phrases` grounding branch stay covered.
+fn gate_b_expansion(
+    options: &Options,
+    manifest: &Manifest,
+    failures: &mut Vec<Failure>,
+    ulp_flips: &mut Vec<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    verify_manifest_files(options, manifest, &["expansion.jsonl"])?;
+    let spec = manifest
+        .expansion
+        .as_ref()
+        .ok_or_else(|| "manifest has no expansion section".to_owned())?;
+    let path = options.golden.join("expansion.jsonl");
+    let text = fs::read_to_string(&path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let mut lines: Vec<ExpansionLine> = Vec::new();
+    for (number, line) in text.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        lines.push(
+            serde_json::from_str(line)
+                .map_err(|error| format!("{}:{}: {error}", path.display(), number + 1))?,
+        );
+    }
+    if lines.len() != spec.cases {
+        return Err(format!(
+            "golden inconsistency: expansion.jsonl holds {} records, manifest says {}",
+            lines.len(),
+            spec.cases
+        ));
+    }
+
+    // Design §7.3: the reference indexes are the default; `--index-dir`
+    // replays against indexes this crate built, and a missing fixture there is
+    // a tooling failure rather than a silent fallback.
+    let index_directory = options
+        .index_dir
+        .clone()
+        .unwrap_or_else(|| options.golden.join("indexes"));
+    let mut indexes: BTreeMap<String, CorpusIndex> = BTreeMap::new();
+    let mut provenance: Vec<serde_json::Value> = Vec::new();
+    for fixture in &spec.fixtures {
+        let counted = lines
+            .iter()
+            .filter(|line| line.fixture == fixture.fixture)
+            .count();
+        if counted != fixture.records {
+            return Err(format!(
+                "golden inconsistency: {} has {counted} records, manifest says {}",
+                fixture.fixture, fixture.records
+            ));
+        }
+        let source = index_directory.join(&fixture.index);
+        let bytes = fs::read(&source).map_err(|error| {
+            if options.index_dir.is_some() {
+                format!(
+                    "fixture {} has no index at {} (--index-dir): {error}",
+                    fixture.fixture,
+                    source.display()
+                )
+            } else {
+                format!("cannot read {}: {error}", source.display())
+            }
+        })?;
+        let digest = sha256_hex(&bytes);
+        let manifest_verified = fixture.index_sha256.as_deref() == Some(digest.as_str());
+        if options.index_dir.is_none() && !manifest_verified {
+            return Err(format!(
+                "{} does not match the manifest sha256",
+                fixture.index
+            ));
+        }
+        fs::create_dir_all(&options.cache)
+            .map_err(|error| format!("cannot create {}: {error}", options.cache.display()))?;
+        let cached = options.cache.join(&fixture.index);
+        fs::write(&cached, &bytes)
+            .map_err(|error| format!("cannot write {}: {error}", cached.display()))?;
+        let index = open_readonly(&cached, &fixture.signature, QueryOptions::default())
+            .map_err(|error| {
+                format!("cannot open expansion fixture {}: {error}", fixture.fixture)
+            })?;
+        if index.statistics().total as usize != fixture.chunks {
+            return Err(format!(
+                "fixture {} holds {} chunks, manifest says {}",
+                fixture.fixture,
+                index.statistics().total,
+                fixture.chunks
+            ));
+        }
+        provenance.push(serde_json::json!({
+            "fixture": fixture.fixture,
+            "path": source.display().to_string(),
+            "sha256": digest,
+            "manifest_sha256": fixture.index_sha256,
+            "manifest_verified": manifest_verified,
+        }));
+        indexes.insert(fixture.fixture.clone(), index);
+    }
+
+    let mut per_fixture: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+    let mut stages: BTreeMap<String, usize> = BTreeMap::new();
+    for line in &lines {
+        let index = indexes
+            .get(&line.fixture)
+            .ok_or_else(|| format!("fixture {} was not opened", line.fixture))?;
+        let before = failures.len();
+        match line.stage.as_str() {
+            "expansion" => check_expansion_record(index, line, failures, ulp_flips)?,
+            "retrieve" => check_retrieve_record(index, line, failures, ulp_flips)?,
+            "repair" => check_repair_record(index, line, failures)?,
+            other => {
+                return Err(format!("{}: unknown stage {other}", line.case_id));
+            }
+        }
+        let entry = per_fixture.entry(line.fixture.clone()).or_insert((0, 0));
+        entry.0 += 1;
+        if failures.len() == before {
+            entry.1 += 1;
+        }
+        *stages.entry(line.stage.clone()).or_insert(0) += 1;
+    }
+
+    let passed_cases = per_fixture.values().map(|(_, passed)| passed).sum::<usize>();
+    println!(
+        "{:<12} {:>7} {:>7} {:>7}",
+        "fixture", "cases", "passed", "failed"
+    );
+    for (fixture, (total, passed)) in &per_fixture {
+        println!(
+            "{:<12} {:>7} {:>7} {:>7}",
+            fixture,
+            total,
+            passed,
+            total - passed
+        );
+    }
+    println!(
+        "gate B expansion: {} records ({}), {} passed, {} failed",
+        lines.len(),
+        stages
+            .iter()
+            .map(|(stage, count)| format!("{stage} {count}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        passed_cases,
+        lines.len() - passed_cases
+    );
+
+    Ok(serde_json::json!({
+        "cases": lines.len(),
+        "passed_cases": passed_cases,
+        "failed": lines.len() - passed_cases,
+        "stages": stages,
+        "indexes": {
+            "dir": index_directory.display().to_string(),
+            "source": if options.index_dir.is_some() { "index_dir" } else { "golden" },
+            "fixtures": provenance,
+        },
+        "fixtures": per_fixture.iter().map(|(fixture, (total, passed))| {
+            serde_json::json!({"fixture": fixture, "cases": total, "passed": passed})
+        }).collect::<Vec<_>>(),
+        "passed": failures.is_empty() && ulp_flips.is_empty(),
+    }))
+}
+
+/// Replay one `expansion` record: the seed sentences in, the §1.2 fields out.
+fn check_expansion_record(
+    index: &CorpusIndex,
+    line: &ExpansionLine,
+    failures: &mut Vec<Failure>,
+    ulp_flips: &mut Vec<serde_json::Value>,
+) -> Result<(), String> {
+    let query = line
+        .query
+        .as_deref()
+        .ok_or_else(|| format!("{}: expansion record without query", line.case_id))?;
+    let term_limit = line
+        .term_limit
+        .ok_or_else(|| format!("{}: expansion record without term_limit", line.case_id))?;
+    let expression = line
+        .expression
+        .as_deref()
+        .ok_or_else(|| format!("{}: expansion record without expression", line.case_id))?;
+    let limit = line
+        .limit
+        .ok_or_else(|| format!("{}: expansion record without limit", line.case_id))?;
+    let seeds: Vec<Seed> = line
+        .seeds
+        .iter()
+        .map(|seed| Seed {
+            document_id: seed.document_id,
+            jev_score: seed.jev_score,
+            content: seed.content.clone(),
+        })
+        .collect();
+    let terms = index
+        .expansion_terms(query, &seeds, term_limit)
+        .map_err(|error| format!("{}: expansion_terms: {error}", line.case_id))?;
+    compare_terms(failures, &line.case_id, "terms", &line.terms, &terms);
+    compare_term_scores(failures, ulp_flips, &line.case_id, &line.term_scores, &terms);
+    let excluded: BTreeSet<i64> = line.excluded.iter().copied().collect();
+    let (hits, queries) = index
+        .retrieve_expansion(expression, &terms, &excluded, limit)
+        .map_err(|error| format!("{}: retrieve_expansion: {error}", line.case_id))?;
+    compare_queries(failures, ulp_flips, &line.case_id, &line.queries, &queries);
+    compare_expansion_hits(failures, ulp_flips, &line.case_id, &line.hits, &hits);
+    Ok(())
+}
+
+/// Replay one `retrieve` record: explicit input terms, the same comparisons.
+fn check_retrieve_record(
+    index: &CorpusIndex,
+    line: &ExpansionLine,
+    failures: &mut Vec<Failure>,
+    ulp_flips: &mut Vec<serde_json::Value>,
+) -> Result<(), String> {
+    let expression = line
+        .expression
+        .as_deref()
+        .ok_or_else(|| format!("{}: retrieve record without expression", line.case_id))?;
+    let limit = line
+        .limit
+        .ok_or_else(|| format!("{}: retrieve record without limit", line.case_id))?;
+    let mut terms: Vec<ExpansionTerm> = Vec::with_capacity(line.input_terms.len());
+    for input in &line.input_terms {
+        terms.push(ExpansionTerm {
+            term: input.term.clone(),
+            score: 0.0,
+            unweighted_score: 0.0,
+            seed_weight: 0.0,
+            seed_jev_score: 0.0,
+            term_frequency: 0,
+            document_frequency: 0,
+            query_context_score: 0.0,
+            seed_document_id: 0,
+            kind: expansion_kind(&line.case_id, &input.kind)?,
+            name: input.name.clone(),
+        });
+    }
+    let excluded: BTreeSet<i64> = line.excluded.iter().copied().collect();
+    let (hits, queries) = index
+        .retrieve_expansion(expression, &terms, &excluded, limit)
+        .map_err(|error| format!("{}: retrieve_expansion: {error}", line.case_id))?;
+    compare_queries(failures, ulp_flips, &line.case_id, &line.queries, &queries);
+    compare_expansion_hits(failures, ulp_flips, &line.case_id, &line.hits, &hits);
+    Ok(())
+}
+
+/// Replay one `repair` record: `repair_names(text, excluded)`.
+fn check_repair_record(
+    index: &CorpusIndex,
+    line: &ExpansionLine,
+    failures: &mut Vec<Failure>,
+) -> Result<(), String> {
+    let text = line
+        .text
+        .as_deref()
+        .ok_or_else(|| format!("{}: repair record without text", line.case_id))?;
+    let expected = line
+        .repaired
+        .as_deref()
+        .ok_or_else(|| format!("{}: repair record without repaired", line.case_id))?;
+    let excluded: BTreeSet<i64> = line.excluded.iter().copied().collect();
+    let actual = index
+        .repair_names(text, &excluded)
+        .map_err(|error| format!("{}: repair_names: {error}", line.case_id))?;
+    if actual != expected {
+        push_gate_failure(
+            failures,
+            &line.case_id,
+            "repaired",
+            display_text(expected),
+            display_text(&actual),
+        );
+    }
+    Ok(())
+}
+
+fn expansion_kind(case_id: &str, kind: &str) -> Result<sag2_index::ExpansionKind, String> {
+    match kind {
+        "name_phrase" => Ok(sag2_index::ExpansionKind::NamePhrase),
+        "word" => Ok(sag2_index::ExpansionKind::Word),
+        other => Err(format!("{case_id}: unknown expansion kind {other}")),
+    }
+}
+
+/// `terms`: the ordered term strings, byte for byte (§1.2).
+fn compare_terms(
+    failures: &mut Vec<Failure>,
+    case_id: &str,
+    prefix: &str,
+    expected: &[String],
+    actual: &[ExpansionTerm],
+) {
+    if expected.len() != actual.len() {
+        push_gate_failure(
+            failures,
+            case_id,
+            format!("{prefix}.len"),
+            expected.len().to_string(),
+            actual.len().to_string(),
+        );
+    }
+    for (position, expected) in expected.iter().enumerate() {
+        let Some(actual) = actual.get(position) else {
+            break;
+        };
+        if *expected != actual.term {
+            push_gate_failure(
+                failures,
+                case_id,
+                format!("{prefix}[{position}]"),
+                display_text(expected),
+                display_text(&actual.term),
+            );
+        }
+    }
+}
+
+/// `term_scores`: every ordered field, `f64` by bits (§1.0 layer S).
+fn compare_term_scores(
+    failures: &mut Vec<Failure>,
+    ulp_flips: &mut Vec<serde_json::Value>,
+    case_id: &str,
+    expected: &[TermScoreGolden],
+    actual: &[ExpansionTerm],
+) {
+    if expected.len() != actual.len() {
+        push_gate_failure(
+            failures,
+            case_id,
+            "term_scores.len",
+            expected.len().to_string(),
+            actual.len().to_string(),
+        );
+    }
+    for (position, expected) in expected.iter().enumerate() {
+        let Some(actual) = actual.get(position) else {
+            break;
+        };
+        let field = |name: &str| format!("term_scores[{position}].{name}");
+        if expected.term != actual.term {
+            push_gate_failure(
+                failures,
+                case_id,
+                field("term"),
+                display_text(&expected.term),
+                display_text(&actual.term),
+            );
+        }
+        let kind = expansion_kind(case_id, &expected.kind);
+        match kind {
+            Ok(kind) if kind == actual.kind => {}
+            Ok(_) => push_gate_failure(
+                failures,
+                case_id,
+                field("kind"),
+                expected.kind.clone(),
+                actual.kind.as_str().to_owned(),
+            ),
+            Err(message) => push_gate_failure(
+                failures,
+                case_id,
+                field("kind"),
+                expected.kind.clone(),
+                message,
+            ),
+        }
+        if expected.name != actual.name {
+            push_gate_failure(
+                failures,
+                case_id,
+                field("name"),
+                format!("{:?}", expected.name),
+                format!("{:?}", actual.name),
+            );
+        }
+        if expected.term_frequency != actual.term_frequency {
+            push_gate_failure(
+                failures,
+                case_id,
+                field("term_frequency"),
+                expected.term_frequency.to_string(),
+                actual.term_frequency.to_string(),
+            );
+        }
+        if expected.document_frequency != actual.document_frequency {
+            push_gate_failure(
+                failures,
+                case_id,
+                field("document_frequency"),
+                expected.document_frequency.to_string(),
+                actual.document_frequency.to_string(),
+            );
+        }
+        if expected.seed_document_id != actual.seed_document_id {
+            push_gate_failure(
+                failures,
+                case_id,
+                field("seed_document_id"),
+                expected.seed_document_id.to_string(),
+                actual.seed_document_id.to_string(),
+            );
+        }
+        for (name, expected_bits, actual_value) in [
+            ("score", &expected.score_bits, actual.score),
+            (
+                "unweighted_score",
+                &expected.unweighted_score_bits,
+                actual.unweighted_score,
+            ),
+            ("seed_weight", &expected.seed_weight_bits, actual.seed_weight),
+            (
+                "seed_jev_score",
+                &expected.seed_jev_score_bits,
+                actual.seed_jev_score,
+            ),
+            (
+                "query_context_score",
+                &expected.query_context_score_bits,
+                actual.query_context_score,
+            ),
+        ] {
+            compare_bits(
+                failures,
+                ulp_flips,
+                case_id,
+                field(name),
+                expected_bits,
+                actual_value,
+            );
+        }
+    }
+}
+
+/// `queries[]`: `ranking_expression` byte for byte, then rank/count/selected.
+fn compare_queries(
+    failures: &mut Vec<Failure>,
+    ulp_flips: &mut Vec<serde_json::Value>,
+    case_id: &str,
+    expected: &[QueryGolden],
+    actual: &[ExpansionQuery],
+) {
+    if expected.len() != actual.len() {
+        push_gate_failure(
+            failures,
+            case_id,
+            "queries.len",
+            expected.len().to_string(),
+            actual.len().to_string(),
+        );
+    }
+    for (position, expected) in expected.iter().enumerate() {
+        let Some(actual) = actual.get(position) else {
+            break;
+        };
+        let field = |name: &str| format!("queries[{position}].{name}");
+        for (name, expected, actual) in [
+            ("term", &expected.term, &actual.term),
+            ("kind", &expected.kind, &actual.kind.as_str().to_owned()),
+            (
+                "match_expression",
+                &expected.match_expression,
+                &actual.match_expression,
+            ),
+            (
+                "ranking_expression",
+                &expected.ranking_expression,
+                &actual.ranking_expression,
+            ),
+        ] {
+            if expected != actual {
+                push_gate_failure(
+                    failures,
+                    case_id,
+                    field(name),
+                    display_text(expected),
+                    display_text(actual),
+                );
+            }
+        }
+        if expected.term_rank != actual.term_rank {
+            push_gate_failure(
+                failures,
+                case_id,
+                field("term_rank"),
+                expected.term_rank.to_string(),
+                actual.term_rank.to_string(),
+            );
+        }
+        if expected.retrieved_count != actual.retrieved_count {
+            push_gate_failure(
+                failures,
+                case_id,
+                field("retrieved_count"),
+                expected.retrieved_count.to_string(),
+                actual.retrieved_count.to_string(),
+            );
+        }
+        if expected.selected.len() != actual.selected.len() {
+            push_gate_failure(
+                failures,
+                case_id,
+                field("selected.len"),
+                expected.selected.len().to_string(),
+                actual.selected.len().to_string(),
+            );
+        }
+        for (index, expected) in expected.selected.iter().enumerate() {
+            let Some(actual) = actual.selected.get(index) else {
+                break;
+            };
+            if expected.document_id != actual.document_id {
+                push_gate_failure(
+                    failures,
+                    case_id,
+                    field(&format!("selected[{index}].document_id")),
+                    expected.document_id.to_string(),
+                    actual.document_id.to_string(),
+                );
+            }
+            if expected.bm25_rank != actual.bm25_rank {
+                push_gate_failure(
+                    failures,
+                    case_id,
+                    field(&format!("selected[{index}].bm25_rank")),
+                    expected.bm25_rank.to_string(),
+                    actual.bm25_rank.to_string(),
+                );
+            }
+            compare_bits(
+                failures,
+                ulp_flips,
+                case_id,
+                field(&format!("selected[{index}].bm25_score")),
+                &expected.bm25_score_bits,
+                actual.bm25_score,
+            );
+        }
+    }
+}
+
+/// `hits`: the interleaved sequence, every field in order (§1.2).
+fn compare_expansion_hits(
+    failures: &mut Vec<Failure>,
+    ulp_flips: &mut Vec<serde_json::Value>,
+    case_id: &str,
+    expected: &[ExpansionHitGolden],
+    actual: &[sag2_index::ExpansionHit],
+) {
+    if expected.len() != actual.len() {
+        push_gate_failure(
+            failures,
+            case_id,
+            "hits.len",
+            expected.len().to_string(),
+            actual.len().to_string(),
+        );
+    }
+    for (position, expected) in expected.iter().enumerate() {
+        let Some(actual) = actual.get(position) else {
+            break;
+        };
+        let field = |name: &str| format!("hits[{position}].{name}");
+        for (name, expected, actual) in [
+            ("id", expected.id, actual.id),
+            ("document_id", expected.document_id, actual.document_id),
+        ] {
+            if expected != actual {
+                push_gate_failure(
+                    failures,
+                    case_id,
+                    field(name),
+                    expected.to_string(),
+                    actual.to_string(),
+                );
+            }
+        }
+        if expected.expansion_term != actual.expansion_term {
+            push_gate_failure(
+                failures,
+                case_id,
+                field("expansion_term"),
+                display_text(&expected.expansion_term),
+                display_text(&actual.expansion_term),
+            );
+        }
+        if expected.expansion_term_rank != actual.expansion_term_rank {
+            push_gate_failure(
+                failures,
+                case_id,
+                field("expansion_term_rank"),
+                expected.expansion_term_rank.to_string(),
+                actual.expansion_term_rank.to_string(),
+            );
+        }
+        if expected.expansion_bm25_rank != actual.expansion_bm25_rank {
+            push_gate_failure(
+                failures,
+                case_id,
+                field("expansion_bm25_rank"),
+                expected.expansion_bm25_rank.to_string(),
+                actual.expansion_bm25_rank.to_string(),
+            );
+        }
+        compare_bits(
+            failures,
+            ulp_flips,
+            case_id,
+            field("score"),
+            &expected.score_bits,
+            actual.score,
+        );
+    }
+}
+
+/// `eq_f64_bits` (§1.0 layer S); a difference inside `eq_f64` is an `ulp_flip`
+/// and still fails the gate.
+fn compare_bits(
+    failures: &mut Vec<Failure>,
+    ulp_flips: &mut Vec<serde_json::Value>,
+    case_id: &str,
+    path: String,
+    expected_bits: &str,
+    actual: f64,
+) {
+    let Some(expected) = bits_to_f64(expected_bits) else {
+        push_gate_failure(
+            failures,
+            case_id,
+            path,
+            expected_bits.to_owned(),
+            "unparseable golden bits".to_owned(),
+        );
+        return;
+    };
+    if actual.to_bits() == expected.to_bits() {
+        return;
+    }
+    let delta = actual - expected;
+    if failures.len() < MAX_FAILURES {
+        failures.push(Failure {
+            case_id: case_id.to_owned(),
+            path: path.clone(),
+            expected: format!("{expected_bits} ({expected:e})"),
+            actual: format!("{:016x} ({actual:e})", actual.to_bits()),
+            delta: Some(delta),
+        });
+    }
+    if within_tolerance(expected, actual) {
+        ulp_flips.push(serde_json::json!({
+            "case_id": case_id,
+            "path": path,
+            "expected": expected_bits,
+            "actual": format!("{:016x}", actual.to_bits()),
+            "delta": delta,
+        }));
+    }
 }
 
 fn run_gate_d(options: &Options) -> Result<ExitCode, String> {
