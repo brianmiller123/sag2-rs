@@ -61,12 +61,13 @@ impl std::error::Error for Error {}
 
 /// Register the `sag_stats` and `sag_bm25` FTS5 functions on `db`.
 ///
-/// # Safety contract
+/// # Safety
 ///
-/// `db` must be a live connection handle obtained from the SQLite that this
-/// archive is linked against. The pointer cannot be validated here; passing
-/// anything else is undefined behaviour.
-pub fn register(db: *mut sqlite3) -> Result<(), Error> {
+/// `db` must be a valid, open connection handle obtained from the SQLite
+/// instance this archive is linked against, and it must not be used after that
+/// connection is closed. The pointer cannot be validated here; passing anything
+/// else is undefined behaviour.
+pub unsafe fn register(db: *mut sqlite3) -> Result<(), Error> {
     // SAFETY: the caller guarantees `db` is a live connection handle; the C
     // entry point only prepares one statement and registers two functions.
     let code = unsafe { sag_register_rank(db) };

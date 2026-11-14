@@ -17,7 +17,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     // SAFETY: the handle refers to the live connection behind `connection`.
     let handle = unsafe { connection.handle() } as *mut sqlite3;
-    sag2_rank_sys::register(handle)?;
+    // SAFETY: `handle` belongs to the live `connection` above and is not used
+    // after `connection` is dropped.
+    unsafe { sag2_rank_sys::register(handle) }?;
     println!("register ok");
 
     let version: String = connection.query_row("SELECT sqlite_version()", [], |row| row.get(0))?;
@@ -45,10 +47,12 @@ fn main() -> Result<(), Box<dyn Error>> {
 mod tests {
     #[test]
     fn null_handle_maps_to_sqlite_misuse() {
-        // `sag_register_rank` starts with `sqlite3_prepare_v2`, which rejects a
-        // null database with SQLITE_MISUSE (21) before dereferencing it, so the
-        // error mapping is observable without a live connection.
-        let error = sag2_rank_sys::register(std::ptr::null_mut())
+        // SAFETY: this call deliberately violates `register`'s contract only in
+        // the sense of passing a null handle; SQLite's `sqlite3_prepare_v2`
+        // rejects a null database in `sqlite3SafetyCheckOk` before
+        // dereferencing it, so no memory is accessed. It is how the non-OK
+        // mapping is observed without a live connection.
+        let error = unsafe { sag2_rank_sys::register(std::ptr::null_mut()) }
             .expect_err("a null connection must not be accepted");
         assert_eq!(error.code(), 21, "SQLITE_MISUSE");
     }

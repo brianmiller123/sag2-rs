@@ -249,7 +249,9 @@ fn register_rank(db: &Connection) -> Result<(), OpenError> {
     // SAFETY: the handle is valid for as long as `db` is alive, and
     // `sag_register_rank` only prepares one statement on that connection.
     let handle = unsafe { db.handle() } as *mut sag2_rank_sys::sqlite3;
-    sag2_rank_sys::register(handle).map_err(|error| OpenError::RankExtension(error.code()))
+    // SAFETY: same live handle as above; not used after `db` is dropped.
+    unsafe { sag2_rank_sys::register(handle) }
+        .map_err(|error| OpenError::RankExtension(error.code()))
 }
 
 /// A fixed-size pool of read-only readers.
