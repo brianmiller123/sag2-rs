@@ -90,6 +90,18 @@ fn fold_german(text: &str) -> String {
     folded
 }
 
+/// The diacritic-free spelling FTS5 `unicode61` indexes for `text`: the shared
+/// Latin fold, `NFD`, the combining marks dropped, lower.
+///
+/// The German profile folds `ä/ö/ü` into `ae/oe/ue`, so the token it stores is
+/// the transliteration and FTS can no longer derive the deaccented spelling
+/// from it (`müller` indexes as `muller`, `mueller` does not).  The multilingual
+/// tokenizer emits this spelling next to the transliteration for exactly that
+/// reason; every other profile has no use for it.
+pub(crate) fn deaccent(text: &str) -> String {
+    lower(&strip_marks(&nfd(&fold_latin(&nfkc(text)))))
+}
+
 /// Drop every code point with a non-zero canonical combining class.
 fn strip_marks(text: &str) -> String {
     text.chars()

@@ -6,7 +6,10 @@
 //! runs [`normalize::normalize`] before the same §4 post-rules, with the
 //! multilingual word character set (`tokenize::is_word_character`) instead of
 //! `re_han_default`'s ASCII + Han set, so accent, case and orthographic variants
-//! of a word collapse onto one term and a word in any script stays one token.  A
+//! of a word collapse onto one term and a word in any script stays one token.
+//! A German word run also carries both ASCII spellings of an umlaut word
+//! (`mueller` and `muller`), because the fold's transliteration and FTS5's
+//! diacritic removal disagree — see `tokenize::tokenize_multilingual`.  A
 //! language that writes without spaces ([`Language::Th`]) replaces the §4 word
 //! boundaries with its own segmenter (see [`segment`]) and shares the rest: the
 //! certified ASCII model and the final filters.  Japanese needs a runtime
@@ -376,7 +379,7 @@ pub fn tokenize_with_segmenter(
             }
             match language {
                 Language::Th => thai_tokens(&normalised),
-                _ => Ok(tokenize_multilingual(&normalised)),
+                _ => Ok(tokenize_multilingual(language, &normalised, text)),
             }
         }
     }
@@ -478,7 +481,10 @@ mod tests {
         let german = Profile::Multilingual {
             language: Language::De,
         };
-        assert_eq!(tokens(german, "Straße"), ["strasse"]);
+        assert_eq!(
+            tokens(german, "Straße"),
+            ["s", "t", "r", "ß", "e", "strasse"]
+        );
         assert_ne!(tokens(german, "Straße"), crate::tokenize("Straße"));
     }
 

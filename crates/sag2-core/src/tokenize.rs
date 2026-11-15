@@ -22,6 +22,8 @@ use std::sync::LazyLock;
 
 use jieba_rs::Jieba;
 
+use crate::analysis::normalize;
+use crate::analysis::Language;
 use crate::{ascii_cut, dict, unicode};
 
 /// The certified jieba 0.42.1 dictionary, byte for byte (design §4.3).
@@ -196,23 +198,62 @@ fn tokenize_normalised(normalised: &str) -> Vec<String> {
     finish(words)
 }
 
-/// The multilingual word pipeline (plan §5.1 L1).
+/// The multilingual word pipeline (plan §5.1 L1, L2b).
 ///
 /// Same post-rules and filters as [`tokenize_normalised`], but the word
 /// boundaries are [`is_word_character`] and a word run the reference classifier
 /// would have shredded emits its code points *and* the whole run: the
 /// code-point tokens are what ru/ar/hi recall depends on, so they are never
 /// replaced.  CJK runs still go through the jieba path of [`emit_block`].
-pub(crate) fn tokenize_multilingual(normalised: &str) -> Vec<String> {
+///
+/// `original` is the text before [`crate::analysis::normalize`] and is read for
+/// [`Language::De`] only: its word run also carries the deaccented spelling
+/// FTS5 `unicode61` indexes for an umlaut, which the umlaut expansion in the
+/// fold would otherwise cost (see [`emit_segment`]).
+pub(crate) fn tokenize_multilingual(
+    language: Language,
+    normalised: &str,
+    original: &str,
+) -> Vec<String> {
+    // Both extra German spellings come from the pre-fold text, and the fold's
+    // maps never move a word boundary, so their word runs pair up with
+    // `normalised`'s one for one.  Text without an umlaut needs neither.
+    let (accented_text, deaccented_text) =
+        if language == Language::De && has_german_umlaut(original) {
+            (
+                unicode::lower(&unicode::nfkc(original)),
+                normalize::deaccent(original),
+            )
+        } else {
+            (String::new(), String::new())
+        };
+    let accented = word_runs(&accented_text);
+    let deaccented = word_runs(&deaccented_text);
+    let mut variants = accented.iter().zip(deaccented.iter());
     let mut words: Vec<String> = Vec::new();
+    for_each_segment(normalised, |kind, segment| {
+        let variant = if kind == Segment::Word {
+            variants
+                .next()
+                .map(|(accented, deaccented)| (*accented, *deaccented))
+        } else {
+            None
+        };
+        emit_segment(segment, kind, variant, &mut words);
+    });
+    finish(words)
+}
+
+/// Walk `text` as its maximal multilingual segments, in order.
+fn for_each_segment<'a>(text: &'a str, mut emit: impl FnMut(Segment, &'a str)) {
     let mut block_start = 0_usize;
     let mut block_kind: Option<Segment> = None;
-    for (index, character) in normalised.char_indices() {
+    for (index, character) in text.char_indices() {
         let kind = segment(character);
         match block_kind {
             Some(state) if state == kind => {}
             Some(state) => {
-                emit_segment(&normalised[block_start..index], state, &mut words);
+                emit(state, &text[block_start..index]);
                 block_start = index;
                 block_kind = Some(kind);
             }
@@ -223,9 +264,19 @@ pub(crate) fn tokenize_multilingual(normalised: &str) -> Vec<String> {
         }
     }
     if let Some(kind) = block_kind {
-        emit_segment(&normalised[block_start..], kind, &mut words);
+        emit(kind, &text[block_start..]);
     }
-    finish(words)
+}
+
+/// The word runs of `text`, in order, without emitting anything.
+fn word_runs(text: &str) -> Vec<&str> {
+    let mut runs = Vec::new();
+    for_each_segment(text, |kind, segment| {
+        if kind == Segment::Word {
+            runs.push(segment);
+        }
+    });
+    runs
 }
 
 /// One multilingual segment: `re_han_default`'s CJK range, a word run, or a
@@ -251,16 +302,39 @@ fn segment(character: char) -> Segment {
 }
 
 /// Emit one multilingual segment.
-fn emit_segment(segment: &str, kind: Segment, out: &mut Vec<String>) {
+fn emit_segment(
+    segment: &str,
+    kind: Segment,
+    variant: Option<(&str, &str)>,
+    out: &mut Vec<String>,
+) {
     match kind {
         Segment::Cjk => emit_block(segment, true, out),
-        // An ASCII run already reaches the word level in the reference
-        // pipeline, so it has no code-point tokens to preserve; emitting them
-        // would only spend the query expression budget on characters.
-        Segment::Word if segment.is_ascii() => out.push(segment.to_owned()),
-        // Dual emission: the code points the reference pipeline would have
-        // produced, then the whole run.  A one-code-point run is not repeated.
         Segment::Word => {
+            // L2b: a German word the umlaut expansion transliterated also
+            // carries the spelling FTS `unicode61` indexes for the umlaut, so
+            // both ASCII spellings reach the word.  Order: the pre-fold code
+            // points, the transliteration, the deaccented spelling.
+            if let Some((accented, deaccented)) = variant {
+                if has_german_umlaut(accented) {
+                    out.extend(accented.chars().map(String::from));
+                    out.push(segment.to_owned());
+                    if deaccented != segment {
+                        out.push(deaccented.to_owned());
+                    }
+                    return;
+                }
+            }
+            // An ASCII run already reaches the word level in the reference
+            // pipeline, so it has no code-point tokens to preserve; emitting
+            // them would only spend the query expression budget on characters.
+            if segment.is_ascii() {
+                out.push(segment.to_owned());
+                return;
+            }
+            // Dual emission: the code points the reference pipeline would have
+            // produced, then the whole run.  A one-code-point run is not
+            // repeated.
             out.extend(segment.chars().map(String::from));
             if segment.chars().count() > 1 {
                 out.push(segment.to_owned());
@@ -268,6 +342,14 @@ fn emit_segment(segment: &str, kind: Segment, out: &mut Vec<String>) {
         }
         Segment::Other => out.extend(segment.chars().map(String::from)),
     }
+}
+
+/// Whether `word` contains a character the German fold expands into two
+/// letters: such a word has a transliteration and a deaccented spelling that
+/// differ, and both have to be emitted.
+fn has_german_umlaut(word: &str) -> bool {
+    word.chars()
+        .any(|character| matches!(character, 'ä' | 'ö' | 'ü' | 'ß' | 'Ä' | 'Ö' | 'Ü'))
 }
 
 /// Rules 3-5 and the final filter, over the words a splitter produced.

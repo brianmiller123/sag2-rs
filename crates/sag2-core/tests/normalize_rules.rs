@@ -194,20 +194,56 @@ fn german_expands_the_umlauts() {
 }
 
 #[test]
-fn german_typing_without_the_umlaut_reaches_the_same_token_stream() {
+fn german_emits_the_code_points_and_both_ascii_spellings() {
+    // `fold_script` turns `Müller` into the transliteration `mueller`, which
+    // FTS5 `unicode61` cannot map back to the deaccented `muller`.  The word
+    // run therefore keeps its code points and carries both spellings, in the
+    // order: code points, transliteration, deaccented spelling.  A query typed
+    // either way reaches the tokens the build stored.
     let german = Profile::Multilingual {
         language: Language::De,
     };
-    for (accented, transliterated) in [
-        ("Müller", "Mueller"),
-        ("für", "fuer"),
-        ("Straße", "Strasse"),
-        ("Fußgänger", "Fussgaenger"),
-    ] {
-        assert_eq!(
-            tokens(german, accented),
-            tokens(german, transliterated),
-            "{accented:?}"
+    assert_eq!(
+        tokens(german, "Müller"),
+        ["m", "ü", "l", "l", "e", "r", "mueller", "muller"]
+    );
+    assert_eq!(
+        tokens(german, "Bäckerei"),
+        [
+            "b",
+            "ä",
+            "c",
+            "k",
+            "e",
+            "r",
+            "e",
+            "i",
+            "baeckerei",
+            "backerei"
+        ]
+    );
+    // `ß` is the shared Latin fold's business: `strasse` is both the
+    // transliteration and the deaccented spelling, so it is emitted once.  The
+    // code-point prefix still goes through the reference filters, which drop
+    // the stopword `a`.
+    assert_eq!(
+        tokens(german, "Straße"),
+        ["s", "t", "r", "ß", "e", "strasse"]
+    );
+}
+
+#[test]
+fn only_german_gets_the_second_ascii_spelling() {
+    // The extra spelling is a German rule, read from the pre-fold text: the
+    // same text under another language keeps its L1 stream.
+    for language in [Language::Fr, Language::Other, Language::Pl] {
+        let profile = Profile::Multilingual { language };
+        let stream = tokens(profile, "Müller");
+        assert!(
+            !stream
+                .iter()
+                .any(|token| token == "mueller" || token == "muller"),
+            "{profile}: {stream:?}"
         );
     }
 }

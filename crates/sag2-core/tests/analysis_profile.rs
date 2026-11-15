@@ -67,8 +67,12 @@ fn a_multilingual_profile_normalises_before_the_certified_pipeline() {
         language: Language::De,
     };
     // Foldable text reaches different tokens through the multilingual profile:
-    // `ß` becomes `ss` before the tokenizer runs.
-    assert_eq!(tokens(german, "Straße"), ["strasse"]);
+    // `ß` becomes `ss` before the tokenizer runs, and the word run keeps the
+    // code points the fold would have dropped (L2b).
+    assert_eq!(
+        tokens(german, "Straße"),
+        ["s", "t", "r", "ß", "e", "strasse"]
+    );
     assert_ne!(tokenize("Straße"), tokens(german, "Straße"));
 
     // Text the fold does not touch keeps the certified tokens wherever the two

@@ -97,9 +97,18 @@ fn a_multilingual_index_matches_case_and_orthography_variants() {
     let (directory, index) = build(GERMAN);
 
     // The build stored `strasse` for the `ß` title; both spellings reach it.
-    for query in ["Straße", "STRASSE", "strasse"] {
+    // `Straße` carries the code-point prefix L2b keeps for a German word run,
+    // the two ASCII spellings are one term each.
+    for (query, expected) in [
+        (
+            "Straße",
+            "\"s\" OR \"t\" OR \"r\" OR \"ß\" OR \"e\" OR \"strasse\"",
+        ),
+        ("STRASSE", "\"strasse\""),
+        ("strasse", "\"strasse\""),
+    ] {
         let expression = index.match_query(query).expect("expression");
-        assert_eq!(expression, "\"strasse\"", "{query:?}");
+        assert_eq!(expression, expected, "{query:?}");
         let hits = index
             .retrieve(&expression, &Default::default(), 5, None)
             .expect("retrieve");
@@ -210,14 +219,20 @@ fn a_word_token_is_what_makes_the_diacritic_free_query_match() {
     }
 }
 
-/// The German fold's reason to exist: the realistic ASCII spelling of `Müller`
-/// is the transliteration `mueller`, and FTS5 `unicode61` removes the umlaut
-/// (`müller` indexes as `muller`) but cannot bridge `muller` to `mueller`.
+/// The German fold's reason to exist, and why one spelling is not enough: the
+/// realistic ASCII spellings of `Müller` are the transliteration `mueller` and
+/// the deaccented `muller`.  FTS5 `unicode61` removes the umlaut (`müller`
+/// indexes as `muller`) but cannot bridge it to `mueller`; the fold adds the
+/// transliteration, and the word run emits the deaccented spelling from the
+/// pre-fold text so the fold cannot cost it.
+///
+/// The document title is deliberately not the umlaut word: the title-alias
+/// repair must not be what makes `muller` match.
 #[test]
-fn the_german_fold_makes_the_transliterated_query_match() {
+fn both_german_ascii_spellings_reach_the_umlaut_document() {
     let documents = [
         Document {
-            title: "Müller",
+            title: "Profil",
             text: "Müller arbeitet am Bahnhof.",
             path: None,
             idx: None,
@@ -231,17 +246,30 @@ fn the_german_fold_makes_the_transliterated_query_match() {
     ];
     let (_directory, index) = build_documents(GERMAN, &documents);
 
-    for query in ["Müller", "mueller", "MUELLER"] {
+    for query in ["Müller", "mueller", "MUELLER", "muller"] {
         let expression = index
             .match_query_with(QueryMode::Lexical, query)
             .expect("expression");
-        assert_eq!(expression, "\"mueller\"", "{query:?}");
         let hits = index
             .retrieve(&expression, &Default::default(), 10, None)
             .expect("retrieve");
         assert!(
-            hits.iter().any(|hit| hit.title == "Müller"),
-            "{query:?} must reach the `Müller` document"
+            hits.iter().any(|hit| hit.title == "Profil"),
+            "{query:?} must reach the `Müller` document through {expression:?}"
         );
     }
+
+    // The accented query carries both spellings; the ASCII inputs are already
+    // one term, so the emission stays off the expression budget.
+    let accented = index
+        .match_query_with(QueryMode::Lexical, "Müller")
+        .expect("expression");
+    assert!(accented.contains("\"mueller\""), "{accented}");
+    assert!(accented.contains("\"muller\""), "{accented}");
+    assert_eq!(
+        index
+            .match_query_with(QueryMode::Lexical, "muller")
+            .expect("expression"),
+        "\"muller\""
+    );
 }

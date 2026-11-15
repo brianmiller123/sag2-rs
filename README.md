@@ -175,7 +175,7 @@ reads back through the pipeline that built it.
 | Thai | `multilingual-v1-th` | `newmm` words (nlpo3 + CC0 word list) | 0.92 | +0.00 | measured |
 | Japanese | `multilingual-v1-ja` | `lindera` words (runtime dictionary) | - | - | dictionary required |
 | Korean | `multilingual-v1-ko` | word runs (no dictionary, no morphological analysis) | 1.00 | +0.00 | measured |
-| German | `multilingual-v1-de` | normalise (shared Latin fold + `ä/ö/ü`→`ae/oe/ue`) + word runs | 1.00 | +0.00 | measured |
+| German | `multilingual-v1-de` | normalise (shared Latin fold + `ä/ö/ü`→`ae/oe/ue`) + word runs with both ASCII spellings | 1.00 | +0.00 | measured |
 | French | `multilingual-v1-fr` | normalise (shared fold) + word runs | 1.00 | +0.00 | measured |
 | Chinese | `sag2-zh-v1` | jieba 0.42.1 words (the reference pipeline) | 0.75 | +0.00 | measured |
 | English | `sag2-zh-v1` | ASCII words (the reference pipeline) | 1.00 | +0.00 | measured |
@@ -192,11 +192,15 @@ Typing without diacritics does not need a fold for French or Polish: FTS5
 `unicode61` removes diacritics by default, and the whole-word token the word run
 stores is what puts the accented word in the body, so `bibliotheque` reaches
 `bibliothèque`.  Stripping the marks in `normalize` would only merge homographs
-(`cote`/`côté`/`côte`) for recall the word run already banked.  German is the
-exception the fold exists for: an ASCII keyboard spells `Müller` as the
-transliteration `mueller`, which FTS cannot bridge from the diacritic-free
-`muller`, so `multilingual-v1-de` expands `ä/ö/ü` to `ae/oe/ue`.  Both rules are
-pinned by `crates/sag2-index/tests/profile_queries.rs`.
+(`cote`/`côté`/`côte`) for recall the word run already banked.
+
+German is the exception the fold exists for: an ASCII keyboard spells `Müller`
+as the transliteration `mueller`, which FTS cannot bridge from the
+diacritic-free `muller`, so `multilingual-v1-de` expands `ä/ö/ü` to `ae/oe/ue`.
+The fold alone would trade one spelling for the other, so the German word run
+emits its code points and *both* ASCII spellings (`müller` → `mueller` and
+`muller`); no other language gets that emission.  Both rules are pinned by
+`crates/sag2-index/tests/profile_queries.rs`.
 
 The `state` column is what the fixture asserts:
 
