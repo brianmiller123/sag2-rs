@@ -4,16 +4,20 @@
 //! the only profile that reproduces the Python token stream byte for byte.
 //! [`Profile::Multilingual`] is the word-level pipeline for one language: it
 //! runs [`normalize::normalize`] before the same §4 tokenizer, so accent, case
-//! and orthographic variants of a word collapse onto one term.  The identifier
-//! a profile persists in an index (`rust_index_metadata.analysis`) comes from
-//! [`Profile::as_str`].
+//! and orthographic variants of a word collapse onto one term.  A language that
+//! writes without spaces ([`Language::Th`]) replaces the §4 word boundaries
+//! with its own segmenter (see [`segment`]) and shares the rest: the certified
+//! ASCII model and the final filters.  The identifier a profile persists in an
+//! index (`rust_index_metadata.analysis`) comes from [`Profile::as_str`].
 
 use std::fmt;
 use std::str::FromStr;
 
 pub mod normalize;
+pub mod segment;
 
-use crate::tokenize::tokenize_default;
+use crate::ascii_cut;
+use crate::tokenize::{keep, tokenize_default};
 
 /// The language a multilingual profile is built for.
 ///
@@ -188,14 +192,42 @@ impl FromStr for Profile {
 /// [`Profile::Sag2ZhV1`] is the certified pipeline and what [`crate::tokenize()`]
 /// always uses; it does not enter [`normalize`] at all, so its token stream and
 /// allocations are the ones the goldens pin.  [`Profile::Multilingual`] runs
-/// [`normalize::normalize`] for its language and then the same §4 tokenizer.
+/// [`normalize::normalize`] for its language and then the same §4 tokenizer -
+/// except for [`Language::Th`], where [`thai_tokens`] supplies the word
+/// boundaries and keeps the certified ASCII model and the final filters.
 pub fn tokenize_with(profile: Profile, text: &str) -> Vec<String> {
     match profile {
         Profile::Sag2ZhV1 => tokenize_default(text),
         Profile::Multilingual { language } => {
-            tokenize_default(&normalize::normalize(language, text))
+            let normalised = normalize::normalize(language, text);
+            match language {
+                Language::Th => thai_tokens(&normalised),
+                _ => tokenize_default(&normalised),
+            }
         }
     }
+}
+
+/// The Thai pipeline: `normalize` -> `newmm` -> ASCII runs through the
+/// certified ASCII model -> the reference `HAS_CONTENT`/stopword filter.
+///
+/// `newmm` hands back one token per ASCII run, but its rules for that run are
+/// not the ones §4.2 certifies (no `[._-]` compounds, no patched `finalseg`).
+/// Passing the run to [`ascii_cut::cut_run`] keeps one ASCII tokenizer for every
+/// profile.  The reference `[._-]` split and the 2-/3-codepoint `FREQ`
+/// expansion do not apply: a Thai word is exactly what the segmenter produced,
+/// so `newmm`'s boundaries are the only word boundaries.
+fn thai_tokens(normalised: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    for word in segment::thai::segment(normalised) {
+        if word.is_ascii() {
+            ascii_cut::cut_run(&word, &mut tokens);
+        } else {
+            tokens.push(word);
+        }
+    }
+    tokens.retain(|token| keep(token));
+    tokens
 }
 
 #[cfg(test)]

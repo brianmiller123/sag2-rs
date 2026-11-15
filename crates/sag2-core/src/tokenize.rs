@@ -238,6 +238,7 @@ fn post_process(word: &str, out: &mut Vec<String>) {
     out.push(word.to_owned());
 }
 
-fn keep(token: &str) -> bool {
+/// `HAS_CONTENT` and `STOPWORDS`, the final filter every profile ends in.
+pub(crate) fn keep(token: &str) -> bool {
     has_content(token) && STOPWORDS.binary_search(&token).is_err()
 }

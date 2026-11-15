@@ -11,6 +11,9 @@ license.workspace = true
 # certified jieba 0.42.1 `dict.txt` is the only dictionary this port loads
 # (design §4.3).
 jieba-rs = { version = "0.7.4", default-features = false }
+# Thai word segmentation (`multilingual-v1-th`).  The crate ships the newmm
+# algorithm only, so the word list comes from `data/thai/words_th.txt`.
+nlpo3 = "1.4"
 
 [build-dependencies]
 flate2 = "1.1"

@@ -58,3 +58,28 @@ The digest is also recorded as `uca_keys_sha256` in the index provenance
 
 License: the DUCET file is distributed under the Unicode Terms of Use
 (https://www.unicode.org/copyright.html).
+
+# Third-party data: Thai `thai/words_th.txt`
+
+`thai/words_th.txt` is the `words_th` corpus word list that ships with
+**PyThaiNLP**, the dictionary the reference `newmm` tokenizer reads:
+
+| field | value |
+| --- | --- |
+| source | `https://raw.githubusercontent.com/PyThaiNLP/pythainlp/dev/pythainlp/corpus/words_th.txt` |
+| sha256 | `12bf4d04e8d59a8b235eb9e7ac59b18e5f4d56320f25e75e9c9f8f565543b481` |
+| bytes | 1,520,294 |
+| lines | 62,109 |
+| license | CC0-1.0 (public domain dedication) |
+
+It is vendored because `nlpo3` 1.4.0 (Apache-2.0) implements Thai `newmm`
+segmentation but ships no dictionary. One word per line; 611 of the lines are
+multi-word expressions that keep their inner spaces (`newmm` matches them as one
+unit). The port reads the file at build time only: `include_str!` in
+`crates/sag2-core/src/analysis/segment/thai.rs` builds the tokenizer trie once
+per process, so `multilingual-v1-th` builds and runs offline and every build
+segments with the same list.
+
+The file is unmodified; any local edit changes every `multilingual-v1-th` token
+stream and invalidates the pinned segmentations in
+`crates/sag2-core/tests/thai_segmentation.rs`.
