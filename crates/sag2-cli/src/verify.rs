@@ -1541,6 +1541,27 @@ fn expected_rust_metadata() -> BTreeMap<&'static str, &'static str> {
     .collect()
 }
 
+/// The `rust_index_metadata/keys` comparison, as the `(expected, actual)`
+/// strings a failure reports.
+///
+/// `expected` is what this build declares and `golden` what the recorded
+/// fixtures require.  The goldens record the design §3.3 v1 key set, which
+/// every build still has to carry; `analysis` is the multilingual plan's
+/// addition to that set, and design §3.2 rule 4 makes an unknown key ignorable
+/// for a 1.x reader.  So the declared set is compared exactly (an undeclared
+/// key is a failure) and the recorded set as a required subset.
+fn metadata_key_failure(
+    expected: &[&str],
+    actual: &[&str],
+    golden: &[&str],
+) -> Option<(String, String)> {
+    let golden_missing = golden.iter().filter(|key| !actual.contains(*key)).count();
+    if actual == expected && golden_missing == 0 {
+        return None;
+    }
+    Some((format!("{expected:?}"), format!("{actual:?}")))
+}
+
 /// Counts of the D1/D3/D4 sub-checks, so the gate report shows they ran.
 #[derive(Default)]
 struct SubChecks {
@@ -1936,22 +1957,10 @@ fn compare_index(
     actual_keys.sort_unstable();
     let mut golden_keys: Vec<&str> = golden_keys.iter().map(String::as_str).collect();
     golden_keys.sort_unstable();
-    // The goldens record the design §3.3 v1 key set, which every build still
-    // has to carry; `analysis` is the multilingual plan's addition to that set,
-    // and design §3.2 rule 4 makes an unknown key ignorable for a 1.x reader.
-    // `actual_keys == expected_keys` keeps the written set exact either way, so
-    // an undeclared key is still a failure.
-    let golden_missing = golden_keys
-        .iter()
-        .filter(|key| !actual_keys.contains(*key))
-        .count();
-    if actual_keys != expected_keys || golden_missing != 0 {
-        gate.push(
-            fixture,
-            "rust_index_metadata/keys",
-            format!("{golden_keys:?}"),
-            format!("{actual_keys:?}"),
-        );
+    if let Some((expected, actual)) =
+        metadata_key_failure(&expected_keys, &actual_keys, &golden_keys)
+    {
+        gate.push(fixture, "rust_index_metadata/keys", expected, actual);
     }
     for (key, expected) in expected_metadata {
         match actual_metadata.get(*key) {
@@ -5073,7 +5082,9 @@ fn run_gate_c(options: &Options) -> Result<ExitCode, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{check, display_text, serialise_spans, Case, Failure, HitGolden};
+    use super::{
+        check, display_text, metadata_key_failure, serialise_spans, Case, Failure, HitGolden,
+    };
     use sag2_index::Hit;
 
     fn bits(value: f64) -> String {
@@ -5193,6 +5204,27 @@ mod tests {
         assert_eq!(serialise_spans(&[(0, 4)]), "[[0,4]]");
         assert_eq!(serialise_spans(&[(0, 4), (6, 9)]), "[[0,4],[6,9]]");
         assert_eq!(serialise_spans(&[]), "[]");
+    }
+
+    #[test]
+    fn the_provenance_key_failure_names_the_declared_set() {
+        let expected = ["analysis", "format_version"];
+        let actual = ["format_version"];
+        let golden = ["format_version"];
+
+        // The build dropped a declared key: the expected column is the
+        // declared set, not the golden's, which does not carry `analysis`.
+        let (expected_column, actual_column) =
+            metadata_key_failure(&expected, &actual, &golden).expect("a key-set failure");
+        assert_eq!(expected_column, format!("{expected:?}"));
+        assert_eq!(actual_column, format!("{actual:?}"));
+
+        // A missing golden key still fails and still names the declared set.
+        let (expected_column, _) =
+            metadata_key_failure(&expected, &["analysis"], &golden).expect("a golden-key failure");
+        assert_eq!(expected_column, format!("{expected:?}"));
+
+        assert_eq!(metadata_key_failure(&expected, &expected, &golden), None);
     }
 
     #[test]

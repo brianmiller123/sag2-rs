@@ -96,11 +96,13 @@ pub fn sqlite_version() -> &'static str {
     rusqlite::version()
 }
 
-/// One opened index: statistics, a read-only connection pool and the signature
-/// it was validated against (`sag2.py:174-206` `CorpusIndex`).
+/// One opened index: statistics, a read-only connection pool, the signature it
+/// was validated against and the analysis profile it was built with
+/// (`sag2.py:174-206` `CorpusIndex`).
 pub struct CorpusIndex {
     path: PathBuf,
     signature: String,
+    profile: Profile,
     statistics: Statistics,
     pool: pool::QueryPool,
     /// `self.frequencies`, the mutable frequency memo (`sag2.py:551-583`).
@@ -113,6 +115,7 @@ impl CorpusIndex {
     pub(crate) fn new(
         path: PathBuf,
         signature: String,
+        profile: Profile,
         statistics: Statistics,
         pool: pool::QueryPool,
     ) -> Self {
@@ -120,6 +123,7 @@ impl CorpusIndex {
         CorpusIndex {
             path,
             signature,
+            profile,
             statistics,
             pool,
             frequencies: Mutex::new(frequencies),
@@ -135,6 +139,15 @@ impl CorpusIndex {
     /// The validated `metadata.signature`.
     pub fn signature(&self) -> &str {
         &self.signature
+    }
+
+    /// The analysis profile this index was built and opened with
+    /// (`rust_index_metadata.analysis`).
+    ///
+    /// Query-side tokenisation uses it, so the query stream and the stored
+    /// stream always come from the same pipeline.
+    pub fn profile(&self) -> Profile {
+        self.profile
     }
 
     /// Corpus statistics loaded from `index_statistics`.

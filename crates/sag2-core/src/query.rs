@@ -8,10 +8,16 @@
 //! [`QueryMode::Phrase3`] is query-side only: it builds word phrases and their
 //! three-token windows from the same token stream, so no index, schema or
 //! stored token changes for it.
+//!
+//! Both modes tokenise the query with a [`Profile`].  `match_query` stays on
+//! [`Profile::Sag2ZhV1`] - the certified expression - while
+//! [`match_query_with`] takes the profile of the index being queried, so a
+//! query can never be tokenised by a different pipeline than the one that
+//! produced the stored tokens.
 
 use std::collections::HashSet;
 
-use crate::tokenize;
+use crate::{tokenize_with, Profile};
 
 /// The cap both modes apply to the number of expression terms (`[:80]`,
 /// `sag2.py:95-97`).
@@ -49,22 +55,31 @@ pub fn quote_term(term: &str) -> String {
     quoted
 }
 
-/// `match_query`: the de-duplicated `OR` of quoted tokens (`sag2.py:69-89`).
+/// `match_query`: the de-duplicated `OR` of quoted tokens (`sag2.py:69-89`),
+/// tokenised by the reference [`Profile::Sag2ZhV1`] pipeline.
 pub fn match_query(query: &str) -> String {
-    let mut terms = deduped_tokens(query);
+    lexical_expression(Profile::Sag2ZhV1, query)
+}
+
+/// The de-duplicated `OR` of quoted tokens for `profile`, capped at the
+/// expression budget.
+fn lexical_expression(profile: Profile, query: &str) -> String {
+    let mut terms = deduped_tokens(profile, query);
     terms.truncate(EXPRESSION_TERM_BUDGET);
     join_terms(&terms)
 }
 
-/// The expression for `query` built by `mode`.
+/// The expression for `query` built by `mode` and tokenised by `profile`.
 ///
-/// [`QueryMode::Lexical`] is exactly [`match_query`]: byte-identical, so the
-/// default path cannot move.
+/// [`QueryMode::Lexical`] with [`Profile::Sag2ZhV1`] is exactly
+/// [`match_query`]: byte-identical, so the default path cannot move.  Callers
+/// pass the profile of the index they are querying, so the query stream and the
+/// stored stream always come from the same pipeline.
 ///
 /// # `Phrase3` construction
 ///
-/// The query is split on whitespace and every chunk is tokenised with the
-/// reference tokenizer, keeping token order (no early deduplication).  A
+/// The query is split on whitespace and every chunk is tokenised with
+/// `profile`, keeping token order (no early deduplication).  A
 /// one-token chunk contributes its quoted term; a longer chunk contributes the
 /// whole chunk as one quoted phrase and then every three-token window of it.
 ///
@@ -72,10 +87,10 @@ pub fn match_query(query: &str) -> String {
 /// it contributes the three-token windows of the whole token stream, plus the
 /// whole stream as one phrase when the stream is at most three tokens.
 ///
-/// The [`match_query`] unigrams are always appended as the fallback: exact
-/// phrases alone lose Korean recall (90.5% to 49.4% R@10 in the plan's
-/// measurements), where the character unigrams act as an accidental stemmer
-/// for the agglutinative particles.  Terms already emitted as phrases are not
+/// The [`match_query`] unigrams (built with the same `profile`) are always
+/// appended as the fallback: exact phrases alone lose Korean recall (90.5% to
+/// 49.4% R@10 in the plan's measurements), where the character unigrams act as
+/// an accidental stemmer for the agglutinative particles.  Terms already emitted as phrases are not
 /// repeated.
 ///
 /// # Budget
@@ -85,19 +100,19 @@ pub fn match_query(query: &str) -> String {
 /// unigrams - but eight slots are held back for the unigram fallback whenever
 /// the query has that many distinct unigrams, so truncation can never drop the
 /// whole fallback.
-pub fn match_query_with(mode: QueryMode, query: &str) -> String {
+pub fn match_query_with(mode: QueryMode, profile: Profile, query: &str) -> String {
     match mode {
-        QueryMode::Lexical => match_query(query),
-        QueryMode::Phrase3 => match_query_phrase3(query),
+        QueryMode::Lexical => lexical_expression(profile, query),
+        QueryMode::Phrase3 => match_query_phrase3(profile, query),
     }
 }
 
 /// `tokenize(query)` with the first occurrence of each token kept
 /// (`list(dict.fromkeys(...))`).
-fn deduped_tokens(query: &str) -> Vec<String> {
+fn deduped_tokens(profile: Profile, query: &str) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut terms = Vec::new();
-    for term in tokenize(query) {
+    for term in tokenize_with(profile, query) {
         if seen.insert(term.clone()) {
             terms.push(term);
         }
@@ -114,9 +129,9 @@ fn join_terms(terms: &[String]) -> String {
 }
 
 /// [`QueryMode::Phrase3`]: phrases first, then the unigram fallback.
-fn match_query_phrase3(query: &str) -> String {
-    let unigrams = deduped_tokens(query);
-    let mut terms = phrase_terms(query);
+fn match_query_phrase3(profile: Profile, query: &str) -> String {
+    let unigrams = deduped_tokens(profile, query);
+    let mut terms = phrase_terms(profile, query);
     let reserve = UNIGRAM_RESERVE.min(unigrams.len());
     terms.truncate(EXPRESSION_TERM_BUDGET - reserve);
     let mut emitted: HashSet<String> = terms.iter().cloned().collect();
@@ -133,11 +148,11 @@ fn match_query_phrase3(query: &str) -> String {
 
 /// The phrase terms of `query` in priority order: every whole-chunk phrase,
 /// then every three-token window.  Duplicates keep their first position.
-fn phrase_terms(query: &str) -> Vec<String> {
+fn phrase_terms(profile: Profile, query: &str) -> Vec<String> {
     let mut phrases = Vec::new();
     let mut seen = HashSet::new();
     if query.split_whitespace().count() <= 1 {
-        let tokens = tokenize(query);
+        let tokens = tokenize_with(profile, query);
         if tokens.len() <= 3 {
             push_phrase(&mut phrases, &mut seen, &tokens);
         }
@@ -146,7 +161,10 @@ fn phrase_terms(query: &str) -> Vec<String> {
         }
         return phrases;
     }
-    let chunks: Vec<Vec<String>> = query.split_whitespace().map(tokenize).collect();
+    let chunks: Vec<Vec<String>> = query
+        .split_whitespace()
+        .map(|chunk| tokenize_with(profile, chunk))
+        .collect();
     for tokens in &chunks {
         push_phrase(&mut phrases, &mut seen, tokens);
     }
@@ -171,6 +189,7 @@ fn push_phrase(phrases: &mut Vec<String>, seen: &mut HashSet<String>, tokens: &[
 #[cfg(test)]
 mod tests {
     use super::{match_query, match_query_with, quote_term, QueryMode};
+    use crate::Profile;
 
     #[test]
     fn quotes_by_doubling_embedded_quotes() {
@@ -194,11 +213,15 @@ mod tests {
         // The strings this module already pinned must come through
         // `match_query_with(Lexical, ..)` byte for byte.
         assert_eq!(
-            match_query_with(QueryMode::Lexical, "Anchor anchor"),
+            match_query_with(QueryMode::Lexical, Profile::Sag2ZhV1, "Anchor anchor"),
             match_query("Anchor anchor")
         );
         assert_eq!(
-            match_query_with(QueryMode::Lexical, "Where was Alston born?"),
+            match_query_with(
+                QueryMode::Lexical,
+                Profile::Sag2ZhV1,
+                "Where was Alston born?"
+            ),
             match_query("Where was Alston born?")
         );
     }
@@ -208,15 +231,23 @@ mod tests {
         // One-token chunks are quoted terms; the unigram fallback repeats
         // nothing already emitted.
         assert_eq!(
-            match_query_with(QueryMode::Phrase3, "Anchor anchor"),
+            match_query_with(QueryMode::Phrase3, Profile::Sag2ZhV1, "Anchor anchor"),
             "\"anchor\""
         );
         assert_eq!(
-            match_query_with(QueryMode::Phrase3, "Where was Alston born?"),
+            match_query_with(
+                QueryMode::Phrase3,
+                Profile::Sag2ZhV1,
+                "Where was Alston born?"
+            ),
             "\"alston\" OR \"born\""
         );
         assert_eq!(
-            match_query_with(QueryMode::Phrase3, "anchor birthplace depicts"),
+            match_query_with(
+                QueryMode::Phrase3,
+                Profile::Sag2ZhV1,
+                "anchor birthplace depicts"
+            ),
             "\"anchor\" OR \"birthplace\" OR \"depicts\""
         );
     }
@@ -226,7 +257,11 @@ mod tests {
         // No whitespace: three-token windows over the whole stream and then
         // the unigrams; the seven-token stream is too long to be one phrase.
         assert_eq!(
-            match_query_with(QueryMode::Phrase3, "中华人民共和国成立了"),
+            match_query_with(
+                QueryMode::Phrase3,
+                Profile::Sag2ZhV1,
+                "中华人民共和国成立了"
+            ),
             concat!(
                 "\"中华 华人 人民\" OR \"华人 人民 共和\" OR ",
                 "\"人民 共和 共和国\" OR \"共和 共和国 中华人民共和国\" OR ",
@@ -235,7 +270,7 @@ mod tests {
             )
         );
         assert_eq!(
-            match_query_with(QueryMode::Phrase3, "北京大学在哪里"),
+            match_query_with(QueryMode::Phrase3, Profile::Sag2ZhV1, "北京大学在哪里"),
             concat!(
                 "\"北京 大学 北京大学\" OR \"大学 北京大学 哪里\" OR ",
                 "\"北京\" OR \"大学\" OR \"北京大学\" OR \"哪里\""
@@ -248,7 +283,11 @@ mod tests {
         // Each tokenised word is a run of single characters, so the whole
         // chunk phrase and its windows carry the word order the unigrams lose.
         assert_eq!(
-            match_query_with(QueryMode::Phrase3, "кто родился в Москве"),
+            match_query_with(
+                QueryMode::Phrase3,
+                Profile::Sag2ZhV1,
+                "кто родился в Москве"
+            ),
             concat!(
                 "\"к т о\" OR \"р о д и л с я\" OR \"в\" OR \"м о с к в е\" OR ",
                 "\"р о д\" OR \"о д и\" OR \"д и л\" OR \"и л с\" OR \"л с я\" OR ",
@@ -258,7 +297,11 @@ mod tests {
             )
         );
         assert_eq!(
-            match_query_with(QueryMode::Phrase3, "памятник Александру Пушкину"),
+            match_query_with(
+                QueryMode::Phrase3,
+                Profile::Sag2ZhV1,
+                "памятник Александру Пушкину"
+            ),
             concat!(
                 "\"п а м я т н и к\" OR \"а л е к с а н д р у\" OR ",
                 "\"п у ш к и н у\" OR \"п а м\" OR \"а м я\" OR \"м я т\" OR ",
@@ -277,7 +320,11 @@ mod tests {
         // Thai has no whitespace: every window is a phrase over characters the
         // tokenizer surfaces one by one.
         assert_eq!(
-            match_query_with(QueryMode::Phrase3, "กรุงเทพมหานครเป็นเมืองหลวง"),
+            match_query_with(
+                QueryMode::Phrase3,
+                Profile::Sag2ZhV1,
+                "กรุงเทพมหานครเป็นเมืองหลวง"
+            ),
             concat!(
                 "\"ก ร ง\" OR \"ร ง เ\" OR \"ง เ ท\" OR \"เ ท พ\" OR \"ท พ ม\" OR ",
                 "\"พ ม ห\" OR \"ม ห า\" OR \"ห า น\" OR \"า น ค\" OR \"น ค ร\" OR ",
@@ -311,7 +358,7 @@ mod tests {
             .map(|chunk| chunk.iter().collect())
             .collect();
         let query = chunks.join(" ");
-        let expression = match_query_with(QueryMode::Phrase3, &query);
+        let expression = match_query_with(QueryMode::Phrase3, Profile::Sag2ZhV1, &query);
         let terms: Vec<&str> = expression.split(" OR ").collect();
         let phrase = |chunk: &str| {
             quote_term(

@@ -21,7 +21,7 @@
 //! that sample equality rests on the platform libm rounding these operations
 //! identically to the reference build.
 
-use sag2_core::{names, quote_term, QueryMode};
+use sag2_core::{names, quote_term, tokenize_with, Profile, QueryMode};
 use sag2_json::{compact_json, Value};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -30,9 +30,9 @@ use crate::pool::QUERY_WORKERS;
 use crate::retrieve::QueryError;
 use crate::CorpusIndex;
 
-/// `sag2.py:590,612` `" ".join(tokenize(...))`.
-fn tokenized_phrase(text: &str) -> String {
-    sag2_core::tokenize(text).join(" ")
+/// `sag2.py:590,612` `" ".join(tokenize(...))`, with the index's profile.
+fn tokenized_phrase(profile: Profile, text: &str) -> String {
+    tokenize_with(profile, text).join(" ")
 }
 
 /// One seed sentence as the reference builds it: the raw text plus the words
@@ -338,7 +338,10 @@ impl CorpusIndex {
         source: &str,
         excluded: &BTreeSet<i64>,
     ) -> Result<String, ExpansionError> {
-        if self.has_match(&quote_term(&tokenized_phrase(source)), excluded)? {
+        if self.has_match(
+            &quote_term(&tokenized_phrase(self.profile(), source)),
+            excluded,
+        )? {
             return Ok(source.to_owned());
         }
         let target = self
@@ -346,7 +349,10 @@ impl CorpusIndex {
             .aliases
             .get(&sag2_core::casefold(source))
             .ok_or_else(|| ExpansionError::UnknownAlias(source.to_owned()))?;
-        if self.has_match(&quote_term(&tokenized_phrase(target)), excluded)? {
+        if self.has_match(
+            &quote_term(&tokenized_phrase(self.profile(), target)),
+            excluded,
+        )? {
             Ok(target.clone())
         } else {
             Ok(source.to_owned())
@@ -358,17 +364,14 @@ impl CorpusIndex {
         self.match_query_with(QueryMode::Lexical, query)
     }
 
-    /// [`match_query`](Self::match_query) with an explicit
-    /// [`QueryMode`].
+    /// [`match_query`](Self::match_query) with an explicit [`QueryMode`].
     ///
-    /// `simplify:` the query is tokenised with the reference pipeline
-    /// ([`Profile::Sag2ZhV1`](sag2_core::Profile)) because a [`CorpusIndex`]
-    /// does not carry the profile it was opened with.  T6 of the multilingual
-    /// plan threads that profile through `CorpusIndex`; until then `Phrase3` on
-    /// a non-reference index would tokenise the query with the wrong pipeline.
+    /// The query is tokenised with the profile this index was opened with
+    /// ([`CorpusIndex::profile`]), so the query stream and the stored stream
+    /// always come from the same pipeline.
     pub fn match_query_with(&self, mode: QueryMode, query: &str) -> Result<String, ExpansionError> {
         let repaired = self.repair_names(query, &BTreeSet::new())?;
-        Ok(sag2_core::match_query_with(mode, &repaired))
+        Ok(sag2_core::match_query_with(mode, self.profile(), &repaired))
     }
 
     /// `sag2.py:585-663` `expansion_terms`.
@@ -389,11 +392,11 @@ impl CorpusIndex {
         for texts in &sentences {
             for text in texts {
                 let text: &str = text;
-                for word in sag2_core::tokenize(text) {
+                for word in tokenize_with(self.profile(), text) {
                     unknown.insert(word);
                 }
                 for range in names::names(text) {
-                    unknown.insert(tokenized_phrase(&text[range]));
+                    unknown.insert(tokenized_phrase(self.profile(), &text[range]));
                 }
             }
         }
@@ -426,7 +429,7 @@ impl CorpusIndex {
             }
         }
 
-        let original: BTreeSet<String> = sag2_core::tokenize(query).into_iter().collect();
+        let original: BTreeSet<String> = tokenize_with(self.profile(), query).into_iter().collect();
         // `max([0, *(seed["jev_score"] ...)])`.
         let max_score = seeds
             .iter()
@@ -445,7 +448,7 @@ impl CorpusIndex {
                 let mut end = 0;
                 let mut sentence_names = Vec::new();
                 for range in names::names(text) {
-                    let term = tokenized_phrase(&text[range.clone()]);
+                    let term = tokenized_phrase(self.profile(), &text[range.clone()]);
                     names_by_term
                         .entry(term.clone())
                         .or_insert_with(|| text[range.clone()].to_owned());
@@ -454,7 +457,8 @@ impl CorpusIndex {
                     ungrouped.push(' ');
                     end = range.end;
                 }
-                let mut words = sag2_core::tokenize(&format!("{ungrouped}{}", &text[end..]));
+                let mut words =
+                    tokenize_with(self.profile(), &format!("{ungrouped}{}", &text[end..]));
                 words.extend(sentence_names);
                 parsed.push(Sentence {
                     text: text.to_owned(),
@@ -482,7 +486,7 @@ impl CorpusIndex {
             for sentence in &parsed {
                 let mut context = 0.0_f64;
                 let mut visited: BTreeSet<String> = BTreeSet::new();
-                for term in sag2_core::tokenize(&sentence.text) {
+                for term in tokenize_with(self.profile(), &sentence.text) {
                     if !visited.insert(term.clone()) {
                         continue;
                     }
@@ -510,7 +514,7 @@ impl CorpusIndex {
                     };
             for (term, term_frequency) in &counts {
                 let document_frequency = self.frequency(term)?;
-                if sag2_core::tokenize(term)
+                if tokenize_with(self.profile(), term)
                     .iter()
                     .all(|word| original.contains(word))
                     || document_frequency == 0
@@ -590,7 +594,7 @@ impl CorpusIndex {
             if !self.has_match(&quote_term(&term.term), excluded)? {
                 let repaired = self.repair_names(&original, excluded)?;
                 if repaired != original {
-                    term.term = tokenized_phrase(&repaired);
+                    term.term = tokenized_phrase(self.profile(), &repaired);
                 }
             }
             if term.kind == ExpansionKind::NamePhrase

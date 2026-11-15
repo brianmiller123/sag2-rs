@@ -374,8 +374,9 @@ pub enum Decision {
 /// Apply the §3.4 decision table.
 ///
 /// `profile` is the analysis profile the caller reads with.  An index built
-/// under another profile is rejected under every [`RebuildPolicy`]: a rebuild
-/// would silently replace the token stream the file was built for.
+/// under another profile is rejected under every [`RebuildPolicy`] - before the
+/// signature is even considered - because a rebuild would silently replace the
+/// token stream the file was built for.
 pub fn decide(
     policy: RebuildPolicy,
     existing: &ExistingIndex,
@@ -399,6 +400,17 @@ pub fn decide(
         };
     }
 
+    // The analysis profile is checked before the corpus signature: an index
+    // built by another pipeline is refused whatever the signature says, because
+    // a rebuild would replace the token stream it was built for.
+    let analysis = existing
+        .rust_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get("analysis").map(String::as_str));
+    if let Err(error) = check_analysis(analysis, profile) {
+        return Decision::Reject(error);
+    }
+
     let stored = existing.signature.as_deref().unwrap_or_default();
     if stored != expected_signature {
         let field = changed_field(expected_signature, stored);
@@ -411,13 +423,10 @@ pub fn decide(
     }
 
     match &existing.rust_metadata {
-        None => match check_analysis(None, profile) {
-            Err(error) => Decision::Reject(error),
+        None => match policy {
             // Python-built index: readable, provenance is `Python`.
-            Ok(()) => match policy {
-                RebuildPolicy::Always => Decision::Rebuild(RebuildReason::CompiledIn),
-                RebuildPolicy::Strict | RebuildPolicy::OnCorpusChange => Decision::Reuse,
-            },
+            RebuildPolicy::Always => Decision::Rebuild(RebuildReason::CompiledIn),
+            RebuildPolicy::Strict | RebuildPolicy::OnCorpusChange => Decision::Reuse,
         },
         Some(metadata) => match check_versions(metadata, runtime, profile) {
             Err(error) => Decision::Reject(error),
@@ -677,6 +686,7 @@ fn open_readonly_with(
     Ok(CorpusIndex::new(
         path.to_owned(),
         stored,
+        profile,
         statistics,
         QueryPool::open(path, options)?,
     ))
@@ -1115,6 +1125,56 @@ mod tests {
             )),
             OpenError::AnalysisMismatch { index: None, .. }
         ));
+    }
+
+    #[test]
+    fn an_analysis_mismatch_wins_over_a_signature_change() {
+        // Both the signature and the profile disagree; the profile check runs
+        // first, so no policy may treat this as a rebuildable index.
+        let changed = existing(Some(OTHER), Some(current_metadata()));
+        for policy in [
+            RebuildPolicy::Strict,
+            RebuildPolicy::OnCorpusChange,
+            RebuildPolicy::Always,
+        ] {
+            match rejection(decide(
+                policy,
+                &changed,
+                EXPECTED,
+                &RUNTIME,
+                Profile::MultilingualV1,
+            )) {
+                OpenError::AnalysisMismatch { index, expected } => {
+                    assert_eq!(index.as_deref(), Some(Profile::Sag2ZhV1.as_str()));
+                    assert_eq!(expected, Profile::MultilingualV1);
+                }
+                other => panic!("{policy:?} must refuse by profile, got {other:?}"),
+            }
+        }
+
+        // Matching profiles keep the signature rules exactly as they were.
+        match rejection(decide(
+            RebuildPolicy::Strict,
+            &changed,
+            EXPECTED,
+            &RUNTIME,
+            Profile::Sag2ZhV1,
+        )) {
+            OpenError::IndexSignatureMismatch { field } => assert_eq!(field, "fingerprint"),
+            other => panic!("unexpected {other}"),
+        }
+        assert_eq!(
+            is_rebuild(decide(
+                RebuildPolicy::OnCorpusChange,
+                &changed,
+                EXPECTED,
+                &RUNTIME,
+                Profile::Sag2ZhV1
+            )),
+            Some(RebuildReason::SignatureChanged {
+                field: "fingerprint"
+            })
+        );
     }
 
     #[test]
