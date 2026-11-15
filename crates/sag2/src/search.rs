@@ -21,7 +21,7 @@ use std::time::Instant;
 use crate::judge::{BatchDetail, Judge, JudgeError, RoundUsage};
 use crate::{
     rank_dpp, CorpusIndex, DppError, ExpansionError, ExpansionQuery, ExpansionTerm, Hit,
-    QueryError, Seed, Usage, UsageBatch,
+    QueryError, QueryMode, Seed, Usage, UsageBatch,
 };
 
 /// One candidate: the retrieved chunk plus what the search loop adds.
@@ -58,6 +58,10 @@ pub struct SearchOptions {
     /// `context` (`sag2.py:939`): `Some` turns on the history branches of the
     /// judge state.
     pub context: Option<SearchContext>,
+    /// How the query becomes the hop-0 FTS5 expression
+    /// ([`QueryMode::Lexical`] unless a word-level analysis profile asks for
+    /// phrase recall).
+    pub query_mode: QueryMode,
 }
 
 impl Default for SearchOptions {
@@ -68,6 +72,7 @@ impl Default for SearchOptions {
             max_hops: crate::DEFAULT_MAX_HOPS,
             expansion_term_limit: crate::DEFAULT_EXPANSION_TERM_LIMIT,
             context: None,
+            query_mode: QueryMode::Lexical,
         }
     }
 }
@@ -361,7 +366,7 @@ pub fn search(
     let mut baseline: Vec<Candidate> = Vec::new();
     let mut usage = Usage::default();
 
-    let expression = index.match_query(query)?;
+    let expression = index.match_query_with(options.query_mode, query)?;
     if expression.is_empty() {
         return finish(index, &retained, baseline, trace, usage, started, options);
     }

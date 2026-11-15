@@ -104,6 +104,7 @@ fn max_hops_zero_still_scores_one_round() {
             max_hops: 0,
             expansion_term_limit: 2,
             context: None,
+            query_mode: sag2::QueryMode::Lexical,
         },
     )
     .expect("search");

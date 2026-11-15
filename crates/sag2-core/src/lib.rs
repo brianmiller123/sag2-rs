@@ -28,7 +28,7 @@ pub use dict::{
     anchor_every, contains as freq_contains, max_key_chars, short_entries, short_entry_count,
 };
 pub use diversity::diversity_tokens;
-pub use query::{match_query, quote_term};
+pub use query::{match_query, match_query_with, quote_term, QueryMode};
 pub use tokenize::tokenize;
 pub use unicode::{
     casefold, combining_class, is_case_ignorable, is_cased, is_letter, is_mark, is_number,

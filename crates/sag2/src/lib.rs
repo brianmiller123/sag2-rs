@@ -96,8 +96,8 @@ pub use judge::{BatchDetail, Judge, JudgeError, RoundUsage, Usage, UsageBatch};
 pub use sag2_index::{
     inspect, open_readonly, BuildError, CorpusIndex, Document, ExpansionError, ExpansionHit,
     ExpansionKind, ExpansionQuery, ExpansionTerm, Hit, IndexOptions, OpenAction, OpenError,
-    OpenOutcome, Profile, QueryError, QueryOptions, RebuildPolicy, RebuildReason, Seed, Selected,
-    SqliteError, Statistics, StatisticsError,
+    OpenOutcome, Profile, QueryError, QueryMode, QueryOptions, RebuildPolicy, RebuildReason, Seed,
+    Selected, SqliteError, Statistics, StatisticsError,
 };
 /// The facade's ordered JSON object, used where Python has a dict.
 pub use sag2_json::Object;

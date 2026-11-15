@@ -4930,6 +4930,7 @@ fn run_gate_c(options: &Options) -> Result<ExitCode, String> {
             max_hops: case.options.max_hops,
             expansion_term_limit: case.options.expansion_term_limit,
             context: case.context.as_ref().map(search_context),
+            query_mode: sag2::QueryMode::Lexical,
         };
         let result = match sag2::search(index, &judge, &case.query, &options) {
             Ok(result) => result,

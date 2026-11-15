@@ -21,7 +21,7 @@
 //! that sample equality rests on the platform libm rounding these operations
 //! identically to the reference build.
 
-use sag2_core::{names, quote_term};
+use sag2_core::{names, quote_term, QueryMode};
 use sag2_json::{compact_json, Value};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -355,8 +355,20 @@ impl CorpusIndex {
 
     /// `sag2.py:420-421`: `match_query(self.repair_names(query, set()))`.
     pub fn match_query(&self, query: &str) -> Result<String, ExpansionError> {
+        self.match_query_with(QueryMode::Lexical, query)
+    }
+
+    /// [`match_query`](Self::match_query) with an explicit
+    /// [`QueryMode`].
+    ///
+    /// `simplify:` the query is tokenised with the reference pipeline
+    /// ([`Profile::Sag2ZhV1`](sag2_core::Profile)) because a [`CorpusIndex`]
+    /// does not carry the profile it was opened with.  T6 of the multilingual
+    /// plan threads that profile through `CorpusIndex`; until then `Phrase3` on
+    /// a non-reference index would tokenise the query with the wrong pipeline.
+    pub fn match_query_with(&self, mode: QueryMode, query: &str) -> Result<String, ExpansionError> {
         let repaired = self.repair_names(query, &BTreeSet::new())?;
-        Ok(sag2_core::match_query(&repaired))
+        Ok(sag2_core::match_query_with(mode, &repaired))
     }
 
     /// `sag2.py:585-663` `expansion_terms`.
