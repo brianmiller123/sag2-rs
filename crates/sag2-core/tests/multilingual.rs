@@ -1,13 +1,14 @@
 //! The multilingual recall fixture: word-rate and R@10 per language.
 //!
-//! `tests/data/multilingual.jsonl` holds thirteen self-authored language packs
-//! (ten documents, ten labelled queries each).  Nothing in it is copied from
-//! UD, MIRACL or any other third-party corpus, so the numbers here are a
+//! `tests/data/multilingual.jsonl` holds twenty-six self-authored language
+//! packs (ten documents, ten labelled queries each).  Nothing in it is copied
+//! from UD, MIRACL or any other third-party corpus, so the numbers here are a
 //! regression net rather than a benchmark of those corpora — see the plan's §7.
 //!
 //! Every pack is in exactly one state, and the fixture says which:
 //!
-//! * **measured** (`hi`, `th`, `de`, `fr`, `ko`, `pl`, `zh`, `en`) - the
+//! * **measured** (`hi`, `th`, `de`, `fr`, `ko`, `pl`, `zh`, `en`, `it`, `es`,
+//!   `ro`, `nl`, `sv`, `da`, `nb`, `pt`, `cs`, `sr`, `et`, `hu`, `fi`) - the
 //!   profile has a word-level pipeline, so the word rate has a pinned target
 //!   and the reference `Sag2ZhV1` rate is pinned as the baseline.
 //! * **deferred** (`ru`, `ar`, `el`, `vi`) - the profile still needs the
@@ -196,11 +197,14 @@ fn word_rate(profile: Profile, pack: &Pack) -> (usize, usize) {
 /// Which stream is reordered is the `decoy` field of the pack, because the two
 /// kinds of pipeline answer different questions:
 ///
-/// * `"words"` (Thai, Vietnamese, Japanese, Chinese, German, French, English) -
-///   the token stream is real words, so the decoy keeps every word and loses
-///   the order.  A `Lexical` expression (the `OR` of the words) retrieves it as
-///   readily as the document; a phrase expression does not.
-/// * `"chars"` (Russian, Arabic, Hindi, Greek, Polish, Korean) - the decoy is
+/// * `"words"` (Thai, Vietnamese, Japanese, Chinese, German, French, English,
+///   Italian, Spanish, Romanian, Dutch, Swedish, Danish, Norwegian, Portuguese,
+///   Czech, Estonian, Hungarian, Finnish) - the token stream is real words, so
+///   the decoy keeps every word and loses the order.  A `Lexical` expression
+///   (the `OR` of the words) retrieves it as readily as the document; a phrase
+///   expression does not.
+/// * `"chars"` (Russian, Arabic, Hindi, Greek, Polish, Korean, Serbian) - the
+///   decoy is
 ///   the character sequence rotated and joined without spaces: every character
 ///   is still there, no three-character window of the original survives.  These
 ///   packs carry code-point tokens alongside their words, which is exactly the
@@ -313,14 +317,15 @@ fn recall_at_10(index: &CorpusIndex, pack: &Pack, mode: QueryMode) -> (f64, Vec<
 }
 
 #[test]
-fn the_fixture_covers_thirteen_languages_in_three_states() {
+fn the_fixture_covers_twenty_six_languages_in_three_states() {
     let packs = packs();
-    assert_eq!(packs.len(), 13, "one pack per language");
+    assert_eq!(packs.len(), 26, "one pack per language");
     let languages: BTreeSet<&str> = packs.iter().map(|pack| pack.lang.as_str()).collect();
     assert_eq!(
         languages,
         BTreeSet::from([
-            "ar", "de", "el", "en", "fr", "hi", "ja", "ko", "pl", "ru", "th", "vi", "zh"
+            "ar", "cs", "da", "de", "el", "en", "es", "et", "fi", "fr", "hi", "hu", "it", "ja",
+            "ko", "nb", "nl", "pl", "pt", "ro", "ru", "sr", "sv", "th", "vi", "zh"
         ])
     );
     for pack in &packs {

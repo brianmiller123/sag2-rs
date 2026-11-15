@@ -65,6 +65,32 @@ pub enum Language {
     Hi,
     /// Hebrew.
     He,
+    /// Italian.
+    It,
+    /// Spanish.
+    Es,
+    /// Romanian.
+    Ro,
+    /// Dutch.
+    Nl,
+    /// Swedish.
+    Sv,
+    /// Danish.
+    Da,
+    /// Norwegian Bokmål.
+    Nb,
+    /// Portuguese.
+    Pt,
+    /// Czech.
+    Cs,
+    /// Serbian, written in both Cyrillic and Latin.
+    Sr,
+    /// Estonian.
+    Et,
+    /// Hungarian.
+    Hu,
+    /// Finnish.
+    Fi,
     /// Any other language: the shared fold and no language-specific rule.
     Other,
 }
@@ -85,6 +111,19 @@ impl Language {
             Language::Pl => "pl",
             Language::Hi => "hi",
             Language::He => "he",
+            Language::It => "it",
+            Language::Es => "es",
+            Language::Ro => "ro",
+            Language::Nl => "nl",
+            Language::Sv => "sv",
+            Language::Da => "da",
+            Language::Nb => "nb",
+            Language::Pt => "pt",
+            Language::Cs => "cs",
+            Language::Sr => "sr",
+            Language::Et => "et",
+            Language::Hu => "hu",
+            Language::Fi => "fi",
             Language::Other => "other",
         }
     }
@@ -104,6 +143,19 @@ impl Language {
             "pl" => Some(Language::Pl),
             "hi" => Some(Language::Hi),
             "he" => Some(Language::He),
+            "it" => Some(Language::It),
+            "es" => Some(Language::Es),
+            "ro" => Some(Language::Ro),
+            "nl" => Some(Language::Nl),
+            "sv" => Some(Language::Sv),
+            "da" => Some(Language::Da),
+            "nb" => Some(Language::Nb),
+            "pt" => Some(Language::Pt),
+            "cs" => Some(Language::Cs),
+            "sr" => Some(Language::Sr),
+            "et" => Some(Language::Et),
+            "hu" => Some(Language::Hu),
+            "fi" => Some(Language::Fi),
             "other" => Some(Language::Other),
             _ => None,
         }
@@ -150,6 +202,19 @@ impl Profile {
                 Language::Pl => "multilingual-v1-pl",
                 Language::Hi => "multilingual-v1-hi",
                 Language::He => "multilingual-v1-he",
+                Language::It => "multilingual-v1-it",
+                Language::Es => "multilingual-v1-es",
+                Language::Ro => "multilingual-v1-ro",
+                Language::Nl => "multilingual-v1-nl",
+                Language::Sv => "multilingual-v1-sv",
+                Language::Da => "multilingual-v1-da",
+                Language::Nb => "multilingual-v1-nb",
+                Language::Pt => "multilingual-v1-pt",
+                Language::Cs => "multilingual-v1-cs",
+                Language::Sr => "multilingual-v1-sr",
+                Language::Et => "multilingual-v1-et",
+                Language::Hu => "multilingual-v1-hu",
+                Language::Fi => "multilingual-v1-fi",
                 Language::Other => "multilingual-v1-other",
             },
         }
@@ -420,7 +485,7 @@ mod tests {
     }
     use std::str::FromStr;
 
-    const LANGUAGES: [Language; 13] = [
+    const LANGUAGES: [Language; 26] = [
         Language::Ja,
         Language::Ko,
         Language::Th,
@@ -433,6 +498,19 @@ mod tests {
         Language::Pl,
         Language::Hi,
         Language::He,
+        Language::It,
+        Language::Es,
+        Language::Ro,
+        Language::Nl,
+        Language::Sv,
+        Language::Da,
+        Language::Nb,
+        Language::Pt,
+        Language::Cs,
+        Language::Sr,
+        Language::Et,
+        Language::Hu,
+        Language::Fi,
         Language::Other,
     ];
 

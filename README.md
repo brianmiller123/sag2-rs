@@ -185,22 +185,36 @@ an index always reads back through the pipeline that built it.
 | Korean | `multilingual-v1-ko` | word runs (no dictionary, no morphological analysis) | 1.00 | +0.00 | measured |
 | German | `multilingual-v1-de` | normalise (shared Latin fold + `ä/ö/ü`→`ae/oe/ue`) + word runs with both ASCII spellings | 1.00 | +0.00 | measured |
 | French | `multilingual-v1-fr` | normalise (shared fold) + word runs | 1.00 | +0.00 | measured |
+| Italian | `multilingual-v1-it` | normalise (shared fold) + word runs | 1.00 | +0.00 | measured |
+| Spanish | `multilingual-v1-es` | normalise (shared fold) + word runs | 1.00 | +0.00 | measured |
+| Romanian | `multilingual-v1-ro` | normalise (shared fold) + word runs | 1.00 | +0.00 | measured |
+| Dutch | `multilingual-v1-nl` | normalise (shared fold) + word runs | 1.00 | +0.00 | measured |
+| Swedish | `multilingual-v1-sv` | normalise (shared fold) + word runs | 1.00 | +0.00 | measured |
+| Danish | `multilingual-v1-da` | normalise (shared fold) + word runs | 1.00 | +0.00 | measured |
+| Norwegian Bokmål | `multilingual-v1-nb` | normalise (shared fold) + word runs | 1.00 | +0.00 | measured |
+| Portuguese | `multilingual-v1-pt` | normalise (shared fold) + word runs | 1.00 | +0.00 | measured |
+| Czech | `multilingual-v1-cs` | normalise (shared fold) + word runs | 1.00 | +0.00 | measured |
+| Serbian | `multilingual-v1-sr` | normalise (shared fold) + word runs, Cyrillic and Latin | 1.00 | +0.00 | measured |
+| Estonian | `multilingual-v1-et` | normalise (shared fold) + word runs | 1.00 | +0.00 | measured |
+| Hungarian | `multilingual-v1-hu` | normalise (shared fold) + word runs | 1.00 | +0.00 | measured |
+| Finnish | `multilingual-v1-fi` | normalise (shared fold) + word runs | 1.00 | +0.00 | measured |
 | Chinese | `sag2-zh-v1` | jieba 0.42.1 words (the reference pipeline) | 0.75 | +0.00 | measured |
 | English | `sag2-zh-v1` | ASCII words (the reference pipeline) | 1.00 | +0.00 | measured |
 
 The numbers are measured by `crates/sag2-core/tests/multilingual.rs` on the
 self-authored fixture in `crates/sag2-core/tests/data/multilingual.jsonl`
-(thirteen packs, ten documents and ten labelled queries each).  `word rate` is
+(twenty-six packs, ten documents and ten labelled queries each).  `word rate` is
 the share of the pack's content words that survive as one whole token: a
 multilingual profile emits a run's code points *and* the run, so "exactly one
 token in the stream" would score a correctly segmented `bibliothèque` as a
 miss.
 
-Typing without diacritics does not need a fold for French, Polish or Vietnamese:
-FTS5 `unicode61` removes diacritics by default, and the whole-word token the
-word run stores is what puts the accented word in the body, so `bibliotheque`
-reaches `bibliothèque` and `truong dai hoc` reaches `trường đại học`.  Stripping
-the marks in `normalize` would still be wrong for Vietnamese: `ma`, `má`, `mà`,
+Typing without diacritics does not need a fold for French, Polish, Vietnamese or
+the Latin-script profiles batch 4 adds: FTS5 `unicode61` removes diacritics by
+default, and the whole-word token the word run stores is what puts the accented
+word in the body, so `bibliotheque` reaches `bibliothèque`, `reka` reaches
+`řeka`, `osz` reaches `ősz` and `truong dai hoc` reaches `trường đại học`.
+Stripping the marks in `normalize` would still be wrong for Vietnamese: `ma`, `má`, `mà`,
 `mả`, `mã` and `mạ` are six words, and the fold would merge them before the
 index sees them.  That distinction survives in the **token stream**, not in the
 FTS index - `chunk_fts` uses SQLite's default `unicode61`
@@ -217,6 +231,12 @@ The fold alone would trade one spelling for the other, so the German word run
 emits its code points and *both* ASCII spellings (`müller` → `mueller` and
 `muller`); no other language gets that emission.  Both rules are pinned by
 `crates/sag2-index/tests/profile_queries.rs`.
+
+Serbian is the dual-script entry: `multilingual-v1-sr` adds no rule of its own,
+and the word-run policy is script-agnostic, so a Cyrillic `библиотека` and a
+Latin `biblioteka` are each one word token in the same index.  The shared Latin
+fold covers the Latin letters `unicode61` does not, so `đak` reaches the stored
+`dak` and a keyboard without `đ` still finds the word.
 
 The `state` column is what the fixture asserts:
 
