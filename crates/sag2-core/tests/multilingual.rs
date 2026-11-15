@@ -1,6 +1,6 @@
 //! The multilingual recall fixture: word-rate and R@10 per language.
 //!
-//! `tests/data/multilingual.jsonl` holds twenty-six self-authored language
+//! `tests/data/multilingual.jsonl` holds thirty self-authored language
 //! packs (ten documents, ten labelled queries each).  Nothing in it is copied
 //! from UD, MIRACL or any other third-party corpus, so the numbers here are a
 //! regression net rather than a benchmark of those corpora — see the plan's §7.
@@ -8,9 +8,10 @@
 //! Every pack is in exactly one state, and the fixture says which:
 //!
 //! * **measured** (`hi`, `th`, `de`, `fr`, `ko`, `pl`, `zh`, `en`, `it`, `es`,
-//!   `ro`, `nl`, `sv`, `da`, `nb`, `pt`, `cs`, `sr`, `et`, `hu`, `fi`) - the
-//!   profile has a word-level pipeline, so the word rate has a pinned target
-//!   and the reference `Sag2ZhV1` rate is pinned as the baseline.
+//!   `ro`, `nl`, `sv`, `da`, `nb`, `pt`, `cs`, `sr`, `et`, `hu`, `fi`, `tr`,
+//!   `mt`, `bg`, `uk`) - the profile has a word-level pipeline, so the word
+//!   rate has a pinned target and the reference `Sag2ZhV1` rate is pinned as
+//!   the baseline.
 //! * **deferred** (`ru`, `ar`, `el`, `vi`) - the profile still needs the
 //!   stemmer plan §5 batch 2 owns (Snowball for ru/el, an Arabic stemmer,
 //!   Vietnamese word boundaries), so their word rate is printed but not
@@ -199,16 +200,16 @@ fn word_rate(profile: Profile, pack: &Pack) -> (usize, usize) {
 ///
 /// * `"words"` (Thai, Vietnamese, Japanese, Chinese, German, French, English,
 ///   Italian, Spanish, Romanian, Dutch, Swedish, Danish, Norwegian, Portuguese,
-///   Czech, Estonian, Hungarian, Finnish) - the token stream is real words, so
-///   the decoy keeps every word and loses the order.  A `Lexical` expression
-///   (the `OR` of the words) retrieves it as readily as the document; a phrase
-///   expression does not.
-/// * `"chars"` (Russian, Arabic, Hindi, Greek, Polish, Korean, Serbian) - the
-///   decoy is
-///   the character sequence rotated and joined without spaces: every character
-///   is still there, no three-character window of the original survives.  These
-///   packs carry code-point tokens alongside their words, which is exactly the
-///   recall path the decoy has to stress.
+///   Czech, Estonian, Hungarian, Finnish, Turkish, Maltese) - the token stream
+///   is real words, so the decoy keeps every word and loses the order.  A
+///   `Lexical` expression (the `OR` of the words) retrieves it as readily as
+///   the document; a phrase expression does not.
+/// * `"chars"` (Russian, Arabic, Hindi, Greek, Polish, Korean, Serbian,
+///   Ukrainian, Bulgarian) - the decoy is the character sequence rotated and
+///   joined without spaces: every character is still there, no three-character
+///   window of the original survives.  These packs carry code-point tokens
+///   alongside their words, which is exactly the recall path the decoy has to
+///   stress.
 ///
 /// Decoy `k` of a document rotates its stream by `(k + 1) * 7` positions, which
 /// is deterministic and keeps the same multiset of tokens.
@@ -317,15 +318,16 @@ fn recall_at_10(index: &CorpusIndex, pack: &Pack, mode: QueryMode) -> (f64, Vec<
 }
 
 #[test]
-fn the_fixture_covers_twenty_six_languages_in_three_states() {
+fn the_fixture_covers_thirty_languages_in_three_states() {
     let packs = packs();
-    assert_eq!(packs.len(), 26, "one pack per language");
+    assert_eq!(packs.len(), 30, "one pack per language");
     let languages: BTreeSet<&str> = packs.iter().map(|pack| pack.lang.as_str()).collect();
     assert_eq!(
         languages,
         BTreeSet::from([
-            "ar", "cs", "da", "de", "el", "en", "es", "et", "fi", "fr", "hi", "hu", "it", "ja",
-            "ko", "nb", "nl", "pl", "pt", "ro", "ru", "sr", "sv", "th", "vi", "zh"
+            "ar", "bg", "cs", "da", "de", "el", "en", "es", "et", "fi", "fr", "hi", "hu", "it",
+            "ja", "ko", "mt", "nb", "nl", "pl", "pt", "ro", "ru", "sr", "sv", "th", "tr", "uk",
+            "vi", "zh"
         ])
     );
     for pack in &packs {

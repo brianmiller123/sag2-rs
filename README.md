@@ -166,7 +166,7 @@ set; Han text still goes through jieba.  A word run the reference pipeline would
 have shredded emits its code points *and* the whole run, so a word-level index
 does not cost the code-point recall the non-ASCII packs rely on.  The profile
 persists `rust_index_metadata.analysis` (`multilingual-v1-<lang>`),
-`analysis_version` (`ml-2`, the multilingual pipeline revision — bumped
+`analysis_version` (`ml-3`, the multilingual pipeline revision — bumped
 whenever the tokenizer or normaliser changes, so an index from another revision
 is rebuilt rather than read with a tokenizer that did not produce its tokens)
 and, only for a profile that actually loaded a dictionary, `analysis_dict`, so
@@ -198,12 +198,16 @@ an index always reads back through the pipeline that built it.
 | Estonian | `multilingual-v1-et` | normalise (shared fold) + word runs | 1.00 | +0.00 | measured |
 | Hungarian | `multilingual-v1-hu` | normalise (shared fold) + word runs | 1.00 | +0.00 | measured |
 | Finnish | `multilingual-v1-fi` | normalise (shared fold) + word runs | 1.00 | +0.00 | measured |
+| Turkish | `multilingual-v1-tr` | normalise (`İ`→`i`, dot `U+0307` dropped) + word runs | 1.00 | +0.00 | measured |
+| Maltese | `multilingual-v1-mt` | normalise (`ħ`→`h`) + word runs | 1.00 | +0.00 | measured |
+| Bulgarian | `multilingual-v1-bg` | normalise (`ѝ`→`и`) + word runs | 1.00 | +0.00 | measured |
+| Ukrainian | `multilingual-v1-uk` | normalise (`'`/`’`→`U+02BC`) + word runs | 1.00 | +0.00 | measured |
 | Chinese | `sag2-zh-v1` | jieba 0.42.1 words (the reference pipeline) | 0.75 | +0.00 | measured |
 | English | `sag2-zh-v1` | ASCII words (the reference pipeline) | 1.00 | +0.00 | measured |
 
 The numbers are measured by `crates/sag2-core/tests/multilingual.rs` on the
 self-authored fixture in `crates/sag2-core/tests/data/multilingual.jsonl`
-(twenty-six packs, ten documents and ten labelled queries each).  `word rate` is
+(thirty packs, ten documents and ten labelled queries each).  `word rate` is
 the share of the pack's content words that survive as one whole token: a
 multilingual profile emits a run's code points *and* the run, so "exactly one
 token in the stream" would score a correctly segmented `bibliothèque` as a
@@ -214,10 +218,10 @@ the Latin-script profiles batch 4 adds: FTS5 `unicode61` removes diacritics by
 default, and the whole-word token the word run stores is what puts the accented
 word in the body, so `bibliotheque` reaches `bibliothèque`, `reka` reaches
 `řeka`, `osz` reaches `ősz` and `truong dai hoc` reaches `trường đại học`.
-Stripping the marks in `normalize` would still be wrong for Vietnamese: `ma`, `má`, `mà`,
-`mả`, `mã` and `mạ` are six words, and the fold would merge them before the
-index sees them.  That distinction survives in the **token stream**, not in the
-FTS index - `chunk_fts` uses SQLite's default `unicode61`
+Stripping the marks in `normalize` would still be wrong for Vietnamese: `ma`,
+`má`, `mà`, `mả`, `mã` and `mạ` are six words, and the fold would merge them
+before the index sees them.  That distinction survives in the **token stream**,
+not in the FTS index - `chunk_fts` uses SQLite's default `unicode61`
 (`remove_diacritics=1`), which folds the marks on both sides of a match - so a
 tone-exact query is not available: the recall rests on word-token
 distinctiveness, not on preserved index terms.  For French and Polish the same
@@ -237,6 +241,29 @@ and the word-run policy is script-agnostic, so a Cyrillic `библиотека`
 Latin `biblioteka` are each one word token in the same index.  The shared Latin
 fold covers the Latin letters `unicode61` does not, so `đak` reaches the stored
 `dak` and a keyboard without `đ` still finds the word.
+
+Four profiles need a fold of their own, because FTS5 cannot supply it:
+
+* `multilingual-v1-tr` — `lower(İ)` is `i` + `U+0307`, and U+0307 has ccc 230,
+  so the word set ends the run: `İstanbul` was stored as `i` + `stanbul` and a
+  typed `istanbul` never matched.  The fold maps `İ→i` and deletes `U+0307`
+  inside `fold_script`, before `lower` can produce the mark; `ı→i` is the
+  shared Latin fold's rule and already ran.
+* `multilingual-v1-mt` — `ħ` is a letter with a stroke, not a base letter plus
+  a combining mark, so `unicode61` has no entry for it; the fold is `ħ→h`.
+* `multilingual-v1-bg` — `unicode61` has no Cyrillic table at all, so `ѝ` and
+  `и` were unrelated terms; the fold is `ѝ→и`.
+* `multilingual-v1-uk` — only `U+02BC` is a letter in the word set, while `'`
+  and `’` end the run; the fold maps both onto `U+02BC`, so `м'ясо`, `м’ясо`
+  and `мʼясо` are one word.  It is Ukrainian-only: in French and Italian the
+  apostrophe is a word boundary (`l'amore` is an article and a noun), and
+  folding it there would glue two words into one term.
+
+Those rules change the token stream of the four profiles, so the multilingual
+pipeline revision is `ml-3`.  The value names the pipeline, not the language, so
+every `multilingual-v1-<lang>` index records it; an `ml-2` index is stale by
+definition and `check_analysis_version` makes it rebuild rather than read it
+with a normaliser that did not produce its tokens.
 
 The `state` column is what the fixture asserts:
 

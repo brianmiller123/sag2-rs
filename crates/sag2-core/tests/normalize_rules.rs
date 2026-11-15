@@ -1,6 +1,7 @@
 //! The multilingual normalisation tables: `NFKC -> fold_script -> lower`.
 //!
-//! Each affected language pins at least twenty `(input, expected)` pairs and
+//! Each language with a rule pins the spellings that rule turns on - twenty or
+//! more for German and Greek, every case the smaller rules distinguish - and
 //! each unaffected language pins five, so a rule change is visible as a diff
 //! rather than a recall number somewhere else.  `fold_script` is checked
 //! separately where the distinction matters: it is the step between NFKC and
@@ -130,6 +131,81 @@ const ARABIC: [(&str, &str); 22] = [
     ("ﻻ", "لا"),
     ("مرحباً", "مرحبا"),
     ("رَؤُوف", "رووف"),
+];
+
+/// Turkish: `İ→i` and `U+0307` is dropped, so the three spellings of the same
+/// word reach one term.  `ı→i` is the shared Latin fold's rule.
+const TURKISH: [(&str, &str); 20] = [
+    ("İstanbul", "istanbul"),
+    ("İSTANBUL", "istanbul"),
+    ("istanbul", "istanbul"),
+    ("i\u{0307}stanbul", "istanbul"),
+    ("İzmir", "izmir"),
+    ("İZMİR", "izmir"),
+    ("ılık", "ilik"),
+    ("ILIK", "ilik"),
+    ("değil", "değil"),
+    ("DEĞİL", "değil"),
+    ("ışık", "işik"),
+    ("IŞIK", "işik"),
+    ("siyah", "siyah"),
+    ("Türkiye", "türkiye"),
+    ("TÜRKİYE", "türkiye"),
+    ("İstiklal", "istiklal"),
+    ("İnternet", "internet"),
+    ("i\u{0307}nternet", "internet"),
+    ("ıspanak", "ispanak"),
+    ("diye", "diye"),
+];
+
+/// Maltese: `ħ/Ħ→h`.  `ġ`, `ċ` and `ż` are left alone: `unicode61` folds them
+/// through their decomposed marks, and the fold is only for what it cannot.
+const MALTESE: [(&str, &str); 14] = [
+    ("Ħal", "hal"),
+    ("ĦAL", "hal"),
+    ("ħal", "hal"),
+    ("ħabib", "habib"),
+    ("ĦABIB", "habib"),
+    ("aħbar", "ahbar"),
+    ("tħares", "thares"),
+    ("għadira", "ghadira"),
+    ("GĦADIRA", "ghadira"),
+    ("ibigħu", "ibighu"),
+    ("ġnien", "ġnien"),
+    ("Ċentru", "ċentru"),
+    ("mitħna", "mithna"),
+    ("baħar", "bahar"),
+];
+
+/// Bulgarian: `ѝ/Ѝ→и`, so the clitic and the conjunction are one term.
+const BULGARIAN: [(&str, &str); 10] = [
+    ("ѝ", "и"),
+    ("Ѝ", "и"),
+    ("и", "и"),
+    ("И", "и"),
+    ("той ѝ каза", "той и каза"),
+    ("ТОЙ Ѝ КАЗА", "той и каза"),
+    ("ѝ показа", "и показа"),
+    ("Ѝ ПОКАЗА", "и показа"),
+    ("и ѝ", "и и"),
+    ("Мира ѝ", "мира и"),
+];
+
+/// Ukrainian: the two punctuation apostrophes become `U+02BC`, the letter that
+/// is already a word character.
+const UKRAINIAN: [(&str, &str); 12] = [
+    ("м'ясо", "м\u{02BC}ясо"),
+    ("м’ясо", "м\u{02BC}ясо"),
+    ("мʼясо", "м\u{02BC}ясо"),
+    ("М'ЯСО", "м\u{02BC}ясо"),
+    ("м'ЯСО", "м\u{02BC}ясо"),
+    ("з'єднує", "з\u{02BC}єднує"),
+    ("З'ЄДНУЄ", "з\u{02BC}єднує"),
+    ("п'ять", "п\u{02BC}ять"),
+    ("П'ЯТЬ", "п\u{02BC}ять"),
+    ("об'єкт", "об\u{02BC}єкт"),
+    ("сім'я", "сім\u{02BC}я"),
+    ("об'єднання", "об\u{02BC}єднання"),
 ];
 
 const RUSSIAN: [(&str, &str); 5] = [
@@ -366,6 +442,82 @@ fn arabic_folds_the_hamza_carriers_and_drops_the_tatweel() {
     assert_eq!(fold_script(Language::Ar, "مُحَمَّد"), "محمد");
     // The fold is the only step besides NFKC: `ة` and the alef are untouched.
     assert_eq!(fold_script(Language::Ar, "مدرسة"), "مدرسة");
+}
+
+#[test]
+fn turkish_folds_the_dotted_and_dotless_i() {
+    assert_table(Language::Tr, &TURKISH);
+    // The capital is mapped before `lower` can turn it into `i` + U+0307.
+    assert_eq!(fold_script(Language::Tr, "İstanbul"), "istanbul");
+    // Every spelling of the word reaches one token stream, and the run stays
+    // whole: no `i` + `stanbul` split is left.
+    let turkish = Profile::Multilingual {
+        language: Language::Tr,
+    };
+    assert_eq!(tokens(turkish, "İstanbul"), tokens(turkish, "istanbul"));
+    assert!(tokens(turkish, "İstanbul")
+        .iter()
+        .any(|token| token == "istanbul"));
+    assert!(!tokens(turkish, "İstanbul")
+        .iter()
+        .any(|token| token == "stanbul"));
+    // The rule is Turkish-only: the mark `lower` produces is still there
+    // under the no-rule profile.
+    assert_eq!(normalize(Language::Other, "İstanbul"), "i\u{0307}stanbul");
+}
+
+#[test]
+fn maltese_folds_the_h() {
+    assert_table(Language::Mt, &MALTESE);
+    // `fold_script` runs before `lower`, so the case is still there.
+    assert_eq!(fold_script(Language::Mt, "ĦAL"), "hAL");
+    let maltese = Profile::Multilingual {
+        language: Language::Mt,
+    };
+    assert!(tokens(maltese, "Ħal").iter().any(|token| token == "hal"));
+}
+
+#[test]
+fn bulgarian_folds_the_clitic_and_the_conjunction_together() {
+    assert_table(Language::Bg, &BULGARIAN);
+    assert_eq!(fold_script(Language::Bg, "Ѝ"), "и");
+    let bulgarian = Profile::Multilingual {
+        language: Language::Bg,
+    };
+    assert_eq!(tokens(bulgarian, "ѝ"), tokens(bulgarian, "и"));
+}
+
+#[test]
+fn ukrainian_joins_the_apostrophe_to_the_word() {
+    assert_table(Language::Uk, &UKRAINIAN);
+    let ukrainian = Profile::Multilingual {
+        language: Language::Uk,
+    };
+    for spelling in ["м'ясо", "м’ясо", "мʼясо"] {
+        assert!(
+            tokens(ukrainian, spelling)
+                .iter()
+                .any(|token| token == "м\u{02BC}ясо"),
+            "{spelling:?} is one word"
+        );
+    }
+    // The rule is Ukrainian-only: the apostrophe is a word boundary in the
+    // languages that use it as an article (`l'amore` is article + noun).
+    for language in [Language::Fr, Language::It, Language::Other] {
+        let profile = Profile::Multilingual { language };
+        assert_eq!(normalize(language, "l'amore"), "l'amore");
+        assert_eq!(tokens(profile, "l'amore"), ["l", "amore"], "{profile}");
+    }
+}
+
+#[test]
+fn the_letter_rules_stay_inside_their_language() {
+    // The shared `fold_latin` is unchanged: under the no-rule profile the four
+    // characters the language rules rewrite are still there.
+    assert_eq!(
+        fold_script(Language::Other, "Ħal ѝ İstanbul м'ясо"),
+        "Ħal ѝ İstanbul м'ясо"
+    );
 }
 
 #[test]

@@ -32,7 +32,20 @@ pub fn normalize(language: Language, text: &str) -> String {
 /// | [`Language::El`] | `NFD`, drop every combining mark, `NFKC` |
 /// | [`Language::De`] | `ä→ae ö→oe ü→ue` (both cases) |
 /// | [`Language::Ar`] | `أإآٱ→ا`, `ى→ي`, `ؤ→و`, `ئ→ي`; delete `U+0640` and `U+064B–U+0652`; `ة` is kept |
+/// | [`Language::Tr`] | `İ→i` and delete `U+0307`, so `İstanbul`, `ISTANBUL` and `istanbul` reach one term |
+/// | [`Language::Mt`] | `ħ→h` (both cases) |
+/// | [`Language::Bg`] | `ѝ→и` (both cases) |
+/// | [`Language::Uk`] | `U+0027` and `U+2019` → `U+02BC`, so `м'ясо`, `м’ясо` and `мʼясо` are one word |
 /// | other languages | no further rule |
+///
+/// The last four rules are the ones `unicode61` cannot supply.  It removes
+/// combining diacritics (`ř`, `ő`, `ș` and `ġ` all fold to their base letter),
+/// so the Latin-script profiles need no rule of their own, but it has no entry
+/// for `ħ` (a letter with stroke, not a decomposed mark) and no Cyrillic table
+/// at all, and it cannot bridge the two punctuation spellings of the Ukrainian
+/// apostrophe to the letter `U+02BC`.  Turkish is not a fold at all: `lower(İ)`
+/// produces `i` + `U+0307`, and that mark's ccc 230 ends a word run, so the
+/// word was stored as two tokens.
 ///
 /// Dropping *every* combining mark is what the Greek profile asks for: NFD
 /// cannot tell a tonos from a circumflex, so `ά` and `α` collapse together.
@@ -49,6 +62,10 @@ pub fn fold_script(language: Language, text: &str) -> String {
         Language::El => nfkc(&strip_marks(&nfd(&folded))),
         Language::De => fold_german(&folded),
         Language::Ar => fold_arabic(&folded),
+        Language::Tr => fold_turkish(&folded),
+        Language::Mt => fold_maltese(&folded),
+        Language::Bg => fold_bulgarian(&folded),
+        Language::Uk => fold_ukrainian(&folded),
         _ => folded,
     }
 }
@@ -129,6 +146,81 @@ fn fold_arabic(text: &str) -> String {
             // Tatweel and the harakat (U+064B..U+0652) are deleted; `ة` stays.
             '\u{0640}' => {}
             '\u{064B}'..='\u{0652}' => {}
+            other => folded.push(other),
+        }
+    }
+    folded
+}
+
+/// The Turkish dotted and dotless i: `İ→i` and `U+0307` deleted, so
+/// `İstanbul`, `ISTANBUL` and `istanbul` all reach `istanbul`.
+///
+/// This runs inside the fold, before `lower`, because `İ` is one precomposed
+/// capital at that point: `lower(İ)` is `i` + U+0307, and that mark's ccc 230
+/// makes [`crate::tokenize`]'s word set end the run, so the word used to be
+/// stored as `i` and `stanbul`.  Mapping the capital first means the mark is
+/// never produced; the filter is left to remove a mark that arrived
+/// decomposed.  `NFKC` composes `I` + U+0307 back into `İ`, so the only U+0307
+/// a caller can deliver to this function is the lowercase residue.  `ı→i` is
+/// the shared Latin fold's rule and has already run.
+fn fold_turkish(text: &str) -> String {
+    let mut folded = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            'İ' => folded.push('i'),
+            '\u{0307}' => {}
+            other => folded.push(other),
+        }
+    }
+    folded
+}
+
+/// The Maltese `ħ`: `ħ/Ħ→h`.
+///
+/// U+0127 is a letter with a stroke, not a base letter plus a combining mark,
+/// so FTS5 `unicode61` has no entry for it and an ASCII `h` query never reaches
+/// a corpus word spelled `ħal`.  `ġ`, `ċ` and `ż` need no rule: they decompose
+/// to a base letter plus U+0307, which `remove_diacritics=1` already folds.
+fn fold_maltese(text: &str) -> String {
+    let mut folded = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            'ħ' | 'Ħ' => folded.push('h'),
+            other => folded.push(other),
+        }
+    }
+    folded
+}
+
+/// The Bulgarian `ѝ`: `ѝ/Ѝ→и`.
+///
+/// `unicode61` has no Cyrillic diacritic table, so `ѝ` (the object-form clitic
+/// of `и`) and `и` are two unrelated terms today.  Both cases fold to the
+/// lowercase letter the later `lower` would produce anyway.
+fn fold_bulgarian(text: &str) -> String {
+    let mut folded = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            'ѝ' | 'Ѝ' => folded.push('и'),
+            other => folded.push(other),
+        }
+    }
+    folded
+}
+
+/// The Ukrainian apostrophe: `U+0027` and `U+2019` → `U+02BC`.
+///
+/// The apostrophe belongs to the word (`м'ясо`, `м’ясо` and `мʼясо` are the
+/// same word), but only U+02BC is a letter (`Lm`) and therefore one of
+/// [`crate::tokenize`]'s word characters; the two punctuation spellings end
+/// the run and leave the word as fragments.  The rule is Ukrainian-only: in
+/// Italian and French the apostrophe is a word *boundary* (`l'amore` is an
+/// article and a noun), so folding it there would glue two words into one term.
+fn fold_ukrainian(text: &str) -> String {
+    let mut folded = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            '\u{0027}' | '\u{2019}' => folded.push('\u{02BC}'),
             other => folded.push(other),
         }
     }

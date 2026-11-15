@@ -91,6 +91,14 @@ pub enum Language {
     Hu,
     /// Finnish.
     Fi,
+    /// Turkish.
+    Tr,
+    /// Maltese.
+    Mt,
+    /// Bulgarian.
+    Bg,
+    /// Ukrainian.
+    Uk,
     /// Any other language: the shared fold and no language-specific rule.
     Other,
 }
@@ -124,6 +132,10 @@ impl Language {
             Language::Et => "et",
             Language::Hu => "hu",
             Language::Fi => "fi",
+            Language::Tr => "tr",
+            Language::Mt => "mt",
+            Language::Bg => "bg",
+            Language::Uk => "uk",
             Language::Other => "other",
         }
     }
@@ -156,6 +168,10 @@ impl Language {
             "et" => Some(Language::Et),
             "hu" => Some(Language::Hu),
             "fi" => Some(Language::Fi),
+            "tr" => Some(Language::Tr),
+            "mt" => Some(Language::Mt),
+            "bg" => Some(Language::Bg),
+            "uk" => Some(Language::Uk),
             "other" => Some(Language::Other),
             _ => None,
         }
@@ -215,6 +231,10 @@ impl Profile {
                 Language::Et => "multilingual-v1-et",
                 Language::Hu => "multilingual-v1-hu",
                 Language::Fi => "multilingual-v1-fi",
+                Language::Tr => "multilingual-v1-tr",
+                Language::Mt => "multilingual-v1-mt",
+                Language::Bg => "multilingual-v1-bg",
+                Language::Uk => "multilingual-v1-uk",
                 Language::Other => "multilingual-v1-other",
             },
         }
@@ -485,7 +505,7 @@ mod tests {
     }
     use std::str::FromStr;
 
-    const LANGUAGES: [Language; 26] = [
+    const LANGUAGES: [Language; 30] = [
         Language::Ja,
         Language::Ko,
         Language::Th,
@@ -511,6 +531,10 @@ mod tests {
         Language::Et,
         Language::Hu,
         Language::Fi,
+        Language::Tr,
+        Language::Mt,
+        Language::Bg,
+        Language::Uk,
         Language::Other,
     ];
 
