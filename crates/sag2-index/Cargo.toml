@@ -6,6 +6,11 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# Japanese/Korean segmentation: forwards to `sag2-core`'s runtime-dictionary
+# segmenter.  Off by default, like the core feature.
+lindera = ["sag2-core/lindera"]
+
 [dependencies]
 rusqlite = { version = "0.37", features = ["bundled"] }
 sag2-core = { path = "../sag2-core" }

@@ -46,6 +46,7 @@ fn build(profile: Profile) -> (tempfile::TempDir, CorpusIndex) {
             index_workers: 1,
             source_dir: None,
             profile,
+            dictionary_dir: None,
             rebuild: RebuildPolicy::Always,
         },
     )

@@ -10,6 +10,10 @@ license.workspace = true
 name = "sag2-cli"
 path = "src/main.rs"
 
+[features]
+# Japanese/Korean runtime-dictionary segmentation (needs Rust 1.88).
+lindera = ["sag2-index/lindera"]
+
 [dependencies]
 sag2 = { path = "../sag2" }
 sag2-core = { path = "../sag2-core" }

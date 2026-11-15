@@ -60,6 +60,7 @@ fn open_index(directory: &Path) -> CorpusIndex {
             index_workers: 1,
             source_dir: None,
             profile: Profile::Sag2ZhV1,
+            dictionary_dir: None,
             rebuild: RebuildPolicy::Always,
         },
     )

@@ -21,14 +21,17 @@ mod query;
 mod tokenize;
 mod unicode;
 
-pub use analysis::{tokenize_with, Language, Profile, UnknownProfile};
+pub use analysis::{
+    tokenize_with, tokenize_with_segmenter, AnalysisError, DictionaryAnalysis, Language, Profile,
+    UnknownProfile,
+};
 pub use chunk::{chunk_document, source_content, utf16_length, Chunk, DEFAULT_CHUNK_CHARS};
 pub use collate::sort_key;
 pub use dict::{
     anchor_every, contains as freq_contains, max_key_chars, short_entries, short_entry_count,
 };
 pub use diversity::diversity_tokens;
-pub use query::{match_query, match_query_with, quote_term, QueryMode};
+pub use query::{match_query, match_query_with, match_query_with_segmenter, quote_term, QueryMode};
 pub use tokenize::tokenize;
 pub use unicode::{
     casefold, combining_class, is_case_ignorable, is_cased, is_letter, is_mark, is_number,

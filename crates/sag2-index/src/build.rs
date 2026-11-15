@@ -13,7 +13,10 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, Transaction};
-use sag2_core::{chunk_document, diversity_tokens, tokenize_with, utf16_length, Profile};
+use sag2_core::{
+    chunk_document, diversity_tokens, tokenize_with_segmenter, utf16_length, AnalysisError,
+    DictionaryAnalysis, Profile,
+};
 use sag2_json::{compact_json, Object, Value};
 use sha2::{Digest, Sha256};
 
@@ -65,6 +68,9 @@ pub enum BuildError {
         /// The corpus row position.
         position: usize,
     },
+    /// The analysis pipeline failed while tokenising (a dictionary profile
+    /// whose dictionary could not be read at segmentation time).
+    Analysis(AnalysisError),
 }
 
 impl std::fmt::Display for BuildError {
@@ -85,6 +91,7 @@ impl std::fmt::Display for BuildError {
                 formatter,
                 "corpus row {position} needs non-empty title and text"
             ),
+            BuildError::Analysis(error) => write!(formatter, "{error}"),
         }
     }
 }
@@ -97,13 +104,25 @@ impl From<rusqlite::Error> for BuildError {
     }
 }
 
+impl From<AnalysisError> for BuildError {
+    fn from(error: AnalysisError) -> Self {
+        BuildError::Analysis(error)
+    }
+}
+
 /// Build (or rebuild) the index at `path` from `corpus` (`sag2.py:197-311`).
+///
+/// `dictionary` is the segmenter resolved for
+/// [`IndexOptions::profile`](crate::IndexOptions): every tokenised column and
+/// the cached statistics use it, and its fingerprint is stored as
+/// `rust_index_metadata.analysis_dict` (`"none"` for dictionary-free profiles).
 pub fn build(
     path: &Path,
     corpus: &[Document<'_>],
     fingerprint: &str,
     options: &IndexOptions,
     versions: &RuntimeVersions,
+    dictionary: Option<&DictionaryAnalysis>,
 ) -> Result<(), BuildError> {
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
@@ -240,7 +259,8 @@ pub fn build(
         options.chunk_chars,
         options.index_workers,
         options.profile,
-    ) {
+        dictionary,
+    )? {
         for chunk in &prepared.chunks {
             chunk_id += 1;
             let document_id = (prepared.position + 1) as i64;
@@ -295,8 +315,14 @@ pub fn build(
         contentless,
         &expected,
         options.profile,
+        dictionary,
     )?;
-    write_rust_metadata(&tx, versions, options.profile)?;
+    write_rust_metadata(
+        &tx,
+        versions,
+        options.profile,
+        dictionary.map(DictionaryAnalysis::fingerprint),
+    )?;
     tx.commit()?;
     Ok(())
 }
@@ -340,29 +366,32 @@ fn prepare_document(
     document: &PendingDocument,
     chunk_chars: usize,
     profile: Profile,
-) -> PreparedDocument {
+    dictionary: Option<&DictionaryAnalysis>,
+) -> Result<PreparedDocument, BuildError> {
     let chunks = chunk_document(
         &document.content,
         chunk_chars,
         document.chunk_path.as_deref().or(Some("document.txt")),
     );
-    PreparedDocument {
+    Ok(PreparedDocument {
         position: document.position,
         title: document.title.clone(),
         full_doc: document.full_doc.clone(),
         source_id: document.source_id.clone(),
-        title_tokens: join_tokens(&document.title, profile),
+        title_tokens: join_tokens(&document.title, profile, dictionary)?,
         chunks: chunks
             .into_iter()
-            .map(|chunk| PreparedChunk {
-                heading_tokens: join_tokens(&chunk.heading, profile),
-                body_tokens: join_tokens(&chunk.content, profile),
-                heading: chunk.heading,
-                content: chunk.content,
-                spans: chunk.spans,
+            .map(|chunk| {
+                Ok(PreparedChunk {
+                    heading_tokens: join_tokens(&chunk.heading, profile, dictionary)?,
+                    body_tokens: join_tokens(&chunk.content, profile, dictionary)?,
+                    heading: chunk.heading,
+                    content: chunk.content,
+                    spans: chunk.spans,
+                })
             })
-            .collect(),
-    }
+            .collect::<Result<Vec<_>, BuildError>>()?,
+    })
 }
 
 /// `index_workers` contiguous slices, reassembled in corpus order so the
@@ -373,12 +402,13 @@ fn prepare_documents(
     chunk_chars: usize,
     index_workers: usize,
     profile: Profile,
-) -> Vec<PreparedDocument> {
+    dictionary: Option<&DictionaryAnalysis>,
+) -> Result<Vec<PreparedDocument>, BuildError> {
     let workers = index_workers.max(1).min(documents.len().max(1));
     if workers <= 1 {
         return documents
             .iter()
-            .map(|document| prepare_document(document, chunk_chars, profile))
+            .map(|document| prepare_document(document, chunk_chars, profile, dictionary))
             .collect();
     }
     let stride = documents.len().div_ceil(workers);
@@ -389,15 +419,18 @@ fn prepare_documents(
                 scope.spawn(move || {
                     slice
                         .iter()
-                        .map(|document| prepare_document(document, chunk_chars, profile))
-                        .collect::<Vec<_>>()
+                        .map(|document| {
+                            prepare_document(document, chunk_chars, profile, dictionary)
+                        })
+                        .collect::<Result<Vec<_>, BuildError>>()
                 })
             })
             .collect();
-        handles
-            .into_iter()
-            .flat_map(|handle| handle.join().expect("an index worker panicked"))
-            .collect()
+        let mut prepared = Vec::with_capacity(documents.len());
+        for handle in handles {
+            prepared.extend(handle.join().expect("an index worker panicked")?);
+        }
+        Ok(prepared)
     })
 }
 
@@ -412,8 +445,12 @@ fn spans_json(spans: &[(usize, usize)]) -> String {
     ))
 }
 
-fn join_tokens(text: &str, profile: Profile) -> String {
-    tokenize_with(profile, text).join(" ")
+fn join_tokens(
+    text: &str,
+    profile: Profile,
+    dictionary: Option<&DictionaryAnalysis>,
+) -> Result<String, BuildError> {
+    Ok(tokenize_with_segmenter(profile, text, dictionary)?.join(" "))
 }
 
 /// `sag2.py:328-401` `_load_statistics`.
@@ -424,6 +461,7 @@ fn load_statistics(
     contentless: bool,
     signature: &str,
     profile: Profile,
+    dictionary: Option<&DictionaryAnalysis>,
 ) -> Result<(), BuildError> {
     tx.execute(
         "CREATE TABLE IF NOT EXISTS index_statistics \
@@ -460,7 +498,7 @@ fn load_statistics(
     let mut term_frequencies: BTreeMap<String, i64> = BTreeMap::new();
     let mut count = 0_i64;
     for document in corpus {
-        let words = tokenize_with(profile, &document.title);
+        let words = tokenize_with_segmenter(profile, &document.title, dictionary)?;
         if words.len() >= 2 {
             title_phrases.insert(words);
         }
@@ -534,6 +572,7 @@ fn write_rust_metadata(
     tx: &Transaction<'_>,
     versions: &RuntimeVersions,
     profile: Profile,
+    dictionary: Option<&str>,
 ) -> Result<(), rusqlite::Error> {
     tx.execute(
         "CREATE TABLE IF NOT EXISTS rust_index_metadata \
@@ -541,9 +580,13 @@ fn write_rust_metadata(
         [],
     )?;
     tx.execute("DELETE FROM rust_index_metadata", [])?;
-    let rows: [(&str, &str); 11] = [
+    let rows: [(&str, &str); 12] = [
         ("format_version", crate::open::FORMAT_VERSION_STR),
         ("analysis", profile.as_str()),
+        (
+            crate::open::ANALYSIS_DICT_KEY,
+            dictionary.unwrap_or(crate::open::ANALYSIS_DICT_NONE),
+        ),
         ("tokenizer_version", versions.tokenizer_version),
         ("chunk_policy_version", versions.chunk_policy_version),
         ("jieba_dict_sha256", versions.jieba_dict_sha256),
@@ -683,7 +726,7 @@ mod tests {
     use crate::{CorpusIndex, OpenAction, OpenError, QueryOptions};
 
     const MULTILINGUAL: Profile = Profile::Multilingual {
-        language: Language::Ja,
+        language: Language::De,
     };
 
     fn materialised(chunk_chars: usize) -> IndexOptions {
@@ -692,6 +735,7 @@ mod tests {
             index_workers: 1,
             source_dir: None,
             profile: Profile::Sag2ZhV1,
+            dictionary_dir: None,
             rebuild: RebuildPolicy::Always,
         }
     }
@@ -780,7 +824,7 @@ mod tests {
                 row.get(0)
             })
             .expect("rust keys");
-        assert_eq!(rust_keys, 11);
+        assert_eq!(rust_keys, 12);
         let fts_sql: String = db
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE name='chunk_fts'",
@@ -889,9 +933,10 @@ mod tests {
             index_workers: 1,
             source_dir: Some(directory.path().to_owned()),
             profile: Profile::Sag2ZhV1,
+            dictionary_dir: None,
             rebuild: RebuildPolicy::Always,
         };
-        build(&path, &corpus, "fixture", &options, &RUNTIME_VERSIONS).expect("build");
+        build(&path, &corpus, "fixture", &options, &RUNTIME_VERSIONS, None).expect("build");
 
         let db = Connection::open(&path).expect("open");
         let fts_sql: String = db
@@ -959,9 +1004,10 @@ mod tests {
                 index_workers: workers,
                 source_dir: None,
                 profile: Profile::Sag2ZhV1,
+                dictionary_dir: None,
                 rebuild: RebuildPolicy::Always,
             };
-            build(&path, &corpus, "fixture", &options, &RUNTIME_VERSIONS).expect("build");
+            build(&path, &corpus, "fixture", &options, &RUNTIME_VERSIONS, None).expect("build");
             let db = Connection::open(&path).expect("open");
             let chunks: Vec<(i64, i64, String, String, String, i64)> = db
                 .prepare("SELECT id,document_id,title,heading,content,characters FROM chunks ORDER BY id")

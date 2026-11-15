@@ -13,6 +13,8 @@ default = ["tiktoken"]
 tiktoken = ["dep:tiktoken-rs"]
 # Async wrappers (`AsyncIndex`, `async_search`) on tokio's blocking pool.
 async = ["dep:tokio", "dep:futures-core"]
+# Japanese/Korean runtime-dictionary segmentation (needs Rust 1.88).
+lindera = ["sag2-index/lindera"]
 
 [dependencies]
 sag2-core = { path = "../sag2-core" }

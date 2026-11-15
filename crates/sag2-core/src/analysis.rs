@@ -7,14 +7,21 @@
 //! and orthographic variants of a word collapse onto one term.  A language that
 //! writes without spaces ([`Language::Th`]) replaces the §4 word boundaries
 //! with its own segmenter (see [`segment`]) and shares the rest: the certified
-//! ASCII model and the final filters.  The identifier a profile persists in an
-//! index (`rust_index_metadata.analysis`) comes from [`Profile::as_str`].
+//! ASCII model and the final filters.  Japanese and Korean need a runtime
+//! dictionary ([`Language::Ja`], [`Language::Ko`]); the resolved segmenter is a
+//! [`segment::DictionaryAnalysis`] and a profile that needs one without it is a
+//! typed error, never a degraded token stream.  The identifier a profile
+//! persists in an index (`rust_index_metadata.analysis`) comes from
+//! [`Profile::as_str`].
 
 use std::fmt;
+use std::path::PathBuf;
 use std::str::FromStr;
 
 pub mod normalize;
 pub mod segment;
+
+pub use segment::DictionaryAnalysis;
 
 use crate::ascii_cut;
 use crate::tokenize::{keep, tokenize_default};
@@ -139,6 +146,100 @@ impl Profile {
             },
         }
     }
+
+    /// The language whose profile segments with a dictionary directory.
+    ///
+    /// `Some` for [`Language::Ja`] and [`Language::Ko`] only: those two profiles
+    /// cannot tokenise without one, so index build and open refuse them when the
+    /// caller supplies no directory (see [`segment::DictionaryAnalysis`]).
+    pub fn dictionary_language(self) -> Option<Language> {
+        match self {
+            Profile::Sag2ZhV1 => None,
+            Profile::Multilingual { language } => match language {
+                Language::Ja | Language::Ko => Some(language),
+                _ => None,
+            },
+        }
+    }
+}
+
+/// A resolved analysis pipeline could not be used.
+///
+/// Every variant is a hard failure: a profile that needs a dictionary never
+/// falls back to the character pipeline, because that would silently build or
+/// read an index with a different token stream than the one it records.
+#[derive(Debug)]
+pub enum AnalysisError {
+    /// A dictionary directory is missing, unreadable or malformed.
+    Dictionary {
+        /// The directory or file that failed.
+        path: PathBuf,
+        /// The underlying failure (an I/O error or `lindera`'s load error).
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    /// The profile segments with a dictionary and the caller supplied no
+    /// directory.
+    DictionaryMissing {
+        /// The language whose profile needs one.
+        language: Language,
+    },
+    /// The profile segments with a dictionary but this build has no `lindera`
+    /// feature, so it cannot load one.
+    DictionaryUnsupported {
+        /// The language whose profile needs one.
+        language: Language,
+    },
+}
+
+impl AnalysisError {
+    #[cfg(feature = "lindera")]
+    pub(crate) fn dictionary(
+        path: impl Into<PathBuf>,
+        source: impl std::error::Error + Send + Sync + 'static,
+    ) -> Self {
+        AnalysisError::Dictionary {
+            path: path.into(),
+            source: Box::new(source),
+        }
+    }
+}
+
+impl fmt::Display for AnalysisError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AnalysisError::Dictionary { path, source } => {
+                write!(
+                    formatter,
+                    "cannot load dictionary {}: {source}",
+                    path.display()
+                )
+            }
+            AnalysisError::DictionaryMissing { language } => write!(
+                formatter,
+                "profile {} needs a dictionary directory; pass IndexOptions::dictionary_dir",
+                Profile::Multilingual {
+                    language: *language
+                }
+            ),
+            AnalysisError::DictionaryUnsupported { language } => write!(
+                formatter,
+                "profile {} needs the `lindera` feature, which this build does not have",
+                Profile::Multilingual {
+                    language: *language
+                }
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AnalysisError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            AnalysisError::Dictionary { source, .. } => Some(source.as_ref()),
+            AnalysisError::DictionaryMissing { .. }
+            | AnalysisError::DictionaryUnsupported { .. } => None,
+        }
+    }
 }
 
 impl fmt::Display for Profile {
@@ -187,7 +288,7 @@ impl FromStr for Profile {
     }
 }
 
-/// Tokenize `text` with `profile`.
+/// Tokenize `text` with `profile`, without a dictionary.
 ///
 /// [`Profile::Sag2ZhV1`] is the certified pipeline and what [`crate::tokenize()`]
 /// always uses; it does not enter [`normalize`] at all, so its token stream and
@@ -195,14 +296,44 @@ impl FromStr for Profile {
 /// [`normalize::normalize`] for its language and then the same §4 tokenizer -
 /// except for [`Language::Th`], where [`thai_tokens`] supplies the word
 /// boundaries and keeps the certified ASCII model and the final filters.
+///
+/// This is the convenience wrapper for dictionary-free pipelines.
+/// [`Language::Ja`] and [`Language::Ko`] segment with a dictionary, so their
+/// callers resolve [`segment::DictionaryAnalysis`] first and use
+/// [`tokenize_with_segmenter`].  Index build and open refuse those profiles
+/// without a resolved dictionary ([`AnalysisError::DictionaryMissing`]), so this
+/// entry point can never produce the stored token stream for them.
 pub fn tokenize_with(profile: Profile, text: &str) -> Vec<String> {
+    tokenize_with_segmenter(profile, text, None).expect("a dictionary-free pipeline cannot fail")
+}
+
+/// Tokenize `text` with `profile`, using `dictionary` when the profile needs one.
+///
+/// The returned tokens always come from one pipeline: the dictionary profiles
+/// segment the normalised text with the supplied [`segment::DictionaryAnalysis`]
+/// and apply the same `HAS_CONTENT`/stopword filter as every other profile.  The
+/// only failure is the dictionary itself (an unreadable or malformed dictionary
+/// at segmentation time); with `dictionary = None` this is exactly
+/// [`tokenize_with`].
+pub fn tokenize_with_segmenter(
+    profile: Profile,
+    text: &str,
+    dictionary: Option<&segment::DictionaryAnalysis>,
+) -> Result<Vec<String>, AnalysisError> {
     match profile {
-        Profile::Sag2ZhV1 => tokenize_default(text),
+        Profile::Sag2ZhV1 => Ok(tokenize_default(text)),
         Profile::Multilingual { language } => {
             let normalised = normalize::normalize(language, text);
+            if profile.dictionary_language().is_some() {
+                if let Some(dictionary) = dictionary {
+                    let mut tokens = dictionary.segment(&normalised)?;
+                    tokens.retain(|token| keep(token));
+                    return Ok(tokens);
+                }
+            }
             match language {
-                Language::Th => thai_tokens(&normalised),
-                _ => tokenize_default(&normalised),
+                Language::Th => Ok(thai_tokens(&normalised)),
+                _ => Ok(tokenize_default(&normalised)),
             }
         }
     }
@@ -232,7 +363,10 @@ fn thai_tokens(normalised: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{tokenize_with, Language, Profile, REMOVED_MULTILINGUAL_V1};
+    use super::{
+        tokenize_with, tokenize_with_segmenter, AnalysisError, DictionaryAnalysis, Language,
+        Profile, REMOVED_MULTILINGUAL_V1,
+    };
     use std::str::FromStr;
 
     const LANGUAGES: [Language; 13] = [
@@ -298,5 +432,79 @@ mod tests {
         };
         assert_eq!(tokenize_with(german, "Straße"), ["strasse"]);
         assert_ne!(tokenize_with(german, "Straße"), crate::tokenize("Straße"));
+    }
+
+    #[test]
+    fn only_japanese_and_korean_profiles_need_a_dictionary() {
+        assert_eq!(Profile::Sag2ZhV1.dictionary_language(), None);
+        for language in LANGUAGES {
+            let profile = Profile::Multilingual { language };
+            let expected = matches!(language, Language::Ja | Language::Ko).then_some(language);
+            assert_eq!(profile.dictionary_language(), expected, "{language:?}");
+        }
+    }
+
+    #[test]
+    fn a_dictionary_profile_without_a_directory_is_a_typed_error() {
+        for language in [Language::Ja, Language::Ko] {
+            let error = DictionaryAnalysis::resolve(Profile::Multilingual { language }, None)
+                .expect_err("no dictionary directory");
+            match error {
+                AnalysisError::DictionaryMissing { language: found } => {
+                    assert_eq!(found, language)
+                }
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_dictionary_free_profile_never_resolves_a_dictionary() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        for profile in [
+            Profile::Sag2ZhV1,
+            Profile::Multilingual {
+                language: Language::De,
+            },
+            Profile::Multilingual {
+                language: Language::Th,
+            },
+        ] {
+            assert!(
+                DictionaryAnalysis::resolve(profile, Some(directory.path()))
+                    .expect("resolve")
+                    .is_none(),
+                "{profile}"
+            );
+        }
+    }
+
+    #[cfg(not(feature = "lindera"))]
+    #[test]
+    fn a_dictionary_profile_needs_the_lindera_feature() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let error = DictionaryAnalysis::resolve(
+            Profile::Multilingual {
+                language: Language::Ko,
+            },
+            Some(directory.path()),
+        )
+        .expect_err("a build without the feature cannot load one");
+        match error {
+            AnalysisError::DictionaryUnsupported {
+                language: Language::Ko,
+            } => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_segmenter_aware_entry_point_keeps_the_reference_stream() {
+        for text in ["Where was Alston born?", "中华人民共和国成立了"] {
+            assert_eq!(
+                tokenize_with_segmenter(Profile::Sag2ZhV1, text, None).expect("no dictionary"),
+                tokenize_with(Profile::Sag2ZhV1, text)
+            );
+        }
     }
 }

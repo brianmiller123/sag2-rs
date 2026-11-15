@@ -1377,6 +1377,7 @@ fn gate_d_index(
                 index_workers: 1,
                 source_dir: source_dir.clone(),
                 profile: Profile::Sag2ZhV1,
+                dictionary_dir: None,
                 rebuild: sag2_index::RebuildPolicy::Always,
             },
         );
@@ -1521,12 +1522,16 @@ fn read_index_goldens(options: &Options) -> Result<Vec<IndexGolden>, String> {
 }
 
 /// The `rust_index_metadata` rows this build writes: the design §3.3 v1 key
-/// set plus the analysis profile every build records.
+/// set plus the analysis profile and dictionary provenance every build records.
 fn expected_rust_metadata() -> BTreeMap<&'static str, &'static str> {
     let versions = &sag2_index::RUNTIME_VERSIONS;
     [
         ("format_version", sag2_index::FORMAT_VERSION_STR),
         ("analysis", Profile::Sag2ZhV1.as_str()),
+        (
+            sag2_index::ANALYSIS_DICT_KEY,
+            sag2_index::ANALYSIS_DICT_NONE,
+        ),
         ("tokenizer_version", versions.tokenizer_version),
         ("chunk_policy_version", versions.chunk_policy_version),
         ("jieba_dict_sha256", versions.jieba_dict_sha256),
@@ -1546,10 +1551,11 @@ fn expected_rust_metadata() -> BTreeMap<&'static str, &'static str> {
 ///
 /// `expected` is what this build declares and `golden` what the recorded
 /// fixtures require.  The goldens record the design §3.3 v1 key set, which
-/// every build still has to carry; `analysis` is the multilingual plan's
-/// addition to that set, and design §3.2 rule 4 makes an unknown key ignorable
-/// for a 1.x reader.  So the declared set is compared exactly (an undeclared
-/// key is a failure) and the recorded set as a required subset.
+/// every build still has to carry; `analysis` and `analysis_dict` are the
+/// multilingual plan's additions to that set, and design §3.2 rule 4 makes an
+/// unknown key ignorable for a 1.x reader.  So the declared set is compared
+/// exactly (an undeclared key is a failure) and the recorded set as a required
+/// subset.
 fn metadata_key_failure(
     expected: &[&str],
     actual: &[&str],
@@ -4903,6 +4909,7 @@ fn run_gate_c(options: &Options) -> Result<ExitCode, String> {
                 index_workers: case.index_workers,
                 source_dir: None,
                 profile: Profile::Sag2ZhV1,
+                dictionary_dir: None,
                 rebuild: sag2_index::RebuildPolicy::Always,
             },
         )

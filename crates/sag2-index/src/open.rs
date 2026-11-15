@@ -17,13 +17,24 @@
 //! reads with must match `rust_index_metadata.analysis`, because reading an
 //! index with another tokenizer would mix two token streams.  A row without the
 //! key predates profiles and is the reference pipeline.
+//!
+//! The dictionary a Japanese or Korean profile segments with is provenance too:
+//! `rust_index_metadata.analysis_dict` records `"none"` or the dictionary
+//! fingerprint, and opening the index with another dictionary is an
+//! [`OpenError::IncompatibleIndex`] whatever the rebuild policy says.  A profile
+//! that needs a dictionary and gets none is [`OpenError::Analysis`] wrapping
+//! [`AnalysisError::DictionaryMissing`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
-use sag2_core::{analysis::REMOVED_MULTILINGUAL_V1, Language, Profile, DEFAULT_CHUNK_CHARS};
+use sag2_core::{
+    analysis::REMOVED_MULTILINGUAL_V1, AnalysisError, DictionaryAnalysis, Language, Profile,
+    DEFAULT_CHUNK_CHARS,
+};
 
 use crate::build::{self, BuildError, Document};
 use crate::pool::{QueryOptions, QueryPool};
@@ -36,6 +47,17 @@ pub const FORMAT_VERSION: i64 = 1;
 
 /// [`FORMAT_VERSION`] in the string form the provenance table stores.
 pub const FORMAT_VERSION_STR: &str = "1";
+
+/// The `rust_index_metadata` key that records the dictionary provenance.
+pub const ANALYSIS_DICT_KEY: &str = "analysis_dict";
+
+/// The [`ANALYSIS_DICT_KEY`] value of a dictionary-free profile.
+///
+/// It is deliberately not a hash, so it can never collide with a
+/// [`DictionaryAnalysis::fingerprint`] (64 lowercase hex digits).  An index
+/// without the key predates this provenance and reads as `"none"`, which is
+/// what every index built before the dictionary profiles was.
+pub const ANALYSIS_DICT_NONE: &str = "none";
 
 /// Design §3.3 example: every feature that changes the token stream is in the
 /// version, `cjk` being the compatibility switch (design §2.4).
@@ -128,6 +150,18 @@ pub struct IndexOptions {
     /// Persisted as `rust_index_metadata.analysis`; opening an index under a
     /// different profile is refused rather than silently re-tokenised.
     pub profile: Profile,
+    /// The lindera dictionary directory a Japanese or Korean `profile` needs.
+    ///
+    /// The directory holds a compiled ipadic/ko-dic (`metadata.json`, `char_def.bin`,
+    /// `unk.bin`, `matrix.mtx`, `dict.trie`, `dict.valsidx`, `dict.vals`,
+    /// `dict.wordsidx`, `dict.words`).  It is loaded once per open and its
+    /// fingerprint is recorded as `rust_index_metadata.analysis_dict`.  A
+    /// Japanese or Korean profile without it fails closed
+    /// ([`AnalysisError::DictionaryMissing`]); dictionary-free profiles ignore it.
+    ///
+    /// Requires the `lindera` feature; without it such a profile is
+    /// [`AnalysisError::DictionaryUnsupported`].
+    pub dictionary_dir: Option<PathBuf>,
     /// How hard the open may try to make the index match the corpus.
     pub rebuild: RebuildPolicy,
 }
@@ -139,6 +173,7 @@ impl Default for IndexOptions {
             index_workers: 1,
             source_dir: None,
             profile: Profile::Sag2ZhV1,
+            dictionary_dir: None,
             rebuild: RebuildPolicy::Strict,
         }
     }
@@ -242,6 +277,10 @@ pub enum OpenError {
     BuildUnavailable,
     /// Building from the corpus failed.
     Build(BuildError),
+    /// The analysis pipeline could not be resolved: a dictionary profile has no
+    /// dictionary directory, this build has no `lindera` feature, or the
+    /// dictionary is unreadable.
+    Analysis(AnalysisError),
     /// `sag_register_rank` failed.
     RankExtension(i32),
     /// The cached statistics are unusable.
@@ -317,6 +356,7 @@ impl std::fmt::Display for OpenError {
                 "index building needs a corpus; use CorpusIndex::open with the corpus rows"
             ),
             OpenError::Build(error) => write!(formatter, "cannot build the index: {error}"),
+            OpenError::Analysis(error) => write!(formatter, "{error}"),
             OpenError::RankExtension(code) => {
                 write!(
                     formatter,
@@ -346,6 +386,12 @@ impl From<StatisticsError> for OpenError {
 impl From<BuildError> for OpenError {
     fn from(error: BuildError) -> Self {
         OpenError::Build(error)
+    }
+}
+
+impl From<AnalysisError> for OpenError {
+    fn from(error: AnalysisError) -> Self {
+        OpenError::Analysis(error)
     }
 }
 
@@ -383,12 +429,34 @@ pub enum Decision {
 /// under another profile is rejected under every [`RebuildPolicy`] - before the
 /// signature is even considered - because a rebuild would silently replace the
 /// token stream the file was built for.
+///
+/// This is the dictionary-free form: a Japanese or Korean profile has no
+/// dictionary fingerprint, so [`decide_with_dictionary`] is the entry point that
+/// also compares `rust_index_metadata.analysis_dict`.
 pub fn decide(
     policy: RebuildPolicy,
     existing: &ExistingIndex,
     expected_signature: &str,
     runtime: &RuntimeVersions,
     profile: Profile,
+) -> Decision {
+    decide_with_dictionary(policy, existing, expected_signature, runtime, profile, None)
+}
+
+/// [`decide`] with the dictionary fingerprint the caller resolved.
+///
+/// `dictionary` is the [`DictionaryAnalysis::fingerprint`] of the directory the
+/// profile was resolved with, or `None` for a dictionary-free profile.  An index
+/// recorded with another dictionary is refused under every [`RebuildPolicy`],
+/// exactly like a profile mismatch: rebuilding would replace the token stream
+/// the index was built for.
+pub fn decide_with_dictionary(
+    policy: RebuildPolicy,
+    existing: &ExistingIndex,
+    expected_signature: &str,
+    runtime: &RuntimeVersions,
+    profile: Profile,
+    dictionary: Option<&str>,
 ) -> Decision {
     if !existing.file_exists {
         return Decision::Build;
@@ -406,14 +474,18 @@ pub fn decide(
         };
     }
 
-    // The analysis profile is checked before the corpus signature: an index
-    // built by another pipeline is refused whatever the signature says, because
-    // a rebuild would replace the token stream it was built for.
+    // The analysis profile and its dictionary are checked before the corpus
+    // signature: an index built by another pipeline is refused whatever the
+    // signature says, because a rebuild would replace the token stream it was
+    // built for.
     let analysis = existing
         .rust_metadata
         .as_ref()
         .and_then(|metadata| metadata.get("analysis").map(String::as_str));
     if let Err(error) = check_analysis(analysis, profile) {
+        return Decision::Reject(error);
+    }
+    if let Err(error) = check_dictionary(existing.rust_metadata.as_ref(), dictionary) {
         return Decision::Reject(error);
     }
 
@@ -434,7 +506,7 @@ pub fn decide(
             RebuildPolicy::Always => Decision::Rebuild(RebuildReason::CompiledIn),
             RebuildPolicy::Strict | RebuildPolicy::OnCorpusChange => Decision::Reuse,
         },
-        Some(metadata) => match check_versions(metadata, runtime, profile) {
+        Some(metadata) => match check_versions(metadata, runtime, profile, dictionary) {
             Err(error) => Decision::Reject(error),
             Ok(()) => match policy {
                 RebuildPolicy::Always => Decision::Rebuild(RebuildReason::CompiledIn),
@@ -463,10 +535,41 @@ fn check_analysis(stored: Option<&str>, profile: Profile) -> Result<(), OpenErro
     }
 }
 
+/// Compare the recorded dictionary fingerprint with the resolved one.
+///
+/// `dictionary` is the fingerprint of the directory the profile was resolved
+/// with, or `None` for a dictionary-free profile; the recorded value is
+/// [`ANALYSIS_DICT_NONE`] for the same case.  A row without the key predates
+/// this provenance and is `"none"`, so every index built before the dictionary
+/// profiles still opens.  Any other difference is
+/// [`OpenError::IncompatibleIndex`] - a provenance mismatch, never a rebuild.
+fn check_dictionary(
+    metadata: Option<&BTreeMap<String, String>>,
+    dictionary: Option<&str>,
+) -> Result<(), OpenError> {
+    let expected = dictionary.unwrap_or(ANALYSIS_DICT_NONE);
+    let stored = metadata.and_then(|metadata| metadata.get(ANALYSIS_DICT_KEY).map(String::as_str));
+    match stored {
+        Some(value) if value == expected => Ok(()),
+        None if expected == ANALYSIS_DICT_NONE => Ok(()),
+        Some(value) => Err(OpenError::IncompatibleIndex {
+            field: ANALYSIS_DICT_KEY,
+            index: value.to_owned(),
+            runtime: expected.to_owned(),
+        }),
+        None => Err(OpenError::IncompatibleIndex {
+            field: ANALYSIS_DICT_KEY,
+            index: ANALYSIS_DICT_NONE.to_owned(),
+            runtime: expected.to_owned(),
+        }),
+    }
+}
+
 fn check_versions(
     metadata: &BTreeMap<String, String>,
     runtime: &RuntimeVersions,
     profile: Profile,
+    dictionary: Option<&str>,
 ) -> Result<(), OpenError> {
     let format = metadata
         .get("format_version")
@@ -509,7 +612,8 @@ fn check_versions(
             runtime: expected.to_owned(),
         });
     }
-    check_analysis(metadata.get("analysis").map(String::as_str), profile)
+    check_analysis(metadata.get("analysis").map(String::as_str), profile)?;
+    check_dictionary(Some(metadata), dictionary)
 }
 
 /// Read the open-relevant facts about `path` without writing anything.
@@ -571,23 +675,34 @@ pub fn open(
     options: &IndexOptions,
     fingerprint: &str,
 ) -> Result<(CorpusIndex, OpenOutcome), OpenError> {
+    let dictionary =
+        DictionaryAnalysis::resolve(options.profile, options.dictionary_dir.as_deref())?
+            .map(Arc::new);
     let expected = signature(
         fingerprint,
         options.chunk_chars,
         options.source_dir.as_deref(),
     );
     let existing = inspect(path)?;
-    match decide(
+    match decide_with_dictionary(
         options.rebuild,
         &existing,
         &expected,
         &RUNTIME_VERSIONS,
         options.profile,
+        dictionary.as_deref().map(DictionaryAnalysis::fingerprint),
     ) {
         Decision::Reject(error) => Err(error),
         Decision::Build | Decision::Rebuild(_) => Err(OpenError::BuildUnavailable),
         Decision::Reuse => Ok((
-            open_readonly(path, &expected, options.profile, QueryOptions::default())?,
+            open_readonly_with(
+                path,
+                &expected,
+                options.profile,
+                dictionary,
+                QueryOptions::default(),
+                &RUNTIME_VERSIONS,
+            )?,
             OpenOutcome::reused(),
         )),
     }
@@ -605,30 +720,48 @@ impl CorpusIndex {
         fingerprint: &str,
         options: IndexOptions,
     ) -> Result<(Self, OpenOutcome), OpenError> {
+        let dictionary =
+            DictionaryAnalysis::resolve(options.profile, options.dictionary_dir.as_deref())?
+                .map(Arc::new);
         let expected = signature(
             fingerprint,
             options.chunk_chars,
             options.source_dir.as_deref(),
         );
         let existing = inspect(path)?;
-        let outcome = match decide(
+        let outcome = match decide_with_dictionary(
             options.rebuild,
             &existing,
             &expected,
             &RUNTIME_VERSIONS,
             options.profile,
+            dictionary.as_deref().map(DictionaryAnalysis::fingerprint),
         ) {
             Decision::Reject(error) => return Err(error),
             Decision::Reuse => OpenOutcome::reused(),
             Decision::Build => {
-                build::build(path, corpus, fingerprint, &options, &RUNTIME_VERSIONS)?;
+                build::build(
+                    path,
+                    corpus,
+                    fingerprint,
+                    &options,
+                    &RUNTIME_VERSIONS,
+                    dictionary.as_deref(),
+                )?;
                 OpenOutcome {
                     action: OpenAction::Built,
                     rebuilt: None,
                 }
             }
             Decision::Rebuild(reason) => {
-                build::build(path, corpus, fingerprint, &options, &RUNTIME_VERSIONS)?;
+                build::build(
+                    path,
+                    corpus,
+                    fingerprint,
+                    &options,
+                    &RUNTIME_VERSIONS,
+                    dictionary.as_deref(),
+                )?;
                 OpenOutcome {
                     action: OpenAction::Rebuilt,
                     rebuilt: Some(reason),
@@ -636,7 +769,14 @@ impl CorpusIndex {
             }
         };
         Ok((
-            open_readonly(path, &expected, options.profile, QueryOptions::default())?,
+            open_readonly_with(
+                path,
+                &expected,
+                options.profile,
+                dictionary,
+                QueryOptions::default(),
+                &RUNTIME_VERSIONS,
+            )?,
             outcome,
         ))
     }
@@ -644,16 +784,23 @@ impl CorpusIndex {
 
 /// Open `path` read-only, verifying that it was built for `expected_signature`
 /// and `profile`.
+///
+/// This entry point resolves no dictionary, so a Japanese or Korean `profile`
+/// fails with [`OpenError::Analysis`] wrapping
+/// [`AnalysisError::DictionaryMissing`].  Use [`open`] with
+/// `IndexOptions::dictionary_dir` when the index needs a dictionary.
 pub fn open_readonly(
     path: &Path,
     expected_signature: &str,
     profile: Profile,
     options: QueryOptions,
 ) -> Result<CorpusIndex, OpenError> {
+    let dictionary = DictionaryAnalysis::resolve(profile, None)?.map(Arc::new);
     open_readonly_with(
         path,
         expected_signature,
         profile,
+        dictionary,
         options,
         &RUNTIME_VERSIONS,
     )
@@ -663,6 +810,7 @@ fn open_readonly_with(
     path: &Path,
     expected_signature: &str,
     profile: Profile,
+    dictionary: Option<Arc<DictionaryAnalysis>>,
     options: QueryOptions,
     runtime: &RuntimeVersions,
 ) -> Result<CorpusIndex, OpenError> {
@@ -677,9 +825,13 @@ fn open_readonly_with(
             found: stored,
         });
     }
+    let dictionary_fingerprint = dictionary.as_deref().map(DictionaryAnalysis::fingerprint);
     match &existing.rust_metadata {
-        Some(metadata) => check_versions(metadata, runtime, profile)?,
-        None => check_analysis(None, profile)?,
+        Some(metadata) => check_versions(metadata, runtime, profile, dictionary_fingerprint)?,
+        None => {
+            check_analysis(None, profile)?;
+            check_dictionary(None, dictionary_fingerprint)?;
+        }
     }
 
     let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
@@ -693,6 +845,7 @@ fn open_readonly_with(
         path.to_owned(),
         stored,
         profile,
+        dictionary,
         statistics,
         QueryPool::open(path, options)?,
     ))
@@ -716,8 +869,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        decide, Decision, ExistingIndex, Language, OpenError, Profile, RebuildPolicy,
-        RebuildReason, RuntimeVersions, FORMAT_VERSION, REMOVED_MULTILINGUAL_V1, RUNTIME_VERSIONS,
+        decide, decide_with_dictionary, Decision, ExistingIndex, Language, OpenError, Profile,
+        RebuildPolicy, RebuildReason, RuntimeVersions, FORMAT_VERSION, REMOVED_MULTILINGUAL_V1,
+        RUNTIME_VERSIONS,
     };
 
     const MULTILINGUAL: Profile = Profile::Multilingual {
@@ -1221,5 +1375,159 @@ mod tests {
                 other => panic!("unexpected {other}"),
             }
         }
+    }
+
+    /// A `multilingual-v1-ja` index with `analysis_dict` set to `dictionary`.
+    fn dictionary_index(dictionary: &str) -> ExistingIndex {
+        let mut metadata = current_metadata();
+        metadata.insert(
+            "analysis".to_owned(),
+            Profile::Multilingual {
+                language: Language::Ja,
+            }
+            .as_str()
+            .to_owned(),
+        );
+        metadata.insert(
+            crate::open::ANALYSIS_DICT_KEY.to_owned(),
+            dictionary.to_owned(),
+        );
+        existing(Some(EXPECTED), Some(metadata))
+    }
+
+    #[test]
+    fn the_same_dictionary_is_reused() {
+        const FINGERPRINT: &str =
+            "0000000000000000000000000000000000000000000000000000000000000001";
+        let index = dictionary_index(FINGERPRINT);
+        for policy in [RebuildPolicy::Strict, RebuildPolicy::OnCorpusChange] {
+            is_reuse(decide_with_dictionary(
+                policy,
+                &index,
+                EXPECTED,
+                &RUNTIME,
+                MULTILINGUAL,
+                Some(FINGERPRINT),
+            ));
+        }
+    }
+
+    #[test]
+    fn a_different_dictionary_is_rejected_under_every_policy() {
+        const STORED: &str = "0000000000000000000000000000000000000000000000000000000000000001";
+        const RESOLVED: &str = "0000000000000000000000000000000000000000000000000000000000000002";
+        let index = dictionary_index(STORED);
+        for policy in [
+            RebuildPolicy::Strict,
+            RebuildPolicy::OnCorpusChange,
+            // Even an explicit rebuild must not replace the token stream the
+            // index was built for.
+            RebuildPolicy::Always,
+        ] {
+            match rejection(decide_with_dictionary(
+                policy,
+                &index,
+                EXPECTED,
+                &RUNTIME,
+                MULTILINGUAL,
+                Some(RESOLVED),
+            )) {
+                OpenError::IncompatibleIndex {
+                    field,
+                    index,
+                    runtime,
+                } => {
+                    assert_eq!(field, crate::open::ANALYSIS_DICT_KEY);
+                    assert_eq!(index, STORED);
+                    assert_eq!(runtime, RESOLVED);
+                }
+                other => panic!("{policy:?} must refuse by dictionary, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_none_row_never_matches_a_dictionary() {
+        // The stored value is a fingerprint, the caller resolved none: refuse.
+        let mut reference = current_metadata();
+        reference.insert(
+            crate::open::ANALYSIS_DICT_KEY.to_owned(),
+            "00000000000000000000000000000000000000000000000000000000000000ff".to_owned(),
+        );
+        let index = existing(Some(EXPECTED), Some(reference));
+        assert!(matches!(
+            rejection(decide_with_dictionary(
+                RebuildPolicy::Strict,
+                &index,
+                EXPECTED,
+                &RUNTIME,
+                Profile::Sag2ZhV1,
+                None,
+            )),
+            OpenError::IncompatibleIndex {
+                field: crate::open::ANALYSIS_DICT_KEY,
+                ..
+            }
+        ));
+
+        // The stored value is `none`, the caller resolved a fingerprint: refuse.
+        let ja = {
+            let mut metadata = current_metadata();
+            metadata.insert("analysis".to_owned(), MULTILINGUAL.as_str().to_owned());
+            metadata.insert(
+                crate::open::ANALYSIS_DICT_KEY.to_owned(),
+                crate::open::ANALYSIS_DICT_NONE.to_owned(),
+            );
+            existing(Some(EXPECTED), Some(metadata))
+        };
+        assert!(matches!(
+            rejection(decide_with_dictionary(
+                RebuildPolicy::Always,
+                &ja,
+                EXPECTED,
+                &RUNTIME,
+                MULTILINGUAL,
+                Some("00000000000000000000000000000000000000000000000000000000000000aa"),
+            )),
+            OpenError::IncompatibleIndex {
+                field: crate::open::ANALYSIS_DICT_KEY,
+                ..
+            }
+        ));
+        // The sentinel is not a hash, so `none` can never equal a fingerprint.
+        assert_ne!(crate::open::ANALYSIS_DICT_NONE.len(), 64);
+    }
+
+    #[test]
+    fn a_legacy_row_without_the_key_is_none() {
+        // Every index built before the dictionary profiles has no
+        // `analysis_dict` row; that is `none`, not a fingerprint.
+        let rust = existing(Some(EXPECTED), Some(current_metadata()));
+        is_reuse(decide_with_dictionary(
+            RebuildPolicy::Strict,
+            &rust,
+            EXPECTED,
+            &RUNTIME,
+            Profile::Sag2ZhV1,
+            None,
+        ));
+        // A dictionary profile cannot read it: the missing row is `none`.
+        let mut ja = current_metadata();
+        ja.insert("analysis".to_owned(), MULTILINGUAL.as_str().to_owned());
+        let ja = existing(Some(EXPECTED), Some(ja));
+        assert!(matches!(
+            rejection(decide_with_dictionary(
+                RebuildPolicy::Always,
+                &ja,
+                EXPECTED,
+                &RUNTIME,
+                MULTILINGUAL,
+                Some("00000000000000000000000000000000000000000000000000000000000000aa"),
+            )),
+            OpenError::IncompatibleIndex {
+                field: crate::open::ANALYSIS_DICT_KEY,
+                ..
+            }
+        ));
     }
 }

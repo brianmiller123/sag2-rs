@@ -84,11 +84,65 @@ async decision in the layer that performs I/O.
 |---|---|---|---|
 | `tiktoken` | on | `BatchedJudge`, `Payload`, `Question`, `Instructions`, `Criteria`, `Answer`, `Transport`, `Response`, `OracleJudge`, the token-budget constants (`CONTEXT_BUDGET`, `BATCH_BUDGET`, `STATE_OVERHEAD`, `QUESTION_OVERHEAD` and the prompt notes) | only a custom `Judge` can score; `search`, retrieval and expansion still work. The accounting types (`BatchDetail`, `RoundUsage`, `UsageBatch`, `Usage`) stay: `Judge::score` and `SearchResult` return them |
 | `async` | off | `AsyncIndex`, `AsyncError`, `async_index::search`; pulls in tokio (`rt`, `sync`) and futures-core | no tokio, no futures-core, no async code is compiled |
+| `lindera` | off | `multilingual-v1-ja`/`-ko` segmentation over a runtime dictionary directory (`sag2_core::DictionaryAnalysis`, `sag2_core::analysis::segment::lindera_seg::LinderaSegmenter`); pulls in `lindera` 6.2 with its bundled dictionary and mmap features off | Japanese/Korean profiles fail closed with `AnalysisError::DictionaryUnsupported`; every other profile is unaffected |
 
 ```sh
 cargo build -p sag2                        # BM25 + full SAG2
 cargo build -p sag2 --no-default-features  # BM25 only
 cargo build -p sag2 --features async       # + async wrappers
+cargo build -p sag2 --features lindera     # + Japanese/Korean dictionaries
+```
+
+### Japanese/Korean dictionaries (feature `lindera`)
+
+`multilingual-v1-ja` and `multilingual-v1-ko` segment with a morphological
+dictionary. Compiled ipadic (≈ 10.5 MB) and ko-dic (≈ 19.9 MB) are far too
+large to ship, so the dictionary is a **runtime directory**: it is not in this
+repository, not vendored, and never downloaded at build time.
+
+The library takes the directory through `IndexOptions::dictionary_dir`; the
+`lindera` feature has to be on (it requires Rust 1.88, while the default build
+keeps the workspace's 1.85):
+
+```rust
+let options = sag2::IndexOptions {
+    profile: sag2::Profile::Multilingual { language: sag2::Language::Ja },
+    dictionary_dir: Some("/path/to/ipadic".into()),
+    ..sag2::IndexOptions::default()
+};
+let (index, outcome) = sag2::CorpusIndex::open(&path, &corpus, "fingerprint", options)?;
+```
+
+The directory is lindera's compiled on-disk dictionary format — the layout its
+`embed-ipadic`/`embed-ko-dic` features compile in, produced with lindera's
+dictionary builder from the upstream mecab-ipadic/mecab-ko-dic sources. Every
+file the filesystem loader reads must be present:
+
+```
+metadata.json  char_def.bin  unk.bin  matrix.mtx
+dict.trie  dict.valsidx  dict.vals  dict.wordsidx  dict.words
+```
+
+The dictionary is provenance, not a hint:
+
+* a Japanese or Korean profile **without** a directory is a typed error from
+  both build and open (`AnalysisError::DictionaryMissing`, surfaced as
+  `OpenError::Analysis`); nothing silently falls back to the character pipeline;
+* the build records `rust_index_metadata.analysis_dict` = `"none"` or the
+  dictionary fingerprint (`sha256` over `metadata.json` and the sorted file
+  digests, path-independent); opening the index with another dictionary is
+  `OpenError::IncompatibleIndex` and never rebuilds;
+* a missing, unreadable or malformed directory is `AnalysisError::Dictionary`,
+  never a panic.
+
+The offline end-to-end test loads a real dictionary only when
+`SAG2_DICT_DIR` points at one (it is `#[ignore]`d in CI):
+
+```sh
+SAG2_DICT_DIR=/path/to/ipadic \
+  cargo test --offline -p sag2-core --features lindera --test lindera_dictionary -- --ignored
+SAG2_DICT_DIR=/path/to/ko-dic SAG2_DICT_LANG=ko \
+  cargo test --offline -p sag2-core --features lindera --test lindera_dictionary -- --ignored
 ```
 
 ### SQLite integration modes

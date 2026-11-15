@@ -185,6 +185,7 @@ fn format_version_mismatch_is_refused_and_never_rebuilds() {
             index_workers: 1,
             source_dir: None,
             profile: Profile::Sag2ZhV1,
+            dictionary_dir: None,
             rebuild,
         };
         match open(&tampered, &options, "fixture") {
@@ -225,6 +226,7 @@ fn foreign_database_is_refused_instead_of_dropped() {
         index_workers: 1,
         source_dir: None,
         profile: Profile::Sag2ZhV1,
+        dictionary_dir: None,
         rebuild: RebuildPolicy::Strict,
     };
     assert!(matches!(
@@ -268,6 +270,7 @@ fn signature_mismatch_follows_the_policy() {
         index_workers: 1,
         source_dir: None,
         profile: Profile::Sag2ZhV1,
+        dictionary_dir: None,
         rebuild: RebuildPolicy::Strict,
     };
     assert!(matches!(

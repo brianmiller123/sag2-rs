@@ -22,7 +22,7 @@ mod statistics;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use sag2_json::{compact_json, Value};
 
@@ -31,15 +31,18 @@ pub use expand::{
     ExpansionError, ExpansionHit, ExpansionKind, ExpansionQuery, ExpansionTerm, Seed, Selected,
 };
 pub use open::{
-    decide, inspect, open, open_readonly, Decision, ExistingIndex, IndexOptions, OpenAction,
-    OpenError, OpenOutcome, RebuildPolicy, RebuildReason, RuntimeVersions, FORMAT_VERSION,
-    FORMAT_VERSION_STR, JIEBA_DICT_SHA256, RUNTIME_VERSIONS, SAG_RANK_SHA256, SQLITE_VERSION,
-    TOKENIZER_VERSION, UCA_KEYS_SHA256, UCA_VERSION, UNICODE_VERSION,
+    decide, decide_with_dictionary, inspect, open, open_readonly, Decision, ExistingIndex,
+    IndexOptions, OpenAction, OpenError, OpenOutcome, RebuildPolicy, RebuildReason,
+    RuntimeVersions, ANALYSIS_DICT_KEY, ANALYSIS_DICT_NONE, FORMAT_VERSION, FORMAT_VERSION_STR,
+    JIEBA_DICT_SHA256, RUNTIME_VERSIONS, SAG_RANK_SHA256, SQLITE_VERSION, TOKENIZER_VERSION,
+    UCA_KEYS_SHA256, UCA_VERSION, UNICODE_VERSION,
 };
 pub use pool::{register_rank, QueryOptions, QUERY_CACHE_ENTRIES, QUERY_WORKERS};
 pub use py312::sum as py312_sum;
 pub use retrieve::{Hit, QueryError, BASE_SQL, SAG_STATS_SQL};
-pub use sag2_core::{Language, Profile, QueryMode, DEFAULT_CHUNK_CHARS};
+pub use sag2_core::{
+    AnalysisError, DictionaryAnalysis, Language, Profile, QueryMode, DEFAULT_CHUNK_CHARS,
+};
 pub use signature::{changed_field, signature, CHUNK_POLICY, INDEX_SCHEMA};
 pub use statistics::{Statistics, StatisticsError};
 impl std::fmt::Debug for CorpusIndex {
@@ -103,6 +106,10 @@ pub struct CorpusIndex {
     path: PathBuf,
     signature: String,
     profile: Profile,
+    /// The dictionary the profile segments with, opened once by
+    /// [`CorpusIndex::open`].  Every query-side tokenisation uses it, so the
+    /// query stream and the stored stream come from one dictionary.
+    dictionary: Option<Arc<DictionaryAnalysis>>,
     statistics: Statistics,
     pool: pool::QueryPool,
     /// `self.frequencies`, the mutable frequency memo (`sag2.py:551-583`).
@@ -116,6 +123,7 @@ impl CorpusIndex {
         path: PathBuf,
         signature: String,
         profile: Profile,
+        dictionary: Option<Arc<DictionaryAnalysis>>,
         statistics: Statistics,
         pool: pool::QueryPool,
     ) -> Self {
@@ -124,6 +132,7 @@ impl CorpusIndex {
             path,
             signature,
             profile,
+            dictionary,
             statistics,
             pool,
             frequencies: Mutex::new(frequencies),
@@ -148,6 +157,27 @@ impl CorpusIndex {
     /// stream always come from the same pipeline.
     pub fn profile(&self) -> Profile {
         self.profile
+    }
+
+    /// `rust_index_metadata.analysis_dict`: the dictionary fingerprint this
+    /// index was built with, or `None` for the dictionary-free profiles.
+    ///
+    /// A profile that needs a dictionary cannot be opened without one, so this
+    /// is `Some` exactly for a Japanese or Korean index.
+    pub fn dictionary_fingerprint(&self) -> Option<&str> {
+        self.dictionary
+            .as_deref()
+            .map(DictionaryAnalysis::fingerprint)
+    }
+
+    /// Tokenise `text` with this index's own pipeline.
+    ///
+    /// This is the only query-side tokenisation entry point: it uses the
+    /// dictionary opened for the index, so name repair, query construction and
+    /// `expansion_terms` cannot drift from the stored token stream.  The only
+    /// failure is the dictionary itself.
+    pub(crate) fn tokenize(&self, text: &str) -> Result<Vec<String>, AnalysisError> {
+        sag2_core::tokenize_with_segmenter(self.profile, text, self.dictionary.as_deref())
     }
 
     /// Corpus statistics loaded from `index_statistics`.

@@ -17,7 +17,8 @@
 
 use std::collections::HashSet;
 
-use crate::{tokenize_with, Profile};
+use crate::analysis::{segment::DictionaryAnalysis, AnalysisError};
+use crate::{tokenize_with_segmenter, Profile};
 
 /// The cap both modes apply to the number of expression terms (`[:80]`,
 /// `sag2.py:95-97`).
@@ -58,23 +59,28 @@ pub fn quote_term(term: &str) -> String {
 /// `match_query`: the de-duplicated `OR` of quoted tokens (`sag2.py:69-89`),
 /// tokenised by the reference [`Profile::Sag2ZhV1`] pipeline.
 pub fn match_query(query: &str) -> String {
-    lexical_expression(Profile::Sag2ZhV1, query)
+    match_query_with(QueryMode::Lexical, Profile::Sag2ZhV1, query)
 }
 
-/// The de-duplicated `OR` of quoted tokens for `profile`, capped at the
-/// expression budget.
-fn lexical_expression(profile: Profile, query: &str) -> String {
-    let mut terms = deduped_tokens(profile, query);
-    terms.truncate(EXPRESSION_TERM_BUDGET);
-    join_terms(&terms)
-}
-
-/// The expression for `query` built by `mode` and tokenised by `profile`.
+/// The expression for `query` built by `mode` and tokenised by `profile`
+/// without a dictionary.
 ///
-/// [`QueryMode::Lexical`] with [`Profile::Sag2ZhV1`] is exactly
-/// [`match_query`]: byte-identical, so the default path cannot move.  Callers
-/// pass the profile of the index they are querying, so the query stream and the
-/// stored stream always come from the same pipeline.
+/// This is the convenience wrapper: it is byte-identical to
+/// [`match_query_with_segmenter`] with `dictionary = None` and never fails.
+/// A Japanese or Korean index passes its resolved
+/// [`DictionaryAnalysis`] to [`match_query_with_segmenter`] instead, so the
+/// query stream and the stored stream come from the same dictionary.
+pub fn match_query_with(mode: QueryMode, profile: Profile, query: &str) -> String {
+    match_query_with_segmenter(mode, profile, None, query)
+        .expect("a dictionary-free pipeline cannot fail")
+}
+
+/// [`match_query_with`] with the dictionary an index was opened with.
+///
+/// The tokenizer is the index's own: dictionary profiles segment with
+/// `dictionary`, every other profile ignores it.  The result is identical to
+/// [`match_query_with`] for a dictionary-free profile, and the only failure is
+/// the dictionary itself.
 ///
 /// # `Phrase3` construction
 ///
@@ -90,8 +96,8 @@ fn lexical_expression(profile: Profile, query: &str) -> String {
 /// The [`match_query`] unigrams (built with the same `profile`) are always
 /// appended as the fallback: exact phrases alone lose Korean recall (90.5% to
 /// 49.4% R@10 in the plan's measurements), where the character unigrams act as
-/// an accidental stemmer for the agglutinative particles.  Terms already emitted as phrases are not
-/// repeated.
+/// an accidental stemmer for the agglutinative particles.  Terms already
+/// emitted as phrases are not repeated.
 ///
 /// # Budget
 ///
@@ -100,24 +106,41 @@ fn lexical_expression(profile: Profile, query: &str) -> String {
 /// unigrams - but eight slots are held back for the unigram fallback whenever
 /// the query has that many distinct unigrams, so truncation can never drop the
 /// whole fallback.
-pub fn match_query_with(mode: QueryMode, profile: Profile, query: &str) -> String {
+pub fn match_query_with_segmenter(
+    mode: QueryMode,
+    profile: Profile,
+    dictionary: Option<&DictionaryAnalysis>,
+    query: &str,
+) -> Result<String, AnalysisError> {
+    let tokenize = |text: &str| tokenize_with_segmenter(profile, text, dictionary);
     match mode {
-        QueryMode::Lexical => lexical_expression(profile, query),
-        QueryMode::Phrase3 => match_query_phrase3(profile, query),
+        QueryMode::Lexical => lexical_expression(&tokenize, query),
+        QueryMode::Phrase3 => match_query_phrase3(&tokenize, query),
     }
+}
+
+/// The tokenizer every helper below shares: one pipeline, one dictionary.
+type Tokenize<'a> = &'a dyn Fn(&str) -> Result<Vec<String>, AnalysisError>;
+
+/// The de-duplicated `OR` of quoted tokens for `tokenize`, capped at the
+/// expression budget.
+fn lexical_expression(tokenize: Tokenize<'_>, query: &str) -> Result<String, AnalysisError> {
+    let mut terms = deduped_tokens(tokenize, query)?;
+    terms.truncate(EXPRESSION_TERM_BUDGET);
+    Ok(join_terms(&terms))
 }
 
 /// `tokenize(query)` with the first occurrence of each token kept
 /// (`list(dict.fromkeys(...))`).
-fn deduped_tokens(profile: Profile, query: &str) -> Vec<String> {
+fn deduped_tokens(tokenize: Tokenize<'_>, query: &str) -> Result<Vec<String>, AnalysisError> {
     let mut seen = HashSet::new();
     let mut terms = Vec::new();
-    for term in tokenize_with(profile, query) {
+    for term in tokenize(query)? {
         if seen.insert(term.clone()) {
             terms.push(term);
         }
     }
-    terms
+    Ok(terms)
 }
 
 fn join_terms(terms: &[String]) -> String {
@@ -129,9 +152,9 @@ fn join_terms(terms: &[String]) -> String {
 }
 
 /// [`QueryMode::Phrase3`]: phrases first, then the unigram fallback.
-fn match_query_phrase3(profile: Profile, query: &str) -> String {
-    let unigrams = deduped_tokens(profile, query);
-    let mut terms = phrase_terms(profile, query);
+fn match_query_phrase3(tokenize: Tokenize<'_>, query: &str) -> Result<String, AnalysisError> {
+    let unigrams = deduped_tokens(tokenize, query)?;
+    let mut terms = phrase_terms(tokenize, query)?;
     let reserve = UNIGRAM_RESERVE.min(unigrams.len());
     terms.truncate(EXPRESSION_TERM_BUDGET - reserve);
     let mut emitted: HashSet<String> = terms.iter().cloned().collect();
@@ -143,28 +166,28 @@ fn match_query_phrase3(profile: Profile, query: &str) -> String {
             terms.push(unigram);
         }
     }
-    join_terms(&terms)
+    Ok(join_terms(&terms))
 }
 
 /// The phrase terms of `query` in priority order: every whole-chunk phrase,
 /// then every three-token window.  Duplicates keep their first position.
-fn phrase_terms(profile: Profile, query: &str) -> Vec<String> {
+fn phrase_terms(tokenize: Tokenize<'_>, query: &str) -> Result<Vec<String>, AnalysisError> {
     let mut phrases = Vec::new();
     let mut seen = HashSet::new();
     if query.split_whitespace().count() <= 1 {
-        let tokens = tokenize_with(profile, query);
+        let tokens = tokenize(query)?;
         if tokens.len() <= 3 {
             push_phrase(&mut phrases, &mut seen, &tokens);
         }
         for window in tokens.windows(3) {
             push_phrase(&mut phrases, &mut seen, window);
         }
-        return phrases;
+        return Ok(phrases);
     }
     let chunks: Vec<Vec<String>> = query
         .split_whitespace()
-        .map(|chunk| tokenize_with(profile, chunk))
-        .collect();
+        .map(tokenize)
+        .collect::<Result<_, _>>()?;
     for tokens in &chunks {
         push_phrase(&mut phrases, &mut seen, tokens);
     }
@@ -173,7 +196,7 @@ fn phrase_terms(profile: Profile, query: &str) -> Vec<String> {
             push_phrase(&mut phrases, &mut seen, window);
         }
     }
-    phrases
+    Ok(phrases)
 }
 
 fn push_phrase(phrases: &mut Vec<String>, seen: &mut HashSet<String>, tokens: &[String]) {
