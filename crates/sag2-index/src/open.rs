@@ -18,7 +18,7 @@
 //! index with another tokenizer would mix two token streams.  A row without the
 //! key predates profiles and is the reference pipeline.
 //!
-//! The dictionary a Japanese or Korean profile segments with is provenance too:
+//! The dictionary a Japanese profile segments with is provenance too:
 //! `rust_index_metadata.analysis_dict` records the fingerprint of the directory
 //! the build loaded, and opening the index with another dictionary is an
 //! [`OpenError::IncompatibleIndex`] whatever the rebuild policy says.  A
@@ -156,14 +156,16 @@ pub struct IndexOptions {
     /// Persisted as `rust_index_metadata.analysis`; opening an index under a
     /// different profile is refused rather than silently re-tokenised.
     pub profile: Profile,
-    /// The lindera dictionary directory a Japanese or Korean `profile` needs.
+    /// The lindera dictionary directory a Japanese `profile` needs.
     ///
-    /// The directory holds a compiled ipadic/ko-dic (`metadata.json`, `char_def.bin`,
+    /// The directory holds a compiled ipadic (`metadata.json`, `char_def.bin`,
     /// `unk.bin`, `matrix.mtx`, `dict.trie`, `dict.valsidx`, `dict.vals`,
     /// `dict.wordsidx`, `dict.words`).  It is loaded once per open and its
     /// fingerprint is recorded as `rust_index_metadata.analysis_dict`.  A
-    /// Japanese or Korean profile without it fails closed
-    /// ([`AnalysisError::DictionaryMissing`]); dictionary-free profiles ignore it.
+    /// Japanese profile without it fails closed
+    /// ([`AnalysisError::DictionaryMissing`]); every other profile has no
+    /// dictionary to read and refuses one
+    /// ([`AnalysisError::DictionaryUnused`]).
     ///
     /// Requires the `lindera` feature; without it such a profile is
     /// [`AnalysisError::DictionaryUnsupported`].
@@ -447,9 +449,9 @@ pub enum Decision {
 /// signature is even considered - because a rebuild would silently replace the
 /// token stream the file was built for.
 ///
-/// This is the dictionary-free form: a Japanese or Korean profile has no
-/// dictionary fingerprint, so [`decide_with_dictionary`] is the entry point that
-/// also compares `rust_index_metadata.analysis_dict`.
+/// This is the dictionary-free form: a profile that does not segment with a
+/// dictionary has no fingerprint, so [`decide_with_dictionary`] is the entry
+/// point that also compares `rust_index_metadata.analysis_dict`.
 pub fn decide(
     policy: RebuildPolicy,
     existing: &ExistingIndex,
@@ -802,10 +804,10 @@ impl CorpusIndex {
 /// Open `path` read-only, verifying that it was built for `expected_signature`
 /// and `profile`.
 ///
-/// This entry point resolves no dictionary, so a Japanese or Korean `profile`
-/// fails with [`OpenError::Analysis`] wrapping
-/// [`AnalysisError::DictionaryMissing`].  Use [`open`] with
-/// `IndexOptions::dictionary_dir` when the index needs a dictionary.
+/// This entry point resolves no dictionary, so a Japanese `profile` fails with
+/// [`OpenError::Analysis`] wrapping [`AnalysisError::DictionaryMissing`].  Use
+/// [`open`] with `IndexOptions::dictionary_dir` when the index needs a
+/// dictionary.
 pub fn open_readonly(
     path: &Path,
     expected_signature: &str,
@@ -829,7 +831,7 @@ pub fn open_readonly(
 /// built: the profile comes from `rust_index_metadata.analysis` (a row without
 /// the key is [`Profile::Sag2ZhV1`], and an unparseable one is
 /// [`OpenError::UnknownAnalysisProfile`]), and `dictionary_dir` resolves the
-/// runtime dictionary a Japanese or Korean index records.  The recorded
+/// runtime dictionary a Japanese index records.  The recorded
 /// provenance is still validated: the signature, the version keys, the profile
 /// and the dictionary fingerprint all have to agree.
 pub fn open_recorded(

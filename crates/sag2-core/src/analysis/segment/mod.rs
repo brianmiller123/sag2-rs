@@ -6,11 +6,14 @@
 //! final `HAS_CONTENT`/stopword filter around it, so every profile ends in the
 //! same filters.
 //!
-//! [`Language::Ja`] and [`Language::Ko`] additionally need a morphological
-//! dictionary.  That dictionary is a runtime directory, so their segmenter is
-//! resolved once per index into a [`DictionaryAnalysis`] and the index fails
-//! closed when it is absent: [`crate::analysis::AnalysisError::DictionaryMissing`]
-//! on build and on open, never a silently degraded token stream.
+//! [`Language::Ja`] additionally needs a morphological dictionary.  That
+//! dictionary is a runtime directory, so its segmenter is resolved once per
+//! index into a [`DictionaryAnalysis`] and the index fails closed when it is
+//! absent: [`crate::analysis::AnalysisError::DictionaryMissing`] on build and on
+//! open, never a silently degraded token stream.  Korean needs none - its eojeol
+//! are space-delimited - and a directory handed to any other profile is
+//! [`crate::analysis::AnalysisError::DictionaryUnused`] rather than a silently
+//! ignored argument.
 
 use std::path::Path;
 
@@ -20,7 +23,7 @@ use crate::analysis::{AnalysisError, Language, Profile};
 pub mod lindera_seg;
 pub mod thai;
 
-/// The dictionary a Japanese or Korean profile tokenises with.
+/// The dictionary a Japanese profile tokenises with.
 ///
 /// Built by [`DictionaryAnalysis::resolve`] from the caller's dictionary
 /// directory and kept for the lifetime of the index, so the build, name repair,
@@ -30,7 +33,7 @@ pub mod thai;
 ///
 /// Without the `lindera` feature the type still exists so the index compiles in
 /// both feature states, but [`DictionaryAnalysis::resolve`] can never produce
-/// one: a Japanese or Korean profile reports
+/// one: a Japanese profile reports
 /// [`AnalysisError::DictionaryUnsupported`].
 pub struct DictionaryAnalysis {
     language: Language,
@@ -43,7 +46,10 @@ impl DictionaryAnalysis {
     /// Resolve `profile` against `dictionary_dir`.
     ///
     /// A profile that does not segment with a dictionary resolves to `None`
-    /// whatever the directory says.  A Japanese or Korean profile without a
+    /// when it is given no directory and reports
+    /// [`AnalysisError::DictionaryUnused`] when it is given one: a directory this
+    /// profile cannot read is a caller mistake, and ignoring it would let a
+    /// Korean build believe it loaded morphology.  A Japanese profile without a
     /// directory is [`AnalysisError::DictionaryMissing`], and one this build
     /// cannot serve (no `lindera` feature, missing or malformed directory) is a
     /// typed error - the caller must never fall back to the character pipeline.
@@ -52,7 +58,10 @@ impl DictionaryAnalysis {
         dictionary_dir: Option<&Path>,
     ) -> Result<Option<Self>, AnalysisError> {
         let Some(language) = profile.dictionary_language() else {
-            return Ok(None);
+            return match dictionary_dir {
+                None => Ok(None),
+                Some(_) => Err(AnalysisError::DictionaryUnused { profile }),
+            };
         };
         let dir = dictionary_dir.ok_or(AnalysisError::DictionaryMissing { language })?;
         #[cfg(feature = "lindera")]

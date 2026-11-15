@@ -84,21 +84,22 @@ async decision in the layer that performs I/O.
 |---|---|---|---|
 | `tiktoken` | on | `BatchedJudge`, `Payload`, `Question`, `Instructions`, `Criteria`, `Answer`, `Transport`, `Response`, `OracleJudge`, the token-budget constants (`CONTEXT_BUDGET`, `BATCH_BUDGET`, `STATE_OVERHEAD`, `QUESTION_OVERHEAD` and the prompt notes) | only a custom `Judge` can score; `search`, retrieval and expansion still work. The accounting types (`BatchDetail`, `RoundUsage`, `UsageBatch`, `Usage`) stay: `Judge::score` and `SearchResult` return them |
 | `async` | off | `AsyncIndex`, `AsyncError`, `async_index::search`; pulls in tokio (`rt`, `sync`) and futures-core | no tokio, no futures-core, no async code is compiled |
-| `lindera` | off | `multilingual-v1-ja`/`-ko` segmentation over a runtime dictionary directory (`sag2_core::DictionaryAnalysis`, `sag2_core::analysis::segment::lindera_seg::LinderaSegmenter`); pulls in `lindera` 6.2 with its bundled dictionary and mmap features off | Japanese/Korean profiles fail closed with `AnalysisError::DictionaryUnsupported`; every other profile is unaffected |
+| `lindera` | off | `multilingual-v1-ja` segmentation over a runtime dictionary directory (`sag2_core::DictionaryAnalysis`, `sag2_core::analysis::segment::lindera_seg::LinderaSegmenter`); pulls in `lindera` 6.2 with its bundled dictionary and mmap features off | the Japanese profile fails closed with `AnalysisError::DictionaryUnsupported`; every other profile is unaffected |
 
 ```sh
 cargo build -p sag2                        # BM25 + full SAG2
 cargo build -p sag2 --no-default-features  # BM25 only
 cargo build -p sag2 --features async       # + async wrappers
-cargo build -p sag2 --features lindera     # + Japanese/Korean dictionaries
+cargo build -p sag2 --features lindera     # + the Japanese dictionary
 ```
 
 ### Dictionaries (feature `lindera`, `SAG2_DICT_DIR`)
 
-`multilingual-v1-ja` and `multilingual-v1-ko` segment with a morphological
-dictionary. Compiled ipadic (≈ 10.5 MB) and ko-dic (≈ 19.9 MB) are far too
-large to ship, so the dictionary is a **runtime directory**: it is not in this
-repository, not vendored, and never downloaded at build time.
+`multilingual-v1-ja` segments with a morphological dictionary. Compiled ipadic
+(≈ 10.5 MB) is far too large to ship, so the dictionary is a **runtime
+directory**: it is not in this repository, not vendored, and never downloaded
+at build time.  Korean needs no dictionary: its eojeol are space-delimited, so
+the word-run pipeline already yields word-level tokens.
 
 The library takes the directory through `IndexOptions::dictionary_dir`; the
 CLI takes `--dict-dir` (or the `SAG2_DICT_DIR` environment variable) on both
@@ -115,9 +116,9 @@ let (index, outcome) = sag2::CorpusIndex::open(&path, &corpus, "fingerprint", op
 ```
 
 The directory is lindera's compiled on-disk dictionary format — the layout its
-`embed-ipadic`/`embed-ko-dic` features compile in, produced with lindera's
-dictionary builder from the upstream mecab-ipadic/mecab-ko-dic sources. Every
-file the filesystem loader reads must be present:
+`embed-ipadic` feature compiles in, produced with lindera's dictionary builder
+from the upstream mecab-ipadic sources. Every file the filesystem loader reads
+must be present:
 
 ```
 metadata.json  char_def.bin  unk.bin  matrix.mtx
@@ -126,9 +127,12 @@ dict.trie  dict.valsidx  dict.vals  dict.wordsidx  dict.words
 
 The dictionary is provenance, not a hint:
 
-* a Japanese or Korean profile **without** a directory is a typed error from
+* a Japanese profile **without** a directory is a typed error from
   both build and open (`AnalysisError::DictionaryMissing`, surfaced as
   `OpenError::Analysis`); nothing silently falls back to the character pipeline;
+* a directory handed to a profile that does not segment with one is
+  `AnalysisError::DictionaryUnused` naming the profile, never a silently
+  ignored argument: an index records the pipeline that produced its tokens;
 * the build records `rust_index_metadata.analysis_dict` = `"none"` or the
   dictionary fingerprint (`sha256` over `metadata.json` and the sorted file
   digests, path-independent); opening the index with another dictionary is
@@ -142,8 +146,6 @@ The offline end-to-end test loads a real dictionary only when
 ```sh
 SAG2_DICT_DIR=/path/to/ipadic \
   cargo test --offline -p sag2-core --features lindera --test lindera_dictionary -- --ignored
-SAG2_DICT_DIR=/path/to/ko-dic SAG2_DICT_LANG=ko \
-  cargo test --offline -p sag2-core --features lindera --test lindera_dictionary -- --ignored
 ```
 
 ## Languages
@@ -152,60 +154,70 @@ SAG2_DICT_DIR=/path/to/ko-dic SAG2_DICT_LANG=ko \
 default index carries none of the plan's provenance rows: an absent `analysis`
 reads back as `sag2-zh-v1` and an absent `analysis_dict` as `none`, so the key
 set stays exactly the ten keys design §3.3 fixes (Gate D compares it exactly).
-`Profile::Multilingual { language }` normalises and (where one exists) segments
-per language; it persists `rust_index_metadata.analysis`
-(`multilingual-v1-<lang>`) and, only for a profile that actually loaded a
-dictionary, `analysis_dict`, so an index always reads back through the pipeline
-that built it.
+`Profile::Multilingual { language }` normalises per language and takes its word
+boundaries from the multilingual word character set - a letter or non-combining
+mark, or a digit - instead of the reference classifier's ASCII + `U+4E00-U+9FD5`
+set; Han text still goes through jieba.  A word run the reference pipeline would
+have shredded emits its code points *and* the whole run, so a word-level index
+does not cost the code-point recall the non-ASCII packs rely on.  The profile
+persists `rust_index_metadata.analysis` (`multilingual-v1-<lang>`) and, only for
+a profile that actually loaded a dictionary, `analysis_dict`, so an index always
+reads back through the pipeline that built it.
 
 | language | profile | analysis | word rate | Phrase3 R@10 gain | state |
 |---|---|---|---|---|---|
-| Russian | `multilingual-v1-ru` | normalise, character tokens | 0.00 | +0.10 | deferred |
-| Arabic | `multilingual-v1-ar` | normalise (hamza/alef/tatweel), character tokens | 0.00 | +0.20 | deferred |
-| Hindi | `multilingual-v1-hi` | character tokens | 0.00 | +0.00 | deferred |
-| Greek | `multilingual-v1-el` | normalise (strip tonos/dialytika), character tokens | 0.00 | +0.20 | deferred |
-| Vietnamese | `multilingual-v1-vi` | normalise (strip tone marks) to ASCII syllables | 0.17 | +0.00 | deferred |
-| Polish | `multilingual-v1-pl` | normalise (Latin fold); remaining diacritics split | 0.58 | +0.00 | deferred |
+| Russian | `multilingual-v1-ru` | normalise, word runs + code points | 1.00 | +0.00 | deferred |
+| Arabic | `multilingual-v1-ar` | normalise (hamza/alef/tatweel), word runs + code points | 1.00 | +0.00 | deferred |
+| Hindi | `multilingual-v1-hi` | word runs + code points (stacked marks end a run) | 0.42 | +0.00 | deferred |
+| Greek | `multilingual-v1-el` | normalise (strip tonos/dialytika), word runs + code points | 1.00 | +0.00 | deferred |
+| Vietnamese | `multilingual-v1-vi` | normalise (strip tone marks); syllables space-separated | 0.17 | +0.00 | deferred |
+| Polish | `multilingual-v1-pl` | normalise (Latin fold) + word runs | 1.00 | +0.00 | measured |
 | Thai | `multilingual-v1-th` | `newmm` words (nlpo3 + CC0 word list) | 0.92 | +0.00 | measured |
 | Japanese | `multilingual-v1-ja` | `lindera` words (runtime dictionary) | - | - | dictionary required |
-| Korean | `multilingual-v1-ko` | `lindera` words (runtime dictionary) | - | - | dictionary required |
-| German | `multilingual-v1-de` | normalise (ß/ø/æ/... fold) + ASCII words | 0.92 | +0.00 | measured |
-| French | `multilingual-v1-fr` | normalise (shared fold) + ASCII words | 0.50 | +0.00 | measured |
+| Korean | `multilingual-v1-ko` | word runs (no dictionary, no morphological analysis) | 1.00 | +0.00 | measured |
+| German | `multilingual-v1-de` | normalise (ß/ø/æ/... fold) + word runs | 1.00 | +0.00 | measured |
+| French | `multilingual-v1-fr` | normalise (shared fold) + word runs | 1.00 | +0.00 | measured |
 | Chinese | `sag2-zh-v1` | jieba 0.42.1 words (the reference pipeline) | 0.75 | +0.00 | measured |
 | English | `sag2-zh-v1` | ASCII words (the reference pipeline) | 1.00 | +0.00 | measured |
 
 The numbers are measured by `crates/sag2-core/tests/multilingual.rs` on the
 self-authored fixture in `crates/sag2-core/tests/data/multilingual.jsonl`
 (thirteen packs, ten documents and ten labelled queries each).  `word rate` is
-the share of the pack's content words that come out as exactly one token.
+the share of the pack's content words that survive as one whole token: a
+multilingual profile emits a run's code points *and* the run, so "exactly one
+token in the stream" would score a correctly segmented `bibliothèque` as a
+miss.
 
 The `state` column is what the fixture asserts:
 
 * **measured** - the profile has a word-level pipeline, so the word rate has a
   pinned target and the `Sag2ZhV1` rate is pinned as the baseline; a change on
   either side fails the test.
-* **deferred** - the profile still tokenises per character and the segmenter or
-  stemmer is plan §5 batch 2 (Snowball for ru/pl/el, an Arabic stemmer, Indic
-  word boundaries for hi, Vietnamese word boundaries).  The word rate is
-  reported but **not** asserted, because a target would only restate the gap.
-* **dictionary required** - `ja`/`ko` cannot tokenise without a runtime
-  dictionary and CI has none, so there is nothing to measure offline.  Those
-  profiles now return `AnalysisError::DictionaryMissing` instead of a
-  character-level stream, which is asserted for every content word.
+* **deferred** - the profile needs the stemmer plan §5 batch 2 owns (Snowball
+  for ru/el, an Arabic stemmer, Indic word boundaries for hi, Vietnamese word
+  boundaries).  A whole word is one token for them, but an inflected form is
+  still a different term, which is what the stemmer has to fix.  The word rate
+  is reported but **not** asserted, because a target would only restate the gap.
+* **dictionary required** - `ja` cannot tokenise without a runtime dictionary
+  and CI has none, so there is nothing to measure offline.  It returns
+  `AnalysisError::DictionaryMissing` instead of a character-level stream, which
+  is asserted for every content word.
 
 `Phrase3 R@10 gain` is `recall@10(Phrase3) - recall@10(Lexical)` on the same
-pack; it never trails Lexical in any pack.
+pack; it never trails Lexical in any pack.  Both modes now reach 1.000 on every
+pack, so the fixture no longer separates them: Lexical used to trail on the
+character-level packs (ru 0.90, ar/el 0.80) because an `OR` of single
+characters retrieves the word-salad decoys as readily as the document, and the
+word token L1 adds outranks them.  `Phrase3`'s advantage is still the PUD-scale
+result in the plan's §4; this fixture cannot reproduce ranking effects of that
+size on ten documents.
 
-What the table says, plainly: Thai, German, French, Chinese and English produce
-words (0.50-1.00); Vietnamese's normalisation turns its syllables into ASCII
-tokens (0.00 -> 0.17) and Polish's Latin fold helps some of its words (0.50 ->
-0.58) without giving it word boundaries; and Russian, Arabic, Hindi, Greek and
-Korean still tokenise per character.  For those the *recall* gain comes from
-the query side - `Phrase3` keeps the characters adjacent instead of OR-ing
-them.  The "≥ 10 pts" figures in the plan's §1 are the PUD-scale measurements
-of the Python prototype; this fixture cannot reproduce corpus-scale ranking
-effects on ten documents, and the pinned gains above are what the port
-currently demonstrates on its own data.
+What the table says, plainly: two of the plan's §5.1 L1 criteria are met -
+French, Korean and Polish all reach 1.00 (from 0.50, n/a and 0.58), and no R@10
+number drops.  Hindi stays at 0.42 because a stacked mark (nukta ccc 7, virama
+ccc 9) ends a word run, and Vietnamese stays at 0.17 because its words are
+space-separated syllables that need their own word boundary, not a character
+class.  Both remain §5 batch 2 work.
 
 ## Query modes
 
@@ -217,13 +229,14 @@ index is never touched.
 | `Lexical` (default) | `"term" OR "term" ...`, the de-duplicated unigram `OR` (`sag2.py:95-97`) | byte-identical to the reference; every gate replays this |
 | `Phrase3` | whole-chunk phrases, then every three-token window, then the same unigrams as a fallback | query-side only; the 80-term budget reserves eight slots for the unigram fallback |
 
-`Phrase3` is what a character-level profile needs: without word boundaries the
+`Phrase3` is what a token stream without word boundaries needs: without them the
 `OR` of single characters matches almost every chunk, while a three-character
 window has to exist.  The unigram fallback is not optional - exact phrases
 alone lose Korean recall (90.5% to 49.4% R@10 in the plan's measurements),
 because the character unigrams act as an accidental stemmer for the
-agglutinative particles.  On the fixture above Phrase3 never trails Lexical and
-lifts the character-level packs (ru +0.10, ar/el +0.20).
+agglutinative particles.  On the fixture above Phrase3 never trails Lexical;
+both reach 1.000 on every pack since the `multilingual-v1` profiles gained word
+tokens, so the fixture no longer shows the separation the plan's PUD numbers do.
 
 Use it through the library (`SearchOptions::query_mode`,
 `CorpusIndex::match_query_with`) or the CLI (`--query-mode phrase3`).
@@ -301,13 +314,18 @@ hits:       1
 
 `--judge oracle` runs the full SAG2 loop with the deterministic fixture judge
 (no network) and prints `jev`/`fusion` scores; omit it for BM25 retrieval only.
-A Japanese or Korean index needs its dictionary on both commands:
+A Japanese index needs its dictionary on both commands:
 
 ```sh
 cargo build -p sag2-cli --features lindera
 SAG2_DICT_DIR=/path/to/ipadic cargo run -p sag2-cli --features lindera -- \
     search --index ja.sqlite --query 東京
 ```
+
+Every other profile refuses a `--dict-dir`/`SAG2_DICT_DIR` value with
+`AnalysisError::DictionaryUnused` rather than ignoring it: a Korean index is
+built from word runs, and silently accepting a dictionary directory would make
+it look as though a morphological one had been used.
 
 ## Workspace crates
 

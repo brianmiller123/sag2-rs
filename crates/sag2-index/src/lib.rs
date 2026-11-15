@@ -163,7 +163,7 @@ impl CorpusIndex {
     /// index was built with, or `None` for the dictionary-free profiles.
     ///
     /// A profile that needs a dictionary cannot be opened without one, so this
-    /// is `Some` exactly for a Japanese or Korean index.
+    /// is `Some` exactly for a Japanese index.
     pub fn dictionary_fingerprint(&self) -> Option<&str> {
         self.dictionary
             .as_deref()

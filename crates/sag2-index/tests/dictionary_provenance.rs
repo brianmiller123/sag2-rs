@@ -1,11 +1,11 @@
-//! Dictionary profiles fail closed: a `multilingual-v1-ja`/`-ko` build or open
+//! Dictionary profiles fail closed: a `multilingual-v1-ja` build or open
 //! without a dictionary directory is a typed error, and an index whose
 //! `analysis_dict` row names another dictionary is provenance, never a rebuild.
 //!
 //! No real dictionary is needed here: the directory rules are exercised at the
 //! resolution boundary, and the provenance test edits the recorded fingerprint
-//! directly.  The offline `#[ignore]`d test that loads a real ipadic/ko-dic
-//! lives in `sag2-core/tests/lindera_dictionary.rs`.
+//! directly.  The offline `#[ignore]`d test that loads a real ipadic lives in
+//! `sag2-core/tests/lindera_dictionary.rs`.
 
 use rusqlite::Connection;
 use sag2_index::{
@@ -49,27 +49,27 @@ fn japanese() -> Profile {
 
 #[test]
 fn a_dictionary_profile_without_a_directory_cannot_build() {
-    for language in [Language::Ja, Language::Ko] {
-        let directory = tempfile::tempdir().expect("temp dir");
-        let path = directory.path().join("index.sqlite");
-        let error = CorpusIndex::open(
-            &path,
-            &corpus(),
-            "fixture",
-            options(Profile::Multilingual { language }),
-        )
-        .expect_err("no dictionary directory");
-        match error {
-            OpenError::Analysis(AnalysisError::DictionaryMissing { language: found }) => {
-                assert_eq!(found, language);
-            }
-            other => panic!("unexpected {other:?}"),
-        }
-        assert!(
-            !path.exists(),
-            "a refused build must not write a degraded index"
-        );
+    let directory = tempfile::tempdir().expect("temp dir");
+    let path = directory.path().join("index.sqlite");
+    let error = CorpusIndex::open(
+        &path,
+        &corpus(),
+        "fixture",
+        options(Profile::Multilingual {
+            language: Language::Ja,
+        }),
+    )
+    .expect_err("no dictionary directory");
+    match error {
+        OpenError::Analysis(AnalysisError::DictionaryMissing {
+            language: Language::Ja,
+        }) => {}
+        other => panic!("unexpected {other:?}"),
     }
+    assert!(
+        !path.exists(),
+        "a refused build must not write a degraded index"
+    );
 }
 
 #[test]

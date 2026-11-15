@@ -10,6 +10,10 @@ use std::process::{Command, Output};
 fn run(arguments: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_sag2-cli"))
         .args(arguments)
+        // A developer's exported dictionary belongs to their own indexes; every
+        // profile except Japanese refuses one, so an inherited value would turn
+        // these tests into environment probes.
+        .env_remove("SAG2_DICT_DIR")
         .output()
         .expect("the binary runs")
 }
@@ -191,6 +195,54 @@ fn refused_open_exits_three_with_the_typed_error() {
         stderr(&profile).contains("unknown analysis profile"),
         "{}",
         stderr(&profile)
+    );
+}
+
+/// A dictionary directory is refused by every profile that does not read one.
+///
+/// Silently ignoring it is how a Korean build comes to look as though it ran
+/// morphological analysis, so the index boundary and the CLI both report it.
+#[test]
+fn a_dictionary_directory_for_a_dictionary_free_profile_is_refused() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let corpus = write_corpus(directory.path());
+    let dictionary = tempfile::tempdir().expect("dictionary dir");
+    let index = directory.path().join("ko.sqlite");
+
+    let refused = run(&[
+        "build",
+        "--input",
+        &corpus,
+        "--output",
+        index.to_str().expect("index path"),
+        "--profile",
+        "multilingual-v1-ko",
+        "--dict-dir",
+        dictionary.path().to_str().expect("dictionary path"),
+    ]);
+    assert_eq!(refused.status.code(), Some(3), "{}", stderr(&refused));
+    assert!(
+        stderr(&refused).contains("profile multilingual-v1-ko does not use a dictionary"),
+        "{}",
+        stderr(&refused)
+    );
+    assert!(!index.exists(), "a refused build must not write an index");
+
+    // The same profile builds without one: Korean is dictionary-free.
+    let built = run(&[
+        "build",
+        "--input",
+        &corpus,
+        "--output",
+        index.to_str().expect("index path"),
+        "--profile",
+        "multilingual-v1-ko",
+    ]);
+    assert_eq!(built.status.code(), Some(0), "{}", stderr(&built));
+    assert!(
+        stdout(&built).contains("profile:     multilingual-v1-ko"),
+        "{}",
+        stdout(&built)
     );
 }
 

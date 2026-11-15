@@ -7,25 +7,28 @@
 //!
 //! Every pack is in exactly one state, and the fixture says which:
 //!
-//! * **measured** (`th`, `de`, `fr`, `zh`, `en`) - the profile has a word-level
-//!   pipeline, so the word rate has a pinned target and the reference
-//!   `Sag2ZhV1` rate is pinned as the baseline.
-//! * **deferred** (`ru`, `ar`, `hi`, `el`, `vi`, `pl`) - the profile still
-//!   tokenises per character because the segmenter or stemmer is plan §5
-//!   batch 2 (Snowball for ru/pl/el, an Arabic stemmer, Indic word boundaries
-//!   for hi, Vietnamese word boundaries).  Their word rate is printed but not
-//!   asserted: a target would only restate the gap.
-//! * **dictionary required** (`ja`, `ko`) - these cannot tokenise without a
-//!   runtime dictionary, and CI has none.  They must return
+//! * **measured** (`th`, `de`, `fr`, `ko`, `pl`, `zh`, `en`) - the profile has
+//!   a word-level pipeline, so the word rate has a pinned target and the
+//!   reference `Sag2ZhV1` rate is pinned as the baseline.
+//! * **deferred** (`ru`, `ar`, `hi`, `el`, `vi`) - the profile still needs the
+//!   stemmer plan §5 batch 2 owns (Snowball for ru/el, an Arabic stemmer, Indic
+//!   word boundaries for hi, Vietnamese word boundaries), so their word rate is
+//!   printed but not asserted: a target would restate the gap, not measure it.
+//!   A whole word is one token for them since L1, but an inflected one is still
+//!   a different term, which is what the stemmer has to fix.
+//! * **dictionary required** (`ja`) - Japanese cannot tokenise without a
+//!   runtime dictionary, and CI has none.  It must return
 //!   [`AnalysisError::DictionaryMissing`](sag2_core::AnalysisError) instead of
-//!   a character stream, so they contribute no word-rate or R@10 number here.
+//!   a character stream, so it contributes no word-rate or R@10 number here.
+//!   Korean is *not* in this state: its eojeol are space-delimited, so the
+//!   word-run pipeline reaches word-level tokens without a dictionary.
 //!
 //! For every measured pack this file checks:
 //!
-//! 1. **word rate** - the share of the pack's content words that tokenise to
-//!    exactly one token.  The multilingual profile has to reach the pack's
-//!    `target_word_rate`; `Profile::Sag2ZhV1` is pinned to its recorded
-//!    `baseline_word_rate`, so the default path cannot move unnoticed.
+//! 1. **word rate** - the share of the pack's content words that survive as
+//!    one whole token (see [`word_level`]).  The multilingual profile has to
+//!    reach the pack's `target_word_rate`; `Profile::Sag2ZhV1` is pinned to its
+//!    recorded `baseline_word_rate`, so the default path cannot move unnoticed.
 //! 2. **R@10** - the pack's ten documents are indexed in a temporary
 //!    directory and its ten queries are replayed in [`QueryMode::Lexical`] and
 //!    [`QueryMode::Phrase3`].  Phrase3 must not trail Lexical, and the packs
@@ -51,6 +54,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use sag2_core::analysis::normalize::normalize;
 use sag2_core::{tokenize, tokenize_with, AnalysisError, Profile};
 use sag2_index::{CorpusIndex, Document, IndexOptions, QueryMode, RebuildPolicy};
 use serde::Deserialize;
@@ -87,8 +91,8 @@ struct Pack {
     /// segmenter or stemmer, so the word rate is reported but not asserted.
     #[serde(default)]
     deferred: bool,
-    /// The profile cannot tokenise without a runtime dictionary (ja/ko), so
-    /// there is nothing to measure offline.
+    /// The profile cannot tokenise without a runtime dictionary (Japanese
+    /// only), so there is nothing to measure offline.
     #[serde(default)]
     dictionary_required: bool,
     /// The word rate the profile must reach - `Some` for measured packs only.
@@ -154,17 +158,35 @@ fn profile(pack: &Pack) -> Profile {
     }
 }
 
-/// `(hits, total)` for one profile: content words that come out as one token.
+/// Whether `word` survives as one whole token under `profile`.
+///
+/// The reference pipeline emits one token per word slice, so "one token" is
+/// exactly "the word was not shredded".  A multilingual profile also emits the
+/// code points of a run ([`sag2_core::analysis::Profile::Multilingual`]), so the
+/// whole word is one token *in a longer stream*: `len() == 1` would score a
+/// correctly segmented `bibliothèque` as a miss.  The token a multilingual
+/// profile emits is the profile's own spelling of the word, so the comparison
+/// is against [`normalize`], not against the raw fixture text (`szkoła` reaches
+/// the stored token `szkola`).
+fn word_level(profile: Profile, word: &str) -> bool {
+    let Ok(tokens) = tokenize_with(profile, word) else {
+        return false;
+    };
+    match profile {
+        Profile::Sag2ZhV1 => tokens.len() == 1,
+        Profile::Multilingual { language } => {
+            let whole = normalize(language, word);
+            tokens.contains(&whole)
+        }
+    }
+}
+
+/// `(hits, total)` for one profile: content words that survive as one token.
 fn word_rate(profile: Profile, pack: &Pack) -> (usize, usize) {
     let hits = pack
         .content_words
         .iter()
-        .filter(|word| {
-            tokenize_with(profile, word)
-                .expect("a dictionary-free profile always tokenises")
-                .len()
-                == 1
-        })
+        .filter(|word| word_level(profile, word))
         .count();
     (hits, pack.content_words.len())
 }
@@ -178,10 +200,11 @@ fn word_rate(profile: Profile, pack: &Pack) -> (usize, usize) {
 ///   the token stream is real words, so the decoy keeps every word and loses
 ///   the order.  A `Lexical` expression (the `OR` of the words) retrieves it as
 ///   readily as the document; a phrase expression does not.
-/// * `"chars"` (Russian, Arabic, Hindi, Greek, Polish, Korean) - the token
-///   stream is single characters, so the decoy is the character sequence
-///   rotated and joined without spaces: every character is still there, no
-///   three-character window of the original survives.
+/// * `"chars"` (Russian, Arabic, Hindi, Greek, Polish, Korean) - the decoy is
+///   the character sequence rotated and joined without spaces: every character
+///   is still there, no three-character window of the original survives.  These
+///   packs carry code-point tokens alongside their words, which is exactly the
+///   recall path the decoy has to stress.
 ///
 /// Decoy `k` of a document rotates its stream by `(k + 1) * 7` positions, which
 /// is deterministic and keeps the same multiset of tokens.
@@ -326,6 +349,17 @@ fn the_fixture_covers_thirteen_languages_in_three_states() {
             "{}: profile parses",
             pack.lang
         );
+        // Chinese has no multilingual variant: L1's word-character policy is a
+        // `Profile::Multilingual` policy, and a Chinese pack must keep the
+        // reference classifier rather than a `multilingual-v1-zh` id.
+        if matches!(pack.lang.as_str(), "zh" | "en") {
+            assert_eq!(
+                profile(pack),
+                Profile::Sag2ZhV1,
+                "{}: the reference classifier",
+                pack.lang
+            );
+        }
         // A pack is measured (both word-rate fields), deferred (neither, and
         // no gain target), or dictionary-required (no word rate at all).
         let measured = pack.target_word_rate.is_some() && pack.baseline_word_rate.is_some();
@@ -341,7 +375,7 @@ fn the_fixture_covers_thirteen_languages_in_three_states() {
                 "{}: no R@10 target",
                 pack.lang
             );
-            assert!(matches!(pack.lang.as_str(), "ja" | "ko"));
+            assert!(matches!(pack.lang.as_str(), "ja"));
         } else if pack.deferred {
             assert!(
                 !measured,
@@ -367,11 +401,13 @@ fn the_fixture_covers_thirteen_languages_in_three_states() {
 
 #[test]
 fn a_dictionary_profile_refuses_the_character_fallback() {
-    // C2: `ja`/`ko` without a dictionary are a typed error, never the
-    // character tokens the old wrapper handed back.
+    // C2: a dictionary profile without a dictionary is a typed error, never the
+    // character tokens the old wrapper handed back.  Japanese is the only such
+    // profile left: Korean reaches word-level tokens through the word-run
+    // pipeline, so it no longer needs a dictionary at all.
     let all = packs();
     let dictionary: Vec<&Pack> = all.iter().filter(|pack| pack.dictionary_required).collect();
-    assert_eq!(dictionary.len(), 2, "ja and ko");
+    assert_eq!(dictionary.len(), 1, "Japanese only");
     for pack in dictionary {
         let profile = profile(pack);
         for word in &pack.content_words {

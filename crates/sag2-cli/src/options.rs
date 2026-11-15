@@ -17,8 +17,10 @@ pub fn value<'a>(
 
 /// The dictionary directory: `--dict-dir`, else `SAG2_DICT_DIR`.
 ///
-/// Only the Japanese and Korean profiles need one; every other profile ignores
-/// the value, so an unset variable is not an error on its own.
+/// Only the Japanese profile resolves one; every other profile reports
+/// `AnalysisError::DictionaryUnused` rather than ignoring the value, so a caller
+/// cannot come away believing it loaded a dictionary that was never read.  An
+/// unset variable and no flag is `None`, which is not an error on its own.
 pub fn dictionary_dir(explicit: Option<PathBuf>) -> Option<PathBuf> {
     explicit.or_else(|| {
         std::env::var_os("SAG2_DICT_DIR")

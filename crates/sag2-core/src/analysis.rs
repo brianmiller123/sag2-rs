@@ -3,16 +3,20 @@
 //! [`Profile::Sag2ZhV1`] is the certified reference pipeline of design §4 and
 //! the only profile that reproduces the Python token stream byte for byte.
 //! [`Profile::Multilingual`] is the word-level pipeline for one language: it
-//! runs [`normalize::normalize`] before the same §4 tokenizer, so accent, case
-//! and orthographic variants of a word collapse onto one term.  A language that
-//! writes without spaces ([`Language::Th`]) replaces the §4 word boundaries
-//! with its own segmenter (see [`segment`]) and shares the rest: the certified
-//! ASCII model and the final filters.  Japanese and Korean need a runtime
-//! dictionary ([`Language::Ja`], [`Language::Ko`]); the resolved segmenter is a
+//! runs [`normalize::normalize`] before the same §4 post-rules, with the
+//! multilingual word character set (`tokenize::is_word_character`) instead of
+//! `re_han_default`'s ASCII + Han set, so accent, case and orthographic variants
+//! of a word collapse onto one term and a word in any script stays one token.  A
+//! language that writes without spaces ([`Language::Th`]) replaces the §4 word
+//! boundaries with its own segmenter (see [`segment`]) and shares the rest: the
+//! certified ASCII model and the final filters.  Japanese needs a runtime
+//! dictionary ([`Language::Ja`]); the resolved segmenter is a
 //! [`segment::DictionaryAnalysis`] and a profile that needs one without it is a
-//! typed error, never a degraded token stream.  The identifier a profile
-//! persists in an index (`rust_index_metadata.analysis`) comes from
-//! [`Profile::as_str`].
+//! typed error, never a degraded token stream.  Korean needs none: its eojeol
+//! are space-delimited, so the word-run pipeline is the whole story and a
+//! dictionary-backed Korean profile would be a *separate* profile identifier,
+//! never a mode of `multilingual-v1-ko`.  The identifier a profile persists in
+//! an index (`rust_index_metadata.analysis`) comes from [`Profile::as_str`].
 
 use std::fmt;
 use std::path::PathBuf;
@@ -24,18 +28,19 @@ pub mod segment;
 pub use segment::DictionaryAnalysis;
 
 use crate::ascii_cut;
-use crate::tokenize::{keep, tokenize_default, tokenize_normalised};
+use crate::tokenize::{keep, tokenize_default, tokenize_multilingual};
 
 /// The language a multilingual profile is built for.
 ///
-/// The language decides the profile's normalisation rules (see [`normalize`]);
-/// the tokenizer itself stays the shared §4 pipeline until T4/T5 add the
-/// language segmenters.
+/// The language decides the profile's normalisation rules (see [`normalize`])
+/// and, for [`Language::Th`], the segmenter; every other language shares the
+/// multilingual word pipeline (`tokenize::is_word_character`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Language {
     /// Japanese.
     Ja,
-    /// Korean.
+    /// Korean: word runs, no morphological analysis (the eojeol are
+    /// space-delimited, so there is nothing to segment).
     Ko,
     /// Thai.
     Th,
@@ -117,7 +122,7 @@ pub enum Profile {
     /// (design §4.1, §4.2).
     Sag2ZhV1,
     /// The word-level pipeline for `language`: normalisation first, then the
-    /// §4 tokenizer.
+    /// multilingual word tokenizer (word runs dual-emitted, Han through jieba).
     Multilingual {
         /// The language whose normalisation rules apply.
         language: Language,
@@ -149,16 +154,20 @@ impl Profile {
 
     /// The language whose profile segments with a dictionary directory.
     ///
-    /// `Some` for [`Language::Ja`] and [`Language::Ko`] only: those two profiles
-    /// cannot tokenise without one, so index build and open refuse them when the
-    /// caller supplies no directory (see [`segment::DictionaryAnalysis`]).
+    /// `Some` for [`Language::Ja`] only: Japanese cannot tokenise without one,
+    /// so index build and open refuse it when the caller supplies no directory
+    /// (see [`segment::DictionaryAnalysis`]).  Korean is dictionary-free: the
+    /// word-run pipeline already produces word-level tokens, and a
+    /// dictionary-backed Korean profile would be a separate profile identifier
+    /// (`multilingual-v1-ko-<segmenter>`), never a mode of `multilingual-v1-ko`,
+    /// because one identifier must name exactly one token stream.
     pub fn dictionary_language(self) -> Option<Language> {
         match self {
             Profile::Sag2ZhV1 => None,
-            Profile::Multilingual { language } => match language {
-                Language::Ja | Language::Ko => Some(language),
-                _ => None,
-            },
+            Profile::Multilingual {
+                language: Language::Ja,
+            } => Some(Language::Ja),
+            Profile::Multilingual { .. } => None,
         }
     }
 }
@@ -182,6 +191,17 @@ pub enum AnalysisError {
     DictionaryMissing {
         /// The language whose profile needs one.
         language: Language,
+    },
+    /// The caller supplied a dictionary directory to a profile that does not
+    /// tokenise with one.
+    ///
+    /// Ignoring it silently is how a caller comes to believe a Korean index was
+    /// built with morphological analysis it never had: an index records the
+    /// pipeline that produced its tokens, so a directory a profile cannot use is
+    /// a caller mistake, not a harmless extra argument.
+    DictionaryUnused {
+        /// The profile the directory was passed for.
+        profile: Profile,
     },
     /// The profile segments with a dictionary but this build has no `lindera`
     /// feature, so it cannot load one.
@@ -240,6 +260,9 @@ impl fmt::Display for AnalysisError {
                     language: *language
                 }
             ),
+            AnalysisError::DictionaryUnused { profile } => {
+                write!(formatter, "profile {profile} does not use a dictionary")
+            }
             AnalysisError::Segmentation { language, source } => write!(
                 formatter,
                 "cannot segment {} input: {source}",
@@ -257,6 +280,7 @@ impl std::error::Error for AnalysisError {
             AnalysisError::Dictionary { source, .. } => Some(source.as_ref()),
             AnalysisError::Segmentation { source, .. } => Some(source.as_ref()),
             AnalysisError::DictionaryMissing { .. }
+            | AnalysisError::DictionaryUnused { .. }
             | AnalysisError::DictionaryUnsupported { .. } => None,
         }
     }
@@ -313,15 +337,15 @@ impl FromStr for Profile {
 /// [`Profile::Sag2ZhV1`] is the certified pipeline and what [`crate::tokenize()`]
 /// always uses; it does not enter [`normalize`] at all, so its token stream and
 /// allocations are the ones the goldens pin.  [`Profile::Multilingual`] runs
-/// [`normalize::normalize`] for its language and then the same §4 tokenizer -
-/// except for [`Language::Th`], where [`thai_tokens`] supplies the word
-/// boundaries and keeps the certified ASCII model and the final filters.
+/// [`normalize::normalize`] for its language and then the multilingual word
+/// tokenizer - except for [`Language::Th`], where [`thai_tokens`] supplies the
+/// word boundaries and keeps the certified ASCII model and the final filters.
 ///
-/// This is the dictionary-free entry point.  [`Language::Ja`] and
-/// [`Language::Ko`] cannot tokenise without a dictionary, so they return
-/// [`AnalysisError::DictionaryMissing`] here rather than a character-level
-/// stream that would not match the index: their callers resolve
-/// [`segment::DictionaryAnalysis`] first and use [`tokenize_with_segmenter`].
+/// This is the dictionary-free entry point.  [`Language::Ja`] cannot tokenise
+/// without a dictionary, so it returns [`AnalysisError::DictionaryMissing`] here
+/// rather than a character-level stream that would not match the index: its
+/// callers resolve [`segment::DictionaryAnalysis`] first and use
+/// [`tokenize_with_segmenter`].  Korean needs no dictionary.
 pub fn tokenize_with(profile: Profile, text: &str) -> Result<Vec<String>, AnalysisError> {
     tokenize_with_segmenter(profile, text, None)
 }
@@ -352,7 +376,7 @@ pub fn tokenize_with_segmenter(
             }
             match language {
                 Language::Th => thai_tokens(&normalised),
-                _ => Ok(tokenize_normalised(&normalised)),
+                _ => Ok(tokenize_multilingual(&normalised)),
             }
         }
     }
@@ -459,26 +483,29 @@ mod tests {
     }
 
     #[test]
-    fn only_japanese_and_korean_profiles_need_a_dictionary() {
+    fn only_the_japanese_profile_needs_a_dictionary() {
         assert_eq!(Profile::Sag2ZhV1.dictionary_language(), None);
         for language in LANGUAGES {
             let profile = Profile::Multilingual { language };
-            let expected = matches!(language, Language::Ja | Language::Ko).then_some(language);
+            let expected = (language == Language::Ja).then_some(Language::Ja);
             assert_eq!(profile.dictionary_language(), expected, "{language:?}");
         }
     }
 
     #[test]
     fn a_dictionary_profile_without_a_directory_is_a_typed_error() {
-        for language in [Language::Ja, Language::Ko] {
-            let error = DictionaryAnalysis::resolve(Profile::Multilingual { language }, None)
-                .expect_err("no dictionary directory");
-            match error {
-                AnalysisError::DictionaryMissing { language: found } => {
-                    assert_eq!(found, language)
-                }
-                other => panic!("unexpected {other:?}"),
-            }
+        let error = DictionaryAnalysis::resolve(
+            Profile::Multilingual {
+                language: Language::Ja,
+            },
+            None,
+        )
+        .expect_err("no dictionary directory");
+        match error {
+            AnalysisError::DictionaryMissing {
+                language: Language::Ja,
+            } => {}
+            other => panic!("unexpected {other:?}"),
         }
     }
 
@@ -523,25 +550,33 @@ mod tests {
 
     #[test]
     fn a_dictionary_profile_never_degrades_to_characters() {
-        for language in [Language::Ja, Language::Ko] {
-            let profile = Profile::Multilingual { language };
-            match tokenize_with(profile, "東京") {
-                Err(AnalysisError::DictionaryMissing { language: found }) => {
-                    assert_eq!(found, language)
-                }
-                other => panic!("{language:?} must refuse without a dictionary, got {other:?}"),
-            }
-            match crate::match_query_with(crate::QueryMode::Lexical, profile, "東京") {
-                Err(AnalysisError::DictionaryMissing { language: found }) => {
-                    assert_eq!(found, language)
-                }
-                other => panic!("{language:?} must not build an expression, got {other:?}"),
-            }
+        let profile = Profile::Multilingual {
+            language: Language::Ja,
+        };
+        match tokenize_with(profile, "東京") {
+            Err(AnalysisError::DictionaryMissing {
+                language: Language::Ja,
+            }) => {}
+            other => panic!("Japanese must refuse without a dictionary, got {other:?}"),
         }
+        match crate::match_query_with(crate::QueryMode::Lexical, profile, "東京") {
+            Err(AnalysisError::DictionaryMissing {
+                language: Language::Ja,
+            }) => {}
+            other => panic!("Japanese must not build an expression, got {other:?}"),
+        }
+        // Korean needs no dictionary, and its word-level stream is not the
+        // character fallback the old wrapper produced.
+        let korean = Profile::Multilingual {
+            language: Language::Ko,
+        };
+        let tokens = tokens(korean, "도서관에서");
+        assert_eq!(tokens.last().map(String::as_str), Some("도서관에서"));
+        assert!(tokens.len() > 1, "{tokens:?}");
     }
 
     #[test]
-    fn a_dictionary_free_profile_never_resolves_a_dictionary() {
+    fn a_dictionary_free_profile_refuses_a_dictionary() {
         let directory = tempfile::tempdir().expect("temp dir");
         for profile in [
             Profile::Sag2ZhV1,
@@ -549,16 +584,44 @@ mod tests {
                 language: Language::De,
             },
             Profile::Multilingual {
+                language: Language::Ko,
+            },
+            Profile::Multilingual {
                 language: Language::Th,
             },
         ] {
             assert!(
-                DictionaryAnalysis::resolve(profile, Some(directory.path()))
-                    .expect("resolve")
+                DictionaryAnalysis::resolve(profile, None)
+                    .expect("resolve without a directory")
                     .is_none(),
                 "{profile}"
             );
+            // A directory this profile cannot read is a caller mistake: it must
+            // never be silently dropped, or a Korean build looks morphological.
+            match DictionaryAnalysis::resolve(profile, Some(directory.path())) {
+                Err(AnalysisError::DictionaryUnused { profile: found }) => {
+                    assert_eq!(found, profile)
+                }
+                other => panic!("{profile}: unexpected {other:?}"),
+            }
         }
+    }
+
+    #[test]
+    fn an_unused_dictionary_names_the_profile_that_ignores_it() {
+        use std::error::Error as _;
+
+        let directory = tempfile::tempdir().expect("temp dir");
+        let profile = Profile::Multilingual {
+            language: Language::Ko,
+        };
+        let error = DictionaryAnalysis::resolve(profile, Some(directory.path()))
+            .expect_err("Korean has no dictionary pipeline");
+        assert_eq!(
+            error.to_string(),
+            "profile multilingual-v1-ko does not use a dictionary"
+        );
+        assert!(error.source().is_none());
     }
 
     #[cfg(not(feature = "lindera"))]
@@ -567,14 +630,14 @@ mod tests {
         let directory = tempfile::tempdir().expect("temp dir");
         let error = DictionaryAnalysis::resolve(
             Profile::Multilingual {
-                language: Language::Ko,
+                language: Language::Ja,
             },
             Some(directory.path()),
         )
         .expect_err("a build without the feature cannot load one");
         match error {
             AnalysisError::DictionaryUnsupported {
-                language: Language::Ko,
+                language: Language::Ja,
             } => {}
             other => panic!("unexpected {other:?}"),
         }

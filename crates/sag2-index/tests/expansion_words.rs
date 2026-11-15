@@ -145,7 +145,7 @@ fn a_name_phrase_is_skipped_only_when_it_is_a_contiguous_query_run() {
 }
 
 #[test]
-fn a_character_level_profile_keeps_only_characters_absent_from_the_query() {
+fn a_word_run_profile_keeps_both_word_and_code_point_candidates() {
     let corpus = [document("كتاب", "كتاب علم")];
     let (_directory, index) = open(
         Profile::Multilingual {
@@ -155,15 +155,15 @@ fn a_character_level_profile_keeps_only_characters_absent_from_the_query() {
     );
     let found = terms(&index, "علم", "كتاب علم");
 
-    // Arabic tokenises to one code point per token: the three query characters
-    // are skipped, the four characters of the other word are kept.
+    // L1: an Arabic word is one token *and* keeps its code points, so a
+    // candidate can be a whole word or a single code point.  The query's own
+    // tokens (its four characters and its word) are skipped either way.
     let kept: BTreeSet<&str> = found.iter().map(|(term, _)| term.as_str()).collect();
     assert_eq!(
         kept,
-        ["ا", "ب", "ت", "ك"].into_iter().collect(),
+        ["ا", "ب", "ت", "ك", "كتاب"].into_iter().collect(),
         "{found:?}"
     );
-    assert!(found.iter().all(|(term, _)| term.chars().count() == 1));
 }
 
 #[test]

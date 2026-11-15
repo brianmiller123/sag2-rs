@@ -69,8 +69,8 @@ pub fn match_query(query: &str) -> String {
 /// without a dictionary.
 ///
 /// This is the convenience wrapper: it is byte-identical to
-/// [`match_query_with_segmenter`] with `dictionary = None`.  A Japanese or
-/// Korean profile has no dictionary-free pipeline, so it returns
+/// [`match_query_with_segmenter`] with `dictionary = None`.  A Japanese profile
+/// has no dictionary-free pipeline, so it returns
 /// [`AnalysisError::DictionaryMissing`] rather than a character-level
 /// expression; an index passes its resolved [`DictionaryAnalysis`] to
 /// [`match_query_with_segmenter`] instead, so the query stream and the stored

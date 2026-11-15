@@ -10,6 +10,13 @@
 //! 4. 2- and 3-codepoint substrings whose `FREQ` is positive
 //! 5. the word itself
 //! 6. `HAS_CONTENT` and `STOPWORDS` filters
+//!
+//! Steps 1-6 are the certified pipeline and the only one [`tokenize`] uses.
+//! [`tokenize_multilingual`] shares steps 3-6 and the jieba path for CJK text,
+//! but takes its word boundaries from [`is_word_character`] instead of
+//! `re_han_default`, so a language that does not write in ASCII or Han reaches
+//! word-level tokens without losing the code-point tokens the reference
+//! pipeline emits (plan §5.1 L1).
 
 use std::sync::LazyLock;
 
@@ -121,6 +128,24 @@ fn class(character: char) -> Class {
     }
 }
 
+/// The multilingual word character (plan §5.1 L1): a letter or a non-combining
+/// mark, or a number.
+///
+/// [`class`] accepts ASCII and `U+4E00-U+9FD5` only, so every other script used
+/// to reach [`emit_block`] one code point at a time.  This set keeps a word
+/// together in every script, and it is built from the pinned Unicode 15.0.0
+/// tables of [`crate::unicode`], so the classification cannot drift with the
+/// compiler's Unicode version.  `combining_class == 0` keeps a stacked mark out
+/// of a run: Devanagari vowel signs and the anusvara (ccc 0) stay inside a
+/// word, the nukta (ccc 7) and the virama (ccc 9) end it.
+fn is_word_character(character: char) -> bool {
+    let cp = character as u32;
+    if unicode::is_number(cp) {
+        return true;
+    }
+    unicode::combining_class(cp) == 0 && (unicode::is_letter(cp) || unicode::is_mark(cp))
+}
+
 /// Tokenize `text` exactly like `sag2.tokenize` (design §4.1, §4.2).
 ///
 /// This is [`crate::analysis::tokenize_with`] with
@@ -132,19 +157,19 @@ pub fn tokenize(text: &str) -> Vec<String> {
 
 /// `NFKC` -> lower, then [`tokenize_normalised`].
 ///
-/// This is the §4 pipeline a profile enters: [`Profile::Sag2ZhV1`] stops after
-/// these two steps, and a multilingual profile runs its own
-/// [`crate::analysis::normalize`] first and then calls
-/// [`tokenize_normalised`], so no input is normalised twice (C4).
+/// This is the §4 pipeline the reference profile enters after its own
+/// normalisation: `NFKC` -> lower here, then [`tokenize_normalised`].  A
+/// multilingual profile runs [`crate::analysis::normalize`] first and then
+/// [`tokenize_multilingual`], so no input is normalised twice (C4).
 ///
 /// [`Profile::Sag2ZhV1`]: crate::analysis::Profile::Sag2ZhV1
 pub(crate) fn tokenize_default(text: &str) -> Vec<String> {
     tokenize_normalised(&unicode::lower(&unicode::nfkc(text)))
 }
 
-/// The §4 pipeline itself, over text the caller has already normalised
+/// The certified §4 pipeline, over text the caller has already normalised
 /// (design §4.1-§4.3).
-pub(crate) fn tokenize_normalised(normalised: &str) -> Vec<String> {
+fn tokenize_normalised(normalised: &str) -> Vec<String> {
     let mut words: Vec<String> = Vec::new();
     let mut block_start = 0_usize;
     let mut block_inside: Option<bool> = None;
@@ -168,6 +193,85 @@ pub(crate) fn tokenize_normalised(normalised: &str) -> Vec<String> {
         emit_block(&normalised[block_start..], state, &mut words);
     }
 
+    finish(words)
+}
+
+/// The multilingual word pipeline (plan §5.1 L1).
+///
+/// Same post-rules and filters as [`tokenize_normalised`], but the word
+/// boundaries are [`is_word_character`] and a word run the reference classifier
+/// would have shredded emits its code points *and* the whole run: the
+/// code-point tokens are what ru/ar/hi recall depends on, so they are never
+/// replaced.  CJK runs still go through the jieba path of [`emit_block`].
+pub(crate) fn tokenize_multilingual(normalised: &str) -> Vec<String> {
+    let mut words: Vec<String> = Vec::new();
+    let mut block_start = 0_usize;
+    let mut block_kind: Option<Segment> = None;
+    for (index, character) in normalised.char_indices() {
+        let kind = segment(character);
+        match block_kind {
+            Some(state) if state == kind => {}
+            Some(state) => {
+                emit_segment(&normalised[block_start..index], state, &mut words);
+                block_start = index;
+                block_kind = Some(kind);
+            }
+            None => {
+                block_start = index;
+                block_kind = Some(kind);
+            }
+        }
+    }
+    if let Some(kind) = block_kind {
+        emit_segment(&normalised[block_start..], kind, &mut words);
+    }
+    finish(words)
+}
+
+/// One multilingual segment: `re_han_default`'s CJK range, a word run, or a
+/// code point that is neither.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Segment {
+    /// A CJK run: the jieba path, exactly as in the reference pipeline.
+    Cjk,
+    /// A maximal run of [`is_word_character`] code points.
+    Word,
+    /// Anything else: one code point, one token, as the reference does it.
+    Other,
+}
+
+fn segment(character: char) -> Segment {
+    if class(character) == Class::Cjk {
+        Segment::Cjk
+    } else if is_word_character(character) {
+        Segment::Word
+    } else {
+        Segment::Other
+    }
+}
+
+/// Emit one multilingual segment.
+fn emit_segment(segment: &str, kind: Segment, out: &mut Vec<String>) {
+    match kind {
+        Segment::Cjk => emit_block(segment, true, out),
+        // An ASCII run already reaches the word level in the reference
+        // pipeline, so it has no code-point tokens to preserve; emitting them
+        // would only spend the query expression budget on characters.
+        Segment::Word if segment.is_ascii() => out.push(segment.to_owned()),
+        // Dual emission: the code points the reference pipeline would have
+        // produced, then the whole run.  A one-code-point run is not repeated.
+        Segment::Word => {
+            out.extend(segment.chars().map(String::from));
+            if segment.chars().count() > 1 {
+                out.push(segment.to_owned());
+            }
+        }
+        Segment::Other => out.extend(segment.chars().map(String::from)),
+    }
+}
+
+/// Rules 3-5 and the final filter, over the words a splitter produced.
+fn finish(words: Vec<String>) -> Vec<String> {
     let mut tokens = Vec::new();
     for word in &words {
         post_process(word, &mut tokens);
