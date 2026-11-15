@@ -21,7 +21,7 @@
 //! that sample equality rests on the platform libm rounding these operations
 //! identically to the reference build.
 
-use sag2_core::{names, quote_term, AnalysisError, QueryMode};
+use sag2_core::{names, quote_term, AnalysisError, Profile, QueryMode};
 use sag2_json::{compact_json, Value};
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
@@ -190,6 +190,37 @@ impl From<QueryError> for ExpansionError {
 impl From<AnalysisError> for ExpansionError {
     fn from(error: AnalysisError) -> Self {
         ExpansionError::Analysis(error)
+    }
+}
+
+/// `sag2.py:585-663`'s "the candidate is already in the query" test.
+///
+/// [`Profile::Sag2ZhV1`] keeps the certified rule verbatim: the candidate is
+/// skipped when *every* token of it occurs somewhere in the query's token set.
+///
+/// A word-level [`Profile::Multilingual`] compares the term's token run
+/// instead: a one-token term is skipped when that word occurs anywhere in the
+/// query, and a multi-token term (a name phrase, or a word-level run of a
+/// language whose tokens are characters) only when the whole run occurs
+/// contiguously in the query's token sequence.  That is what keeps a word-level
+/// candidate out of the character-subset dead end: a word that merely shares
+/// characters with a query word survives, while the query word itself does not.
+/// An empty tokenisation is skipped: it can never match the stored stream.
+fn term_in_query(
+    profile: Profile,
+    term_tokens: &[String],
+    query_tokens: &[String],
+    query_set: &BTreeSet<String>,
+) -> bool {
+    match profile {
+        Profile::Sag2ZhV1 => term_tokens.iter().all(|word| query_set.contains(word)),
+        Profile::Multilingual { .. } => match term_tokens {
+            [] => true,
+            [word] => query_set.contains(word),
+            tokens => query_tokens
+                .windows(tokens.len())
+                .any(|window| window == tokens),
+        },
     }
 }
 
@@ -383,6 +414,13 @@ impl CorpusIndex {
     }
 
     /// `sag2.py:585-663` `expansion_terms`.
+    ///
+    /// Candidates are the seed sentences' words and name phrases, tokenised by
+    /// the index's own pipeline; no character n-gram candidates are generated,
+    /// so a word-level profile is not diluted with 2/3-token windows of its
+    /// seeds.  The "already in the query" filter is per profile (the
+    /// module-private `term_in_query`) and the reference profile's rule is
+    /// byte-identical to `sag2.py:585-663`.
     pub fn expansion_terms(
         &self,
         query: &str,
@@ -437,7 +475,8 @@ impl CorpusIndex {
             }
         }
 
-        let original: BTreeSet<String> = self.tokenize(query)?.into_iter().collect();
+        let query_tokens = self.tokenize(query)?;
+        let original: BTreeSet<String> = query_tokens.iter().cloned().collect();
         // `max([0, *(seed["jev_score"] ...)])`.
         let max_score = seeds
             .iter()
@@ -521,10 +560,8 @@ impl CorpusIndex {
                     };
             for (term, term_frequency) in &counts {
                 let document_frequency = self.frequency(term)?;
-                if self
-                    .tokenize(term)?
-                    .iter()
-                    .all(|word| original.contains(word))
+                let term_tokens = self.tokenize(term)?;
+                if term_in_query(self.profile(), &term_tokens, &query_tokens, &original)
                     || document_frequency == 0
                 {
                     continue;
@@ -695,5 +732,97 @@ impl CorpusIndex {
             }
         }
         Ok((hits, queries))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::BTreeSet;
+
+    use super::term_in_query;
+    use sag2_core::{Language, Profile};
+
+    fn tokens(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_owned()).collect()
+    }
+
+    #[test]
+    fn the_multilingual_filter_compares_token_runs() {
+        let query_tokens = tokens(&["alice", "paul", "bridge"]);
+        let query_set: BTreeSet<String> = query_tokens.iter().cloned().collect();
+        let word_level = Profile::Multilingual {
+            language: Language::Th,
+        };
+
+        // A one-token term is skipped exactly when that word is in the query.
+        assert!(term_in_query(
+            word_level,
+            &tokens(&["bridge"]),
+            &query_tokens,
+            &query_set
+        ));
+        assert!(!term_in_query(
+            word_level,
+            &tokens(&["harbour"]),
+            &query_tokens,
+            &query_set
+        ));
+
+        // A multi-token term is skipped only when the whole run is contiguous.
+        assert!(term_in_query(
+            word_level,
+            &tokens(&["alice", "paul"]),
+            &query_tokens,
+            &query_set
+        ));
+        assert!(!term_in_query(
+            word_level,
+            &tokens(&["paul", "alice"]),
+            &query_tokens,
+            &query_set
+        ));
+        // Every token is in the query set but they are not one run: the old
+        // character-subset rule would have dropped this candidate.
+        assert!(!term_in_query(
+            word_level,
+            &tokens(&["alice", "bridge"]),
+            &query_tokens,
+            &query_set
+        ));
+        // A run longer than the query cannot match.
+        assert!(!term_in_query(
+            word_level,
+            &tokens(&["alice", "paul", "bridge", "harbour"]),
+            &query_tokens,
+            &query_set
+        ));
+        // An empty tokenisation is skipped instead of panicking on `windows(0)`.
+        let empty: [String; 0] = [];
+        assert!(term_in_query(word_level, &empty, &query_tokens, &query_set));
+    }
+
+    #[test]
+    fn the_reference_filter_keeps_the_certified_token_set_rule() {
+        let query_tokens = tokens(&["alice", "paul", "bridge"]);
+        let query_set: BTreeSet<String> = query_tokens.iter().cloned().collect();
+        // The reference rule is a subset test: a scattered pair still skips.
+        assert!(term_in_query(
+            Profile::Sag2ZhV1,
+            &tokens(&["alice", "bridge"]),
+            &query_tokens,
+            &query_set
+        ));
+        assert!(term_in_query(
+            Profile::Sag2ZhV1,
+            &tokens(&["bridge"]),
+            &query_tokens,
+            &query_set
+        ));
+        assert!(!term_in_query(
+            Profile::Sag2ZhV1,
+            &tokens(&["alice", "harbour"]),
+            &query_tokens,
+            &query_set
+        ));
     }
 }
