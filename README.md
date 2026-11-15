@@ -159,13 +159,14 @@ default index carries none of the plan's provenance rows: an absent `analysis`
 reads back as `sag2-zh-v1` and an absent `analysis_dict` as `none`, so the key
 set stays exactly the ten keys design §3.3 fixes (Gate D compares it exactly).
 `Profile::Multilingual { language }` normalises per language and takes its word
-boundaries from the multilingual word character set - a letter or non-combining
-mark, or a digit - instead of the reference classifier's ASCII + `U+4E00-U+9FD5`
+boundaries from the multilingual word character set - a letter or a digit, a
+mark with `combining_class == 0`, and the two joiner classes (ccc 7 nukta,
+ccc 9 virama) - instead of the reference classifier's ASCII + `U+4E00-U+9FD5`
 set; Han text still goes through jieba.  A word run the reference pipeline would
 have shredded emits its code points *and* the whole run, so a word-level index
 does not cost the code-point recall the non-ASCII packs rely on.  The profile
 persists `rust_index_metadata.analysis` (`multilingual-v1-<lang>`),
-`analysis_version` (`ml-1`, the multilingual pipeline revision — bumped
+`analysis_version` (`ml-2`, the multilingual pipeline revision — bumped
 whenever the tokenizer or normaliser changes, so an index from another revision
 is rebuilt rather than read with a tokenizer that did not produce its tokens)
 and, only for a profile that actually loaded a dictionary, `analysis_dict`, so
@@ -175,9 +176,9 @@ an index always reads back through the pipeline that built it.
 |---|---|---|---|---|---|
 | Russian | `multilingual-v1-ru` | normalise, word runs + code points | 1.00 | +0.00 | deferred |
 | Arabic | `multilingual-v1-ar` | normalise (hamza/alef/tatweel), word runs + code points | 1.00 | +0.00 | deferred |
-| Hindi | `multilingual-v1-hi` | word runs + code points (stacked marks end a run) | 0.42 | +0.00 | deferred |
+| Hindi | `multilingual-v1-hi` | word runs + code points (nukta and virama join a run) | 1.00 | +0.00 | measured |
 | Greek | `multilingual-v1-el` | normalise (strip tonos/dialytika), word runs + code points | 1.00 | +0.00 | deferred |
-| Vietnamese | `multilingual-v1-vi` | normalise (strip tone marks); syllables space-separated | 0.17 | +0.00 | deferred |
+| Vietnamese | `multilingual-v1-vi` | normalise (shared Latin fold; tone marks kept); syllables space-separated | 0.17 | +0.00 | deferred |
 | Polish | `multilingual-v1-pl` | normalise (Latin fold) + word runs | 1.00 | +0.00 | measured |
 | Thai | `multilingual-v1-th` | `newmm` words (nlpo3 + CC0 word list) | 0.92 | +0.00 | measured |
 | Japanese | `multilingual-v1-ja` | `lindera` words (runtime dictionary) | - | - | dictionary required |
@@ -195,11 +196,12 @@ multilingual profile emits a run's code points *and* the run, so "exactly one
 token in the stream" would score a correctly segmented `bibliothèque` as a
 miss.
 
-Typing without diacritics does not need a fold for French or Polish: FTS5
-`unicode61` removes diacritics by default, and the whole-word token the word run
-stores is what puts the accented word in the body, so `bibliotheque` reaches
-`bibliothèque`.  Stripping the marks in `normalize` would only merge homographs
-(`cote`/`côté`/`côte`) for recall the word run already banked.
+Typing without diacritics does not need a fold for French, Polish or Vietnamese:
+FTS5 `unicode61` removes diacritics by default, and the whole-word token the
+word run stores is what puts the accented word in the body, so `bibliotheque`
+reaches `bibliothèque` and `truong dai hoc` reaches `trường đại học`.  Stripping
+the marks in `normalize` would only merge homographs (`cote`/`côté`/`côte`,
+`ma`/`má`/`mà`/`mả`/`mã`/`mạ`) for recall the word run already banked.
 
 German is the exception the fold exists for: an ASCII keyboard spells `Müller`
 as the transliteration `mueller`, which FTS cannot bridge from the
@@ -215,10 +217,10 @@ The `state` column is what the fixture asserts:
   pinned target and the `Sag2ZhV1` rate is pinned as the baseline; a change on
   either side fails the test.
 * **deferred** - the profile needs the stemmer plan §5 batch 2 owns (Snowball
-  for ru/el, an Arabic stemmer, Indic word boundaries for hi, Vietnamese word
-  boundaries).  A whole word is one token for them, but an inflected form is
-  still a different term, which is what the stemmer has to fix.  The word rate
-  is reported but **not** asserted, because a target would only restate the gap.
+  for ru/el, an Arabic stemmer, Vietnamese word boundaries).  A whole word is
+  one token for them, but an inflected form is still a different term, which is
+  what the stemmer has to fix.  The word rate is reported but **not** asserted,
+  because a target would only restate the gap.
 * **dictionary required** - `ja` cannot tokenise without a runtime dictionary
   and CI has none, so there is nothing to measure offline.  It returns
   `AnalysisError::DictionaryMissing` instead of a character-level stream, which
@@ -235,10 +237,11 @@ size on ten documents.
 
 What the table says, plainly: two of the plan's §5.1 L1 criteria are met -
 French, Korean and Polish all reach 1.00 (from 0.50, n/a and 0.58), and no R@10
-number drops.  Hindi stays at 0.42 because a stacked mark (nukta ccc 7, virama
-ccc 9) ends a word run, and Vietnamese stays at 0.17 because its words are
-space-separated syllables that need their own word boundary, not a character
-class.  Both remain §5 batch 2 work.
+number drops.  Hindi reaches 1.00 as well: nukta (ccc 7) and virama (ccc 9) are
+joiners, so `सड़क` and `ट्रेन` are one token each and the word rate moved from
+0.42 to 1.00.  Vietnamese stays at 0.17 because its words are space-separated
+syllables that need their own word boundary, not a character class; that
+remains §5 batch 2 work.
 
 ## Query modes
 

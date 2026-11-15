@@ -130,22 +130,28 @@ fn class(character: char) -> Class {
     }
 }
 
-/// The multilingual word character (plan §5.1 L1): a letter or a non-combining
-/// mark, or a number.
+/// The multilingual word character (plan §5.1 L1): a letter or a mark that
+/// attaches to the word, or a number.
 ///
 /// [`class`] accepts ASCII and `U+4E00-U+9FD5` only, so every other script used
 /// to reach [`emit_block`] one code point at a time.  This set keeps a word
 /// together in every script, and it is built from the pinned Unicode 15.0.0
 /// tables of [`crate::unicode`], so the classification cannot drift with the
-/// compiler's Unicode version.  `combining_class == 0` keeps a stacked mark out
-/// of a run: Devanagari vowel signs and the anusvara (ccc 0) stay inside a
-/// word, the nukta (ccc 7) and the virama (ccc 9) end it.
+/// compiler's Unicode version.  A stacked mark (ccc != 0) is normally a mark on
+/// the *previous* code point, so it ends a run only when it is not a joiner;
+/// two canonical combining classes are joiners by definition, since ccc 7 is
+/// assigned only to nukta and ccc 9 only to virama across the Indic scripts.
+/// That keeps `सड़क` and `ट्रेन` whole while an ordinary stacked mark (a Vedic
+/// accent, ccc 230) still splits.
 fn is_word_character(character: char) -> bool {
     let cp = character as u32;
     if unicode::is_number(cp) {
         return true;
     }
-    unicode::combining_class(cp) == 0 && (unicode::is_letter(cp) || unicode::is_mark(cp))
+    // ccc 7 (nukta) and ccc 9 (virama) attach the following code point to the
+    // current word instead of ending it.
+    let joins = matches!(unicode::combining_class(cp), 0 | 7 | 9);
+    joins && (unicode::is_letter(cp) || unicode::is_mark(cp))
 }
 
 /// Tokenize `text` exactly like `sag2.tokenize` (design §4.1, §4.2).

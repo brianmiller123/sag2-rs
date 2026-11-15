@@ -29,18 +29,21 @@ pub fn normalize(language: Language, text: &str) -> String {
 /// | scope | rule |
 /// |---|---|
 /// | every language | `ß→ss æ→ae œ→oe ø→o ł→l đ→d ð→d þ→th ı→i ſ→s` (both cases) |
-/// | [`Language::El`], [`Language::Vi`] | `NFD`, drop every combining mark, `NFKC` |
+/// | [`Language::El`] | `NFD`, drop every combining mark, `NFKC` |
 /// | [`Language::De`] | `ä→ae ö→oe ü→ue` (both cases) |
 /// | [`Language::Ar`] | `أإآٱ→ا`, `ى→ي`, `ؤ→و`, `ئ→ي`; delete `U+0640` and `U+064B–U+0652`; `ة` is kept |
 /// | other languages | no further rule |
 ///
-/// Dropping *every* combining mark is what the Greek and Vietnamese profiles
-/// ask for: NFD cannot tell a tonos from a circumflex, so `ế` and `e` collapse
-/// together as well as `ά` and `α`.
+/// Dropping *every* combining mark is what the Greek profile asks for: NFD
+/// cannot tell a tonos from a circumflex, so `ά` and `α` collapse together.
+/// Vietnamese does not: its tone marks are lexical identity (`ma`, `má`, `mà`,
+/// `mả`, `mã`, `mạ` are six words), and the index layer already removes the
+/// diacritics (FTS5 `unicode61`), so stripping them here would only destroy the
+/// distinctiveness of the stored word tokens.
 pub fn fold_script(language: Language, text: &str) -> String {
     let folded = fold_latin(text);
     match language {
-        Language::El | Language::Vi => nfkc(&strip_marks(&nfd(&folded))),
+        Language::El => nfkc(&strip_marks(&nfd(&folded))),
         Language::De => fold_german(&folded),
         Language::Ar => fold_arabic(&folded),
         _ => folded,

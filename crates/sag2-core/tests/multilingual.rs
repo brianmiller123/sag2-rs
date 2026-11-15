@@ -7,15 +7,15 @@
 //!
 //! Every pack is in exactly one state, and the fixture says which:
 //!
-//! * **measured** (`th`, `de`, `fr`, `ko`, `pl`, `zh`, `en`) - the profile has
-//!   a word-level pipeline, so the word rate has a pinned target and the
-//!   reference `Sag2ZhV1` rate is pinned as the baseline.
-//! * **deferred** (`ru`, `ar`, `hi`, `el`, `vi`) - the profile still needs the
-//!   stemmer plan §5 batch 2 owns (Snowball for ru/el, an Arabic stemmer, Indic
-//!   word boundaries for hi, Vietnamese word boundaries), so their word rate is
-//!   printed but not asserted: a target would restate the gap, not measure it.
-//!   A whole word is one token for them since L1, but an inflected one is still
-//!   a different term, which is what the stemmer has to fix.
+//! * **measured** (`hi`, `th`, `de`, `fr`, `ko`, `pl`, `zh`, `en`) - the
+//!   profile has a word-level pipeline, so the word rate has a pinned target
+//!   and the reference `Sag2ZhV1` rate is pinned as the baseline.
+//! * **deferred** (`ru`, `ar`, `el`, `vi`) - the profile still needs the
+//!   stemmer plan §5 batch 2 owns (Snowball for ru/el, an Arabic stemmer,
+//!   Vietnamese word boundaries), so their word rate is printed but not
+//!   asserted: a target would restate the gap, not measure it.  A whole word is
+//!   one token for them since L1, but an inflected one is still a different
+//!   term, which is what the stemmer has to fix.
 //! * **dictionary required** (`ja`) - Japanese cannot tokenise without a
 //!   runtime dictionary, and CI has none.  It must return
 //!   [`AnalysisError::DictionaryMissing`](sag2_core::AnalysisError) instead of

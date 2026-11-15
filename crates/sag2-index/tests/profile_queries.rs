@@ -5,6 +5,7 @@
 //! the pinned ones.  A multilingual profile folds case, accents and
 //! orthographic variants, so a query reaches the tokens the build stored.
 
+use sag2_core::analysis::normalize::normalize;
 use sag2_core::{match_query, match_query_with, Language, Profile, QueryMode};
 use sag2_index::{
     open_readonly, CorpusIndex, Document, IndexOptions, OpenError, QueryOptions, RebuildPolicy,
@@ -272,4 +273,52 @@ fn both_german_ascii_spellings_reach_the_umlaut_document() {
             .expect("expression"),
         "\"muller\""
     );
+}
+
+/// Vietnamese: the tone marks are lexical identity, so the profile stores them
+/// (`ma`, `má`, `mà`, `mả`, `mã`, `mạ` stay six terms instead of collapsing into
+/// one), and a diacritic-free query still reaches the document because FTS5
+/// `unicode61` removes the diacritics from the stored word a second time.
+#[test]
+fn vietnamese_keeps_its_diacritics_and_answers_a_diacritic_free_query() {
+    const VIETNAMESE: Profile = Profile::Multilingual {
+        language: Language::Vi,
+    };
+    let documents = [
+        Document {
+            title: "Trường",
+            text: "Trường đại học ở Hà Nội mở cửa sớm.",
+            path: None,
+            idx: None,
+        },
+        Document {
+            title: "Cảng",
+            text: "Bến cảng mở cửa sớm vào buổi sáng.",
+            path: None,
+            idx: None,
+        },
+    ];
+    let (_directory, index) = build_documents(VIETNAMESE, &documents);
+
+    // The index stores the diacritics, not a stripped spelling.
+    assert_eq!(normalize(Language::Vi, "trường"), "trường");
+    let expression = index
+        .match_query_with(QueryMode::Lexical, "trường")
+        .expect("expression");
+    assert!(expression.contains("\"trường\""), "{expression}");
+
+    // The accented query reaches the stored token; the ASCII one reaches the
+    // diacritic-free term FTS5 derives from it.
+    for query in ["trường đại học", "truong dai hoc"] {
+        let expression = index
+            .match_query_with(QueryMode::Lexical, query)
+            .expect("expression");
+        let hits = index
+            .retrieve(&expression, &Default::default(), 10, None)
+            .expect("retrieve");
+        assert!(
+            hits.iter().any(|hit| hit.title == "Trường"),
+            "{query:?} must reach the document through {expression:?}"
+        );
+    }
 }

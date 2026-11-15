@@ -77,7 +77,7 @@ pub const ANALYSIS_VERSION_KEY: &str = "analysis_version";
 /// value (or without the key, which every pre-batch index is) is stale by
 /// definition and is rebuilt, never read with a tokenizer that did not produce
 /// its tokens.  The reference profile records no such row.
-pub const MULTILINGUAL_VERSION: &str = "ml-1";
+pub const MULTILINGUAL_VERSION: &str = "ml-2";
 
 /// The [`ANALYSIS_DICT_KEY`] value of a dictionary-free profile.
 ///

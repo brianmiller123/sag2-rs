@@ -198,27 +198,37 @@ fn an_ascii_word_run_stays_one_token() {
 }
 
 #[test]
-fn a_stacked_mark_ends_a_word_run() {
-    // A word character is a letter or mark with `combining_class == 0` (L1):
-    // the Devanagari vowel signs and anusvara (ccc 0) stay inside the run, the
-    // nukta (ccc 7) and the virama (ccc 9) end it.
+fn a_nukta_and_a_virama_keep_a_word_run_together() {
+    // A word character is a letter or mark with `combining_class == 0` (L1),
+    // plus the two joiner classes: ccc 7 is assigned only to nukta and ccc 9
+    // only to virama in every Indic script, and both attach the next code point
+    // to the word rather than ending it.
     let hindi = Profile::Multilingual {
         language: Language::Hi,
     };
-    assert!(tokens(hindi, "बंदरगाह")
-        .iter()
-        .any(|token| token == "बंदरगाह"));
-    let nukta = tokens(hindi, "बाज़ार");
+    for word in ["सड़क", "ट्रेन", "बंदरगाह"] {
+        let tokens = tokens(hindi, word);
+        assert!(
+            tokens.iter().any(|token| token == word),
+            "{word:?} is one token: {tokens:?}"
+        );
+    }
+}
+
+#[test]
+fn a_mark_that_is_not_a_joiner_still_ends_a_word_run() {
+    // The joiner rule is narrow: only ccc 7 and ccc 9 join.  The Vedic svarita
+    // (U+0951, ccc 230) is a stacked Devanagari mark like any other, so it
+    // still ends the run and the word is not one token.
+    let hindi = Profile::Multilingual {
+        language: Language::Hi,
+    };
+    let tokens = tokens(hindi, "क॑");
     assert!(
-        !nukta.iter().any(|token| token == "बाज़ार"),
-        "the nukta ends the run: {nukta:?}"
+        !tokens.iter().any(|token| token == "क॑"),
+        "ccc 230 does not join: {tokens:?}"
     );
-    assert!(nukta.iter().any(|token| token == "बाज"), "{nukta:?}");
-    let virama = tokens(hindi, "स्कूल");
-    assert!(
-        !virama.iter().any(|token| token == "स्कूल"),
-        "the virama ends the run: {virama:?}"
-    );
+    assert!(tokens.iter().any(|token| token == "क"), "{tokens:?}");
 }
 
 #[test]

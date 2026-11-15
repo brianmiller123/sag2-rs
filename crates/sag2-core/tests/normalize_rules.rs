@@ -77,30 +77,33 @@ const GREEK: [(&str, &str); 22] = [
     ("Αθήνα και Θεσσαλονίκη", "αθηνα και θεσσαλονικη"),
 ];
 
-/// Vietnamese: the tone (and vowel-quality) marks are combining marks in NFD.
+/// Vietnamese: the tone marks carry lexical identity (`ma`, `má`, `mà`, `mả`,
+/// `mã`, `mạ` are six words), so only the shared Latin fold applies; the
+/// diacritic-free spelling is the index layer's business (FTS5 `unicode61`).
 const VIETNAMESE: [(&str, &str); 22] = [
-    ("Việt Nam", "viet nam"),
-    ("VIỆT NAM", "viet nam"),
-    ("việt nam", "viet nam"),
-    ("Hà Nội", "ha noi"),
-    ("Đà Nẵng", "da nang"),
-    ("Thành phố Hồ Chí Minh", "thanh pho ho chi minh"),
-    ("Tôi yêu tiếng Việt", "toi yeu tieng viet"),
-    ("ế", "e"),
-    ("ô", "o"),
-    ("ơ", "o"),
-    ("ư", "u"),
-    ("ă", "a"),
+    ("Việt Nam", "việt nam"),
+    ("VIỆT NAM", "việt nam"),
+    ("việt nam", "việt nam"),
+    ("Hà Nội", "hà nội"),
+    ("Đà Nẵng", "dà nẵng"),
+    ("Thành phố Hồ Chí Minh", "thành phố hồ chí minh"),
+    ("Tôi yêu tiếng Việt", "tôi yêu tiếng việt"),
+    ("ế", "ế"),
+    ("ô", "ô"),
+    ("ơ", "ơ"),
+    ("ư", "ư"),
+    ("ă", "ă"),
+    // `đ` is the shared Latin fold's rule (`đ→d`), not a mark.
     ("đ", "d"),
-    ("ÁÀẢÃẠ", "aaaaa"),
-    ("ấầẩẫậ", "aaaaa"),
-    ("ắằẳẵặ", "aaaaa"),
-    ("ếềểễệ", "eeeee"),
-    ("ốồổỗộ", "ooooo"),
-    ("ớờởỡợ", "ooooo"),
-    ("ứừửữự", "uuuuu"),
-    ("ýỳỷỹỵ", "yyyyy"),
-    ("ƠƯ", "ou"),
+    ("ÁÀẢÃẠ", "áàảãạ"),
+    ("ấầẩẫậ", "ấầẩẫậ"),
+    ("ắằẳẵặ", "ắằẳẵặ"),
+    ("ếềểễệ", "ếềểễệ"),
+    ("ốồổỗộ", "ốồổỗộ"),
+    ("ớờởỡợ", "ớờởỡợ"),
+    ("ứừửữự", "ứừửữự"),
+    ("ýỳỷỹỵ", "ýỳỷỹỵ"),
+    ("ƠƯ", "ơư"),
 ];
 
 /// Arabic: hamza carriers, alef maksura, tatweel; `ة` is kept.
@@ -319,12 +322,18 @@ fn greek_drops_tonos_and_dialytika() {
     assert_table(Language::El, &GREEK);
     // The marks are gone from the fold, before `lower` runs.
     assert_eq!(fold_script(Language::El, "Αθήνα"), "Αθηνα");
+    // Greek keeps its strip: `ά` alone still reaches `α`.
+    assert_eq!(normalize(Language::El, "ά"), "α");
 }
 
 #[test]
-fn vietnamese_drops_the_tone_marks() {
+fn vietnamese_keeps_the_tone_marks() {
     assert_table(Language::Vi, &VIETNAMESE);
-    assert_eq!(fold_script(Language::Vi, "Việt"), "Viet");
+    assert_eq!(fold_script(Language::Vi, "Việt"), "Việt");
+    // Lexical identity: NFKC and lower apply, the tone mark stays.
+    assert_eq!(normalize(Language::Vi, "trường"), "trường");
+    assert_ne!(normalize(Language::Vi, "ma"), normalize(Language::Vi, "má"));
+    assert_ne!(normalize(Language::Vi, "má"), normalize(Language::Vi, "mà"));
 }
 
 #[test]
