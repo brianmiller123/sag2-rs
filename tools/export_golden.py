@@ -1955,6 +1955,12 @@ MULTILINGUAL_SEGMENTS = [
     "กรุงเทพมหานคร",  # Thai: no inter-word spaces, per code point
     "नई दिल्ली भारत की राजधानी है।",  # Devanagari: the danda is not a letter
     "ＡＢＣ１２３",  # Fullwidth Latin and digits fold to ASCII
+    # Non-ASCII Latin letters fall outside `re_han_default`, so they split the
+    # word: European text with diacritics is per code point, not word level.
+    "Müller café",
+    "nghiệp vụ",
+    "Łódź",
+    "Dvořák",
     "İSTANBUL ß ﬁ ①",  # Dotted capital I, sharp s, ligature, circled digit
     "👨‍👩‍👧 e\u0301",  # ZWJ emoji has no content; the combining accent composes
     "東京都 ﾃｽﾄ ＡＢＣ",  # Mixed CJK, halfwidth and fullwidth in one line

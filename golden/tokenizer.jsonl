@@ -27,9 +27,13 @@
 {"segment_id": "C0/tokenizer/multilingual/18", "text": "กรุงเทพมหานคร", "tokens": ["ก", "ร", "ง", "เ", "ท", "พ", "ม", "ห", "า", "น", "ค", "ร"]}
 {"segment_id": "C0/tokenizer/multilingual/19", "text": "नई दिल्ली भारत की राजधानी है।", "tokens": ["न", "ई", "द", "ल", "ल", "भ", "र", "त", "क", "र", "ज", "ध", "न", "ह"]}
 {"segment_id": "C0/tokenizer/multilingual/20", "text": "ＡＢＣ１２３", "tokens": ["abc123"]}
-{"segment_id": "C0/tokenizer/multilingual/21", "text": "İSTANBUL ß ﬁ ①", "tokens": ["i", "stanbul", "ß", "fi", "1"]}
-{"segment_id": "C0/tokenizer/multilingual/22", "text": "👨‍👩‍👧 é", "tokens": ["é"]}
-{"segment_id": "C0/tokenizer/multilingual/23", "text": "東京都 ﾃｽﾄ ＡＢＣ", "tokens": ["東", "京都", "テ", "ス", "ト", "abc"]}
+{"segment_id": "C0/tokenizer/multilingual/21", "text": "Müller café", "tokens": ["m", "ü", "ller", "caf", "é"]}
+{"segment_id": "C0/tokenizer/multilingual/22", "text": "nghiệp vụ", "tokens": ["nghi", "ệ", "p", "v", "ụ"]}
+{"segment_id": "C0/tokenizer/multilingual/23", "text": "Łódź", "tokens": ["ł", "ó", "d", "ź"]}
+{"segment_id": "C0/tokenizer/multilingual/24", "text": "Dvořák", "tokens": ["dvo", "ř", "á", "k"]}
+{"segment_id": "C0/tokenizer/multilingual/25", "text": "İSTANBUL ß ﬁ ①", "tokens": ["i", "stanbul", "ß", "fi", "1"]}
+{"segment_id": "C0/tokenizer/multilingual/26", "text": "👨‍👩‍👧 é", "tokens": ["é"]}
+{"segment_id": "C0/tokenizer/multilingual/27", "text": "東京都 ﾃｽﾄ ＡＢＣ", "tokens": ["東", "京都", "テ", "ス", "ト", "abc"]}
 {"segment_id": "C0/title/0", "text": "Anchor", "tokens": ["anchor"]}
 {"segment_id": "C0/text/0", "text": "Anchor birthplace depicts Alice Paul. Alice Paul. Bob Smith.", "tokens": ["anchor", "birthplace", "depicts", "alice", "paul", "alice", "paul", "bob", "smith"]}
 {"segment_id": "C0/title/1", "text": "Single", "tokens": ["single"]}

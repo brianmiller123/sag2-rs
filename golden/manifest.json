@@ -26,8 +26,8 @@
     },
     {
       "path": "tokenizer.jsonl",
-      "sha256": "0fbcb1db8a7845c9b1cbb73a4928a29a012b74dbc8a10c983f8199c2abd3f8d9",
-      "lines": 8826
+      "sha256": "169697d57002b7aa9a1fe6d7ba95c4926c0205b2b3a177d47505a7988843fb06",
+      "lines": 8830
     },
     {
       "path": "ascii_runs.jsonl",
@@ -146,7 +146,7 @@
     }
   ],
   "tokenizer": {
-    "segments": 8826,
+    "segments": 8830,
     "golden": "tokenizer.jsonl"
   },
   "ascii_runs": {
