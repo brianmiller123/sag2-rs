@@ -1721,8 +1721,11 @@ UNICODE_TABLES = {
     },
     "categories": {
         "magic": b"SAG2CATE",
-        "record_bytes": 5,  # cp:u32le, mask:u8 (bit0 L, bit1 N, bit2 Lu, bit3 M)
-        "fields": ["cp:u32le", "mask:u8 (1<<0 L, 1<<1 N, 1<<2 Lu, 1<<3 M)"],
+        "record_bytes": 5,  # cp:u32le, mask:u8 (bits 0..5)
+        "fields": [
+            "cp:u32le",
+            "mask:u8 (1<<0 L, 1<<1 N, 1<<2 Lu, 1<<3 M, 1<<4 Cased, 1<<5 Case_Ignorable)",
+        ],
         "path": "unicode_categories.bin.gz",
     },
 }
@@ -1733,6 +1736,18 @@ CATEGORY_PATTERNS = (
     (0b0100, regex.compile(r"\p{Lu}")),
     (0b1000, regex.compile(r"\p{M}")),
 )
+
+# The probe for the two context-sensitive properties.  `Α` is cased and `Σ` is
+# the only character whose lowercase mapping depends on context, so
+# `"Α" + X + "Σ"` ends in `ς` exactly when `X` is cased or case-ignorable, and
+# appending `X` again ends in `ς` exactly when `X` is not cased.  Both
+# properties therefore come out of `str.lower()` itself, which is the oracle the
+# port must match, instead of from a `regex` table whose Unicode version can
+# drift.
+FINAL_SIGMA_PROBE_PREFIX = "Α"
+FINAL_SIGMA_PROBE_SUFFIX = "Σ"
+FINAL_SIGMA_PROBE_SENTINEL = "\0"
+FINAL_SIGMA_FINAL = "ς"
 
 
 # Sparse, variable-width tables (NFKD/NFKC mappings and the canonical
@@ -1911,6 +1926,40 @@ MIXED_SCRIPT_SEGMENTS = [
     "x 江南style y",
 ]
 
+# Scripts the benchmark corpora do not contain.  Everything outside jieba's
+# `re_han_default` (CJK U+4E00-U+9FD5 plus ASCII) is one token per code point,
+# and the NFKC/lower tables decide what reaches FTS, so a consumer that indexes
+# Russian, Greek, Japanese, Korean, Arabic, Hebrew, Thai or Devanagari depends on
+# this branch.  Pinned so Gate D, not only reasoning about the port, defends it.
+MULTILINGUAL_SEGMENTS = [
+    "Москва — столица России.",  # Cyrillic: per code point, ASCII `.` sentence end
+    "Αθήνα και Θεσσαλονίκη.",  # Greek: cased, per code point
+    # `str.lower()` applies the Unicode Final_Sigma rule; a per-code-point table
+    # cannot, so these pin the one context-sensitive case of the lowercasing.
+    "ΟΔΟΣ",
+    "ΣΣ",
+    "Σ",
+    "ΑΣ.",
+    "ΑΣΣ",
+    "ΑΣ\u0301",
+    "ΑΣ'",
+    "ΑΣΑ",
+    "ΑΣΣΑ",
+    "Η ΣΟΦΙΑ ΤΗΣ ΑΘΗΝΑΣ",
+    "東京都に住んでいます。",  # Japanese: kanji enters the Chinese DAG, kana per code point
+    "コーヒーを飲む",  # Katakana: per code point
+    "ｺｰﾋｰ",  # Halfwidth katakana: NFKC folds it before tokenizing
+    "서울은 대한민국의 수도입니다.",  # Hangul: per code point, no segmentation
+    "القاهرة هي عاصمة مصر.",  # Arabic: RTL, per code point
+    "ירושלים היא בירת ישראל.",  # Hebrew: RTL, per code point
+    "กรุงเทพมหานคร",  # Thai: no inter-word spaces, per code point
+    "नई दिल्ली भारत की राजधानी है।",  # Devanagari: the danda is not a letter
+    "ＡＢＣ１２３",  # Fullwidth Latin and digits fold to ASCII
+    "İSTANBUL ß ﬁ ①",  # Dotted capital I, sharp s, ligature, circled digit
+    "👨‍👩‍👧 e\u0301",  # ZWJ emoji has no content; the combining accent composes
+    "東京都 ﾃｽﾄ ＡＢＣ",  # Mixed CJK, halfwidth and fullwidth in one line
+]
+
 
 def export_tokenizer(reference, fixture_segments_by_name, sag2):
     """`tokenizer.jsonl`: segment id, normalised text and the reference tokens."""
@@ -1924,6 +1973,8 @@ def export_tokenizer(reference, fixture_segments_by_name, sag2):
         segments.append((f"C0/tokenizer/{index}", entry["text"], tokens))
     for index, text in enumerate(MIXED_SCRIPT_SEGMENTS):
         segments.append((f"C0/tokenizer/mixed-script/{index}", text, sag2.tokenize(text)))
+    for index, text in enumerate(MULTILINGUAL_SEGMENTS):
+        segments.append((f"C0/tokenizer/multilingual/{index}", text, sag2.tokenize(text)))
     for name, entries in fixture_segments_by_name.items():
         for segment_id, text in entries:
             segments.append((segment_id, text, sag2.tokenize(text)))
@@ -1934,9 +1985,43 @@ def export_tokenizer(reference, fixture_segments_by_name, sag2):
     return "".join(json.dumps(line, ensure_ascii=False) + "\n" for line in lines), len(lines)
 
 
+def final_sigma_properties():
+    """`Cased` and `Case_Ignorable` as CPython's `str.lower()` applies them.
+
+    Greek `Final_Sigma` (SpecialCasing.txt) is the only context-sensitive
+    lowercase mapping `str.lower()` performs, and CPython exposes neither
+    property, so measure them.  With `Α` cased and `Σ` the probe (see the
+    comment next to `FINAL_SIGMA_PROBE_PREFIX`):
+
+    * `"Α" + X + "Σ"` ends in `ς` exactly when `X` is cased or case-ignorable;
+    * `"ΑΣ" + X` ends in `ς` exactly when `X` is not cased, so the middle
+      character decides whether `Σ` is final.  The probe reads the `Σ` itself
+      rather than the string tail, because an ignorable `X` keeps the tail.
+    """
+    cased = bytearray(CODEPOINTS // 8)
+    ignorable = bytearray(CODEPOINTS // 8)
+    for cp in range(CODEPOINTS):
+        char = chr(cp)
+        before = (FINAL_SIGMA_PROBE_PREFIX + char + FINAL_SIGMA_PROBE_SUFFIX).lower()[-1] == (
+            FINAL_SIGMA_FINAL
+        )
+        after = (
+            FINAL_SIGMA_PROBE_PREFIX
+            + FINAL_SIGMA_PROBE_SUFFIX
+            + char
+            + FINAL_SIGMA_PROBE_SENTINEL
+        ).lower()[1] == FINAL_SIGMA_FINAL
+        if not after:
+            cased[cp // 8] |= 1 << (cp % 8)
+        elif before:
+            ignorable[cp // 8] |= 1 << (cp % 8)
+    return cased, ignorable
+
+
 def export_unicode_tables():
     """Exhaustive per-codepoint lower/casefold/combining/category results."""
     buffers = {name: bytearray(spec["magic"]) for name, spec in UNICODE_TABLES.items()}
+    cased, ignorable = final_sigma_properties()
     max_lower = max_casefold = 0
     for cp in range(CODEPOINTS):
         char = chr(cp)
@@ -1955,6 +2040,10 @@ def export_unicode_tables():
         for bit, pattern in CATEGORY_PATTERNS:
             if pattern.match(char):
                 mask |= bit
+        if cased[cp // 8] & (1 << (cp % 8)):
+            mask |= 0b010000
+        if ignorable[cp // 8] & (1 << (cp % 8)):
+            mask |= 0b100000
         buffers["categories"] += struct.pack("<IB", cp, mask)
     for name, spec in UNICODE_TABLES.items():
         expected = 8 + CODEPOINTS * spec["record_bytes"]

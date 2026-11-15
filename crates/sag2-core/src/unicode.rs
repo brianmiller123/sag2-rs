@@ -10,6 +10,9 @@
 //!   `cp:u32le, class:u8`, holding only non-zero combining classes.
 //! * `letters.bin` / `numbers.bin` / `uppercase.bin` / `marks.bin`: one bit per
 //!   code point (LSB first) for `\p{L}`, `\p{N}`, `\p{Lu}` and `\p{M}`.
+//! * `cased.bin` / `case_ignorable.bin`: the two properties `str.lower()` uses
+//!   for Greek `Final_Sigma`, measured from `str.lower()` itself rather than
+//!   taken from a table whose Unicode version could differ from CPython's.
 //! * `nfkd.bin`: `u32 count, u8 width` then `count` records
 //!   `cp:u32le, len:u8, cps:[u32le;width]`, the fully decomposed compatibility
 //!   mapping of every code point that changes (Hangul is algorithmic).
@@ -31,6 +34,8 @@ static LETTERS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/letters.bin"))
 static NUMBERS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/numbers.bin"));
 static UPPERCASE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/uppercase.bin"));
 static MARKS: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/marks.bin"));
+static CASED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/cased.bin"));
+static CASE_IGNORABLE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/case_ignorable.bin"));
 static NFKD: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/nfkd.bin"));
 static NFD: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/nfd.bin"));
 static COMPOSE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/compose.bin"));
@@ -85,24 +90,64 @@ fn mapping(table: &[u8], cp: u32) -> Option<([u32; 3], usize)> {
     None
 }
 
+fn push_mapping(table: &[u8], character: char, out: &mut String) {
+    match mapping(table, character as u32) {
+        Some((cps, length)) => {
+            for &cp in &cps[..length] {
+                out.push(char::from_u32(cp).expect("generated mapping is a scalar value"));
+            }
+        }
+        None => out.push(character),
+    }
+}
+
 fn apply(table: &[u8], text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     for character in text.chars() {
-        match mapping(table, character as u32) {
-            Some((cps, length)) => {
-                for &cp in &cps[..length] {
-                    out.push(char::from_u32(cp).expect("generated mapping is a scalar value"));
-                }
-            }
-            None => out.push(character),
-        }
+        push_mapping(table, character, &mut out);
     }
     out
 }
 
 /// `str.lower()` (design §4.1 rule 1).
+///
+/// The per-code-point table covers every mapping except Greek `Final_Sigma`,
+/// the one context-sensitive rule `str.lower()` applies: `Σ` lowercases to `ς`
+/// when the preceding significant character is cased and the following one is
+/// not, "significant" skipping `Case_Ignorable` (`SpecialCasing.txt`).
 pub fn lower(text: &str) -> String {
-    apply(LOWER, text)
+    if !text.contains('\u{3A3}') {
+        return apply(LOWER, text);
+    }
+    let characters: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
+    for (index, &character) in characters.iter().enumerate() {
+        if character == '\u{3A3}' && final_sigma(&characters, index) {
+            out.push('\u{3C2}');
+        } else {
+            push_mapping(LOWER, character, &mut out);
+        }
+    }
+    out
+}
+
+/// Whether the `Σ` at `index` is word-final for `str.lower()`.
+fn final_sigma(characters: &[char], index: usize) -> bool {
+    let before = characters[..index]
+        .iter()
+        .rev()
+        .find(|character| !is_case_ignorable(**character as u32))
+        .is_some_and(|character| is_cased(*character as u32));
+    if !before {
+        return false;
+    }
+    match characters[index + 1..]
+        .iter()
+        .find(|character| !is_case_ignorable(**character as u32))
+    {
+        None => true,
+        Some(character) => !is_cased(*character as u32),
+    }
 }
 
 /// `str.casefold()` (design §4.5; used by `diversity_tokens`).
@@ -162,6 +207,17 @@ pub fn is_uppercase(cp: u32) -> bool {
 /// `\p{M}` under the Python `regex` module's Unicode 15.0.0 tables.
 pub fn is_mark(cp: u32) -> bool {
     bit_is_set(MARKS, cp)
+}
+
+/// Unicode `Cased`, as CPython's `str.lower()` applies it to `Final_Sigma`.
+pub fn is_cased(cp: u32) -> bool {
+    bit_is_set(CASED, cp)
+}
+
+/// Unicode `Case_Ignorable`, as CPython's `str.lower()` applies it to
+/// `Final_Sigma`.
+pub fn is_case_ignorable(cp: u32) -> bool {
+    bit_is_set(CASE_IGNORABLE, cp)
 }
 
 /// `str.isspace()`, which is also what Python's `\s` matches.
@@ -373,4 +429,31 @@ pub fn nfkc(text: &str) -> String {
     }
     canonical_order(&mut characters);
     compose(&characters)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::lower;
+
+    /// Every vector is `str.lower()`'s output on CPython 3.12.11 (Unicode
+    /// 15.0.0); `Final_Sigma` is the only context-sensitive entry.
+    #[test]
+    fn lower_applies_the_final_sigma_rule() {
+        for (text, expected) in [
+            ("ΟΔΟΣ", "οδος"),
+            ("ΣΣ", "σς"),
+            ("Σ", "σ"),
+            ("ΑΣ.", "ας."),
+            ("ΑΣΣ", "ασς"),
+            ("ΑΣ\u{0301}", "ας\u{0301}"),
+            ("ΑΣ'", "ας'"),
+            ("ΑΣΑ", "ασα"),
+            ("ΑΣΣΑ", "ασσα"),
+            ("Η ΣΟΦΙΑ ΤΗΣ ΑΘΗΝΑΣ", "η σοφια της αθηνας"),
+            ("İSTANBUL", "i\u{0307}stanbul"),
+            ("ß", "ß"),
+        ] {
+            assert_eq!(lower(text), expected, "{text:?}");
+        }
+    }
 }

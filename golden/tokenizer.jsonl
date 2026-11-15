@@ -6,6 +6,30 @@
 {"segment_id": "C0/tokenizer/mixed-script/1", "text": "4S店 and 1号店", "tokens": ["4s店", "1号店"]}
 {"segment_id": "C0/tokenizer/mixed-script/2", "text": "江南style", "tokens": ["江南", "江南style"]}
 {"segment_id": "C0/tokenizer/mixed-script/3", "text": "x 江南style y", "tokens": ["x", "江南", "江南style", "y"]}
+{"segment_id": "C0/tokenizer/multilingual/0", "text": "Москва — столица России.", "tokens": ["м", "о", "с", "к", "в", "а", "с", "т", "о", "л", "и", "ц", "а", "р", "о", "с", "с", "и", "и"]}
+{"segment_id": "C0/tokenizer/multilingual/1", "text": "Αθήνα και Θεσσαλονίκη.", "tokens": ["α", "θ", "ή", "ν", "α", "κ", "α", "ι", "θ", "ε", "σ", "σ", "α", "λ", "ο", "ν", "ί", "κ", "η"]}
+{"segment_id": "C0/tokenizer/multilingual/2", "text": "ΟΔΟΣ", "tokens": ["ο", "δ", "ο", "ς"]}
+{"segment_id": "C0/tokenizer/multilingual/3", "text": "ΣΣ", "tokens": ["σ", "ς"]}
+{"segment_id": "C0/tokenizer/multilingual/4", "text": "Σ", "tokens": ["σ"]}
+{"segment_id": "C0/tokenizer/multilingual/5", "text": "ΑΣ.", "tokens": ["α", "ς"]}
+{"segment_id": "C0/tokenizer/multilingual/6", "text": "ΑΣΣ", "tokens": ["α", "σ", "ς"]}
+{"segment_id": "C0/tokenizer/multilingual/7", "text": "ΑΣ́", "tokens": ["α", "ς"]}
+{"segment_id": "C0/tokenizer/multilingual/8", "text": "ΑΣ'", "tokens": ["α", "ς"]}
+{"segment_id": "C0/tokenizer/multilingual/9", "text": "ΑΣΑ", "tokens": ["α", "σ", "α"]}
+{"segment_id": "C0/tokenizer/multilingual/10", "text": "ΑΣΣΑ", "tokens": ["α", "σ", "σ", "α"]}
+{"segment_id": "C0/tokenizer/multilingual/11", "text": "Η ΣΟΦΙΑ ΤΗΣ ΑΘΗΝΑΣ", "tokens": ["η", "σ", "ο", "φ", "ι", "α", "τ", "η", "ς", "α", "θ", "η", "ν", "α", "ς"]}
+{"segment_id": "C0/tokenizer/multilingual/12", "text": "東京都に住んでいます。", "tokens": ["東", "京都", "に", "住", "ん", "で", "い", "ま", "す"]}
+{"segment_id": "C0/tokenizer/multilingual/13", "text": "コーヒーを飲む", "tokens": ["コ", "ー", "ヒ", "ー", "を", "飲", "む"]}
+{"segment_id": "C0/tokenizer/multilingual/14", "text": "ｺｰﾋｰ", "tokens": ["コ", "ー", "ヒ", "ー"]}
+{"segment_id": "C0/tokenizer/multilingual/15", "text": "서울은 대한민국의 수도입니다.", "tokens": ["서", "울", "은", "대", "한", "민", "국", "의", "수", "도", "입", "니", "다"]}
+{"segment_id": "C0/tokenizer/multilingual/16", "text": "القاهرة هي عاصمة مصر.", "tokens": ["ا", "ل", "ق", "ا", "ه", "ر", "ة", "ه", "ي", "ع", "ا", "ص", "م", "ة", "م", "ص", "ر"]}
+{"segment_id": "C0/tokenizer/multilingual/17", "text": "ירושלים היא בירת ישראל.", "tokens": ["י", "ר", "ו", "ש", "ל", "י", "ם", "ה", "י", "א", "ב", "י", "ר", "ת", "י", "ש", "ר", "א", "ל"]}
+{"segment_id": "C0/tokenizer/multilingual/18", "text": "กรุงเทพมหานคร", "tokens": ["ก", "ร", "ง", "เ", "ท", "พ", "ม", "ห", "า", "น", "ค", "ร"]}
+{"segment_id": "C0/tokenizer/multilingual/19", "text": "नई दिल्ली भारत की राजधानी है।", "tokens": ["न", "ई", "द", "ल", "ल", "भ", "र", "त", "क", "र", "ज", "ध", "न", "ह"]}
+{"segment_id": "C0/tokenizer/multilingual/20", "text": "ＡＢＣ１２３", "tokens": ["abc123"]}
+{"segment_id": "C0/tokenizer/multilingual/21", "text": "İSTANBUL ß ﬁ ①", "tokens": ["i", "stanbul", "ß", "fi", "1"]}
+{"segment_id": "C0/tokenizer/multilingual/22", "text": "👨‍👩‍👧 é", "tokens": ["é"]}
+{"segment_id": "C0/tokenizer/multilingual/23", "text": "東京都 ﾃｽﾄ ＡＢＣ", "tokens": ["東", "京都", "テ", "ス", "ト", "abc"]}
 {"segment_id": "C0/title/0", "text": "Anchor", "tokens": ["anchor"]}
 {"segment_id": "C0/text/0", "text": "Anchor birthplace depicts Alice Paul. Alice Paul. Bob Smith.", "tokens": ["anchor", "birthplace", "depicts", "alice", "paul", "alice", "paul", "bob", "smith"]}
 {"segment_id": "C0/title/1", "text": "Single", "tokens": ["single"]}

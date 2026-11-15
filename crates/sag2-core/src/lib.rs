@@ -29,6 +29,6 @@ pub use diversity::diversity_tokens;
 pub use query::{match_query, quote_term};
 pub use tokenize::tokenize;
 pub use unicode::{
-    casefold, combining_class, is_letter, is_mark, is_number, is_space, is_uppercase, is_word,
-    lower, nfd, nfkc, nfkd,
+    casefold, combining_class, is_case_ignorable, is_cased, is_letter, is_mark, is_number,
+    is_space, is_uppercase, is_word, lower, nfd, nfkc, nfkd,
 };

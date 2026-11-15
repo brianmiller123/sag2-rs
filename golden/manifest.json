@@ -26,8 +26,8 @@
     },
     {
       "path": "tokenizer.jsonl",
-      "sha256": "c6dd32595d1112966cc991fd36a6b03cb085bb94cc6ce4ac20d2f63bb204eeb3",
-      "lines": 8802
+      "sha256": "0fbcb1db8a7845c9b1cbb73a4928a29a012b74dbc8a10c983f8199c2abd3f8d9",
+      "lines": 8826
     },
     {
       "path": "ascii_runs.jsonl",
@@ -70,11 +70,11 @@
     },
     {
       "path": "unicode_categories.bin.gz",
-      "sha256": "ecbf5714634d03944639e17edb22e00fe8f1c5605c404efe19065287e23b41c2",
+      "sha256": "a21a19e94992386a5f1c7edc2adbd9fc3fde94a662773e080313e1e992cadbd9",
       "records": 1114112,
       "record_bytes": 5,
       "uncompressed_bytes": 5570568,
-      "gzip_bytes": 1682875
+      "gzip_bytes": 1683388
     },
     {
       "path": "unicode_nfd.bin.gz",
@@ -146,7 +146,7 @@
     }
   ],
   "tokenizer": {
-    "segments": 8802,
+    "segments": 8826,
     "golden": "tokenizer.jsonl"
   },
   "ascii_runs": {
@@ -195,7 +195,7 @@
       "record_bytes": 5,
       "fields": [
         "cp:u32le",
-        "mask:u8 (1<<0 L, 1<<1 N, 1<<2 Lu, 1<<3 M)"
+        "mask:u8 (1<<0 L, 1<<1 N, 1<<2 Lu, 1<<3 M, 1<<4 Cased, 1<<5 Case_Ignorable)"
       ],
       "codepoints": 1114112
     }

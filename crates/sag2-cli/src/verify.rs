@@ -3746,6 +3746,12 @@ fn gate_d_table(
                 if sag2_core::is_mark(scalar) {
                     actual |= 0b1000;
                 }
+                if sag2_core::is_cased(scalar) {
+                    actual |= 0b010000;
+                }
+                if sag2_core::is_case_ignorable(scalar) {
+                    actual |= 0b100000;
+                }
                 (mask.to_string(), actual.to_string())
             }
             other => return Err(format!("unknown unicode table {other}")),

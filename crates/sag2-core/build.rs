@@ -250,6 +250,8 @@ fn write_unicode_tables(golden: &Path, out_dir: &Path) {
         vec![0_u8; CODEPOINTS / 8],
         vec![0_u8; CODEPOINTS / 8],
         vec![0_u8; CODEPOINTS / 8],
+        vec![0_u8; CODEPOINTS / 8],
+        vec![0_u8; CODEPOINTS / 8],
     ];
     for cp in 0..CODEPOINTS {
         let mask = body[cp * 5 + 4];
@@ -259,9 +261,16 @@ fn write_unicode_tables(golden: &Path, out_dir: &Path) {
             }
         }
     }
-    for (name, bitset) in ["letters", "numbers", "uppercase", "marks"]
-        .iter()
-        .zip(bitsets.iter())
+    for (name, bitset) in [
+        "letters",
+        "numbers",
+        "uppercase",
+        "marks",
+        "cased",
+        "case_ignorable",
+    ]
+    .iter()
+    .zip(bitsets.iter())
     {
         fs::write(out_dir.join(format!("{name}.bin")), bitset).expect("write category bitset");
     }
