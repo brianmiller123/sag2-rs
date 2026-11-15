@@ -228,11 +228,13 @@ pub(crate) fn tokenize_multilingual(
     // The paired spelling is the pre-fold word run, and it is read only for
     // German: `fold_german` rewrites letters as letters and never creates or
     // deletes a boundary, so `normalised` and `accented` - both built from the
-    // same `lower(nfkc(original))` - have the same segments.  The other
-    // language rules are not boundary-neutral (Ukrainian's apostrophe turns a
-    // separator into a word character, Turkish deletes a mark), which is why
-    // the pairing stays scoped to the German rule: no other profile reads a
-    // variant, and the `debug_assert!` below fails closed if one ever does.
+    // same `lower(nfkc(original))` - have the same segments.  `accented_text`
+    // is empty for every other profile, which is what keeps the pairing safe:
+    // the rules that do move a boundary (`Uk` turns its apostrophe into a word
+    // character, `Tr` deletes U+0307, `El` NFD-strips every mark, `Ar` deletes
+    // the harakat) are never paired, and no profile reads a variant.  Debug
+    // builds assert a one-for-one count in the surplus direction only; a
+    // deficit would leave later words without a variant rather than panic.
     //
     // The deaccented spelling is derived from each paired run instead of being
     // read from a re-segmented deaccented text: `strip_marks` deletes combining

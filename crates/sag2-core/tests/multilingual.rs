@@ -42,11 +42,11 @@
 //!    Lexical, and the packs that ask for a gain (`target_query_gain`) must
 //!    clear it.
 //!
-//! 3. **fold pairs** - the spellings a language rule must collapse (`ѝ`/`и`,
-//!    `Ħal`/`hal`, `İstanbul`/`istanbul`, the three Ukrainian apostrophes) are
-//!    declared by the pack and must normalise and tokenise alike.  The rates
-//!    cannot see an in-word substitution, so this is the check that fails when
-//!    a rule is deleted.
+//! 3. **fold pairs** - the spellings the profile must collapse (`ѝ`/`и`,
+//!    `Ħal`/`hal`, `İstanbul`/`istanbul`, the Ukrainian apostrophes) are
+//!    declared by the pack and must normalise alike; the token stream follows
+//!    from that for every profile but German.  The rates cannot see an in-word
+//!    substitution, so this is the check that fails when a rule is deleted.
 //!
 //! The packs are tiny, so the index is built with a sentence-sized
 //! [`CHUNK_CHARS`] and a top-10 cut over the resulting chunks; with ten
@@ -120,13 +120,17 @@ struct Pack {
     /// whose queries are evaluated, `None` for the dictionary packs.
     #[serde(default)]
     target_query_gain: Option<f64>,
-    /// Spellings the profile's language rule must fold onto one token stream.
+    /// Spellings the profile's rule - or the shared fold or case mapping it
+    /// relies on - must fold onto one term.
     ///
     /// The rates cannot see a pure in-word letter substitution: `word_level`
     /// normalises the word it compares (`ѝ` and `и` are each whole runs), and
     /// the corpus's code-point tokens make a cross-spelling query match anyway.
-    /// The pack therefore states the pairs its rule owns and
+    /// The pack therefore states the pairs it relies on and
     /// `the_declared_fold_pairs_reach_one_token_stream` asserts them directly.
+    /// The list covers more than the language rule: tr's `ılık`/`ilik` is the
+    /// shared Latin fold and `ISTANBUL`/`istanbul` is case folding, while only
+    /// `İstanbul`/`istanbul` pins `fold_turkish`.
     #[serde(default)]
     fold_pairs: Vec<FoldPair>,
     content_words: Vec<String>,
@@ -134,7 +138,7 @@ struct Pack {
     queries: Vec<PackQuery>,
 }
 
-/// One `(from, to)` spelling pair a language rule must collapse.
+/// One `(from, to)` spelling pair the profile must collapse onto one term.
 #[derive(Debug, Deserialize)]
 struct FoldPair {
     from: String,
@@ -472,9 +476,11 @@ fn a_dictionary_profile_refuses_the_character_fallback() {
 fn the_declared_fold_pairs_reach_one_token_stream() {
     // A letter substitution inside a word is invisible to `word_level`, and
     // the code-point tokens every non-ASCII run emits make a cross-spelling
-    // query match either way, so the rule's own contract is asserted here: the
-    // two spellings the pack declares must normalise alike and tokenise alike.
-    // Deleting a language rule fails this test.
+    // query match either way, so the profile's own contract is asserted here:
+    // the two spellings the pack declares must normalise alike, and therefore
+    // tokenise alike - `tokenize_with` normalises with this same `normalize`,
+    // and only the German profile reads the pre-fold text.  Deleting a rule
+    // fails this test.
     let mut checked = 0;
     for pack in &packs() {
         let Profile::Multilingual { language } = profile(pack) else {
@@ -491,6 +497,9 @@ fn the_declared_fold_pairs_reach_one_token_stream() {
                 pair.from,
                 pair.to
             );
+            // Not an independent pin: for every profile but German the token
+            // stream is a function of the normalised text, so this assertion
+            // restates the one above in the form the index stores.
             assert_eq!(
                 tokenize_with(profile, &pair.from).expect("a dictionary-free profile tokenises"),
                 tokenize_with(profile, &pair.to).expect("a dictionary-free profile tokenises"),
