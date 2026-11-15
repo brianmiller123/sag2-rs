@@ -127,12 +127,24 @@ fn class(character: char) -> Class {
 /// [`Profile::Sag2ZhV1`](crate::analysis::Profile::Sag2ZhV1), the certified
 /// reference pipeline; it is the one entry point whose bytes the goldens pin.
 pub fn tokenize(text: &str) -> Vec<String> {
-    crate::analysis::tokenize_with(crate::analysis::Profile::Sag2ZhV1, text)
+    tokenize_default(text)
 }
 
-/// The §4 pipeline itself: what every profile starts from (design §4.1-§4.3).
+/// `NFKC` -> lower, then [`tokenize_normalised`].
+///
+/// This is the §4 pipeline a profile enters: [`Profile::Sag2ZhV1`] stops after
+/// these two steps, and a multilingual profile runs its own
+/// [`crate::analysis::normalize`] first and then calls
+/// [`tokenize_normalised`], so no input is normalised twice (C4).
+///
+/// [`Profile::Sag2ZhV1`]: crate::analysis::Profile::Sag2ZhV1
 pub(crate) fn tokenize_default(text: &str) -> Vec<String> {
-    let normalised = unicode::lower(&unicode::nfkc(text));
+    tokenize_normalised(&unicode::lower(&unicode::nfkc(text)))
+}
+
+/// The §4 pipeline itself, over text the caller has already normalised
+/// (design §4.1-§4.3).
+pub(crate) fn tokenize_normalised(normalised: &str) -> Vec<String> {
     let mut words: Vec<String> = Vec::new();
     let mut block_start = 0_usize;
     let mut block_inside: Option<bool> = None;

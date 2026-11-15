@@ -39,6 +39,7 @@ const METADATA: &str = "metadata.json";
 pub struct LinderaSegmenter {
     segmenter: Segmenter,
     dir: PathBuf,
+    fingerprint: String,
 }
 
 impl LinderaSegmenter {
@@ -46,6 +47,12 @@ impl LinderaSegmenter {
     ///
     /// A missing directory, a missing component or a malformed dictionary all
     /// come back as [`AnalysisError::Dictionary`]; nothing aborts the process.
+    ///
+    /// The fingerprint is computed here, from the same directory the loader
+    /// reads, so the value an index records always describes the lattice that
+    /// was actually loaded (C7).  `open` is the only place that produces a
+    /// segmenter, so there is no path that records a fingerprint from one scan
+    /// and segments with another.
     pub fn open(dir: &Path) -> Result<Self, AnalysisError> {
         if !dir.is_dir() {
             return Err(AnalysisError::dictionary(
@@ -56,12 +63,19 @@ impl LinderaSegmenter {
                 ),
             ));
         }
+        let fingerprint = Self::fingerprint(dir)?;
         let dictionary = load_fs_dictionary_with_options(dir, false)
             .map_err(|error| AnalysisError::dictionary(dir, error))?;
         Ok(LinderaSegmenter {
             segmenter: Segmenter::new(Mode::Normal, dictionary, None),
             dir: dir.to_owned(),
+            fingerprint,
         })
+    }
+
+    /// The fingerprint of the directory this segmenter loaded.
+    pub fn dictionary_fingerprint(&self) -> &str {
+        &self.fingerprint
     }
 
     /// Segment `text` into the dictionary's tokens.
@@ -91,6 +105,11 @@ impl LinderaSegmenter {
     /// A missing or unreadable directory or file is
     /// [`AnalysisError::Dictionary`]; a directory without `metadata.json` is
     /// the same error, because `lindera` cannot load it either.
+    ///
+    /// Symlinks are followed, because `lindera`'s loader reads the same paths:
+    /// a dictionary assembled out of symlinks must fingerprint like the files
+    /// it points at (C7).  `fs::metadata` follows and `DirEntry::metadata`
+    /// does not, so the scan uses the former.
     pub fn fingerprint(dir: &Path) -> Result<String, AnalysisError> {
         let metadata = fs::read(dir.join(METADATA))
             .map_err(|error| AnalysisError::dictionary(dir.join(METADATA), error))?;
@@ -98,10 +117,10 @@ impl LinderaSegmenter {
             .map_err(|error| AnalysisError::dictionary(dir, error))?
             .map(|entry| {
                 let entry = entry.map_err(|error| AnalysisError::dictionary(dir, error))?;
-                let file_type = entry
-                    .file_type()
-                    .map_err(|error| AnalysisError::dictionary(entry.path(), error))?;
-                if file_type.is_file() {
+                let path = entry.path();
+                let metadata =
+                    fs::metadata(&path).map_err(|error| AnalysisError::dictionary(path, error))?;
+                if metadata.is_file() {
                     // A lindera dictionary is flat; a subdirectory (a user
                     // dictionary, say) is not part of the system dictionary.
                     Ok(Some(entry.file_name().to_string_lossy().into_owned()))
@@ -151,6 +170,7 @@ impl std::fmt::Debug for LinderaSegmenter {
         formatter
             .debug_struct("LinderaSegmenter")
             .field("dir", &self.dir)
+            .field("fingerprint", &self.fingerprint)
             .finish_non_exhaustive()
     }
 }
@@ -215,6 +235,35 @@ mod tests {
         write(directory.path(), "dict.trie", b"trie");
         let added = LinderaSegmenter::fingerprint(directory.path()).expect("fingerprint");
         assert_ne!(before, added);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fingerprint_follows_symlinks() {
+        // A dictionary assembled from symlinks is the same dictionary: the
+        // scan must hash the file a symlink points at instead of skipping it.
+        use std::os::unix::fs::symlink;
+
+        let real = tempfile::tempdir().expect("temp dir");
+        write(real.path(), "metadata.json", br#"{"name":"test"}"#);
+        write(real.path(), "dict.vals", b"values");
+
+        let linked = tempfile::tempdir().expect("temp dir");
+        fs::copy(
+            real.path().join("metadata.json"),
+            linked.path().join("metadata.json"),
+        )
+        .expect("copy metadata");
+        symlink(
+            real.path().join("dict.vals"),
+            linked.path().join("dict.vals"),
+        )
+        .expect("symlink");
+
+        assert_eq!(
+            LinderaSegmenter::fingerprint(real.path()).expect("fingerprint"),
+            LinderaSegmenter::fingerprint(linked.path()).expect("fingerprint"),
+        );
     }
 
     #[test]

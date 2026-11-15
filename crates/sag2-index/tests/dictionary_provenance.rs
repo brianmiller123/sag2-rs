@@ -100,7 +100,7 @@ fn a_dictionary_profile_without_a_directory_cannot_open() {
 }
 
 #[test]
-fn a_dictionary_free_index_records_none_and_refuses_another_dictionary() {
+fn a_dictionary_free_index_records_no_row_and_refuses_one() {
     let directory = tempfile::tempdir().expect("temp dir");
     let path = directory.path().join("index.sqlite");
     CorpusIndex::open(&path, &corpus(), "fixture", options(Profile::Sag2ZhV1))
@@ -108,21 +108,23 @@ fn a_dictionary_free_index_records_none_and_refuses_another_dictionary() {
 
     {
         let db = Connection::open(&path).expect("open the index file");
-        let recorded: String = db
+        // C1: a default index does not record the row at all, because an
+        // absent `analysis_dict` already reads as `none`.
+        let rows: i64 = db
             .query_row(
-                "SELECT value FROM rust_index_metadata WHERE key='analysis_dict'",
+                "SELECT COUNT(*) FROM rust_index_metadata WHERE key='analysis_dict'",
                 [],
                 |row| row.get(0),
             )
-            .expect("analysis_dict row");
-        assert_eq!(recorded, "none");
+            .expect("analysis_dict rows");
+        assert_eq!(rows, 0);
         // A fingerprint recorded where a dictionary-free profile was expected
         // is a provenance mismatch even with `RebuildPolicy::Always`.
         db.execute(
-            "UPDATE rust_index_metadata SET value=?1 WHERE key='analysis_dict'",
+            "INSERT INTO rust_index_metadata VALUES('analysis_dict', ?1)",
             [format!("{}-fake", "0".repeat(59))],
         )
-        .expect("rewrite the provenance row");
+        .expect("insert the provenance row");
     }
 
     let error = CorpusIndex::open(&path, &corpus(), "fixture", options(Profile::Sag2ZhV1))

@@ -7,6 +7,12 @@
 
 use sag2_core::{tokenize, tokenize_with, Language, Profile};
 
+/// [`tokenize_with`] for a profile that never needs a dictionary; the tests
+/// below all use one, so the typed error is a test failure here.
+fn tokens(profile: Profile, text: &str) -> Vec<String> {
+    tokenize_with(profile, text).expect("a dictionary-free profile always tokenises")
+}
+
 /// `(text, tokens)` — the `tokenize` output this build certifies.
 const PINNED: [(&str, &[&str]); 6] = [
     ("Alice Paul birthplace", &["alice", "paul", "birthplace"]),
@@ -46,7 +52,7 @@ const PINNED: [(&str, &[&str]); 6] = [
 fn tokenize_is_the_sag2_zh_profile() {
     for (text, expected) in PINNED {
         assert_eq!(tokenize(text), expected, "{text:?}");
-        assert_eq!(tokenize_with(Profile::Sag2ZhV1, text), expected, "{text:?}");
+        assert_eq!(tokens(Profile::Sag2ZhV1, text), expected, "{text:?}");
     }
 }
 
@@ -57,8 +63,8 @@ fn a_multilingual_profile_normalises_before_the_certified_pipeline() {
     };
     // Foldable text reaches different tokens through the multilingual profile:
     // `ß` becomes `ss` before the tokenizer runs.
-    assert_eq!(tokenize_with(german, "Straße"), ["strasse"]);
-    assert_ne!(tokenize("Straße"), tokenize_with(german, "Straße"));
+    assert_eq!(tokens(german, "Straße"), ["strasse"]);
+    assert_ne!(tokenize("Straße"), tokens(german, "Straße"));
 
     // Text the fold does not touch keeps the certified tokens.
     for text in [
@@ -68,7 +74,7 @@ fn a_multilingual_profile_normalises_before_the_certified_pipeline() {
         "2024-11-15T09:30:00Z",
         "中华人民共和国成立了",
     ] {
-        assert_eq!(tokenize_with(german, text), tokenize(text), "{text:?}");
+        assert_eq!(tokens(german, text), tokenize(text), "{text:?}");
     }
 }
 

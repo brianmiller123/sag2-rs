@@ -568,6 +568,13 @@ fn load_statistics(
 }
 
 /// The v1 `rust_index_metadata` rows (design §3.3).
+///
+/// The ten design keys are unconditional.  The multilingual plan's two
+/// provenance keys are written only when they carry information: a
+/// [`Profile::Sag2ZhV1`] index records neither, because an absent `analysis`
+/// row reads back as `sag2-zh-v1` and an absent `analysis_dict` row as `none`
+/// (see [`crate::recorded_profile`]).  That keeps a default index at exactly
+/// the key set Gate D certifies.
 fn write_rust_metadata(
     tx: &Transaction<'_>,
     versions: &RuntimeVersions,
@@ -580,13 +587,8 @@ fn write_rust_metadata(
         [],
     )?;
     tx.execute("DELETE FROM rust_index_metadata", [])?;
-    let rows: [(&str, &str); 12] = [
+    let mut rows: Vec<(&str, &str)> = vec![
         ("format_version", crate::open::FORMAT_VERSION_STR),
-        ("analysis", profile.as_str()),
-        (
-            crate::open::ANALYSIS_DICT_KEY,
-            dictionary.unwrap_or(crate::open::ANALYSIS_DICT_NONE),
-        ),
         ("tokenizer_version", versions.tokenizer_version),
         ("chunk_policy_version", versions.chunk_policy_version),
         ("jieba_dict_sha256", versions.jieba_dict_sha256),
@@ -597,6 +599,13 @@ fn write_rust_metadata(
         ("sag_rank_sha256", versions.sag_rank_sha256),
         ("sag2_rs_version", versions.sag2_rs_version),
     ];
+    if profile != Profile::Sag2ZhV1 {
+        rows.push((crate::open::ANALYSIS_KEY, profile.as_str()));
+        let fingerprint = dictionary.unwrap_or(crate::open::ANALYSIS_DICT_NONE);
+        if fingerprint != crate::open::ANALYSIS_DICT_NONE {
+            rows.push((crate::open::ANALYSIS_DICT_KEY, fingerprint));
+        }
+    }
     let mut statement = tx.prepare("INSERT INTO rust_index_metadata VALUES(?,?)")?;
     for (key, value) in rows {
         statement.execute(rusqlite::params![key, value])?;
@@ -824,7 +833,17 @@ mod tests {
                 row.get(0)
             })
             .expect("rust keys");
-        assert_eq!(rust_keys, 12);
+        // The reference profile records no `analysis`/`analysis_dict` row, so
+        // the default index carries exactly the design §3.3 key set (C1).
+        assert_eq!(rust_keys, 10);
+        let analysis_row: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM rust_index_metadata WHERE key IN ('analysis','analysis_dict')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("analysis rows");
+        assert_eq!(analysis_row, 0);
         let fts_sql: String = db
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE name='chunk_fts'",
@@ -913,6 +932,44 @@ mod tests {
         let (_, outcome) = CorpusIndex::open(&path, &corpus, "fixture", reference)
             .expect("a legacy row opens as the reference profile");
         assert_eq!(outcome.action, OpenAction::Reused);
+    }
+
+    #[test]
+    fn a_multilingual_build_records_only_the_provenance_it_carries() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("index.sqlite");
+        let corpus = [Document {
+            title: "Markt",
+            text: "Der Markt öffnet früh am Morgen.",
+            path: None,
+            idx: None,
+        }];
+        let mut options = materialised(2200);
+        options.profile = MULTILINGUAL;
+        CorpusIndex::open(&path, &corpus, "fixture", options).expect("build");
+
+        let db = Connection::open(&path).expect("open");
+        let keys: Vec<String> = db
+            .prepare("SELECT key FROM rust_index_metadata ORDER BY key")
+            .expect("statement")
+            .query_map([], |row| row.get(0))
+            .expect("rows")
+            .collect::<Result<_, _>>()
+            .expect("keys");
+        // The ten design keys plus `analysis`; a dictionary-free profile must
+        // not record `analysis_dict = none`, because an absent row already
+        // reads as `none` (C1).
+        assert_eq!(keys.len(), 11, "{keys:?}");
+        assert!(keys.contains(&"analysis".to_owned()));
+        assert!(!keys.contains(&"analysis_dict".to_owned()));
+        let analysis: String = db
+            .query_row(
+                "SELECT value FROM rust_index_metadata WHERE key='analysis'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("analysis row");
+        assert_eq!(analysis, "multilingual-v1-de");
     }
 
     #[test]

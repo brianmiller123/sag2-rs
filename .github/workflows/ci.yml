@@ -84,8 +84,12 @@ jobs:
         run: cargo test --locked -p sag2-core --test multilingual -- --nocapture
       # Japanese/Korean segmentation needs its runtime dictionary at run time,
       # but the feature itself must build with no dictionary present.
-      - name: lindera dictionary support builds
-        run: cargo build --locked -p sag2-core --features lindera
+      # The feature is forwarded by sag2-index/sag2/sag2-cli, so building only
+      # `sag2-core` would leave those forwarding arms uncompiled (C5).
+      - name: lindera dictionary support builds through the CLI
+        run: |
+          cargo build --locked -p sag2-core --features lindera
+          cargo build --locked -p sag2-cli --features lindera
 
   gates:
     name: gates A-D (offline)

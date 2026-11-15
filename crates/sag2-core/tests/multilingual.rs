@@ -1,11 +1,26 @@
 //! The multilingual recall fixture: word-rate and R@10 per language.
 //!
-//! `tests/data/multilingual.jsonl` holds twelve self-authored language packs
+//! `tests/data/multilingual.jsonl` holds thirteen self-authored language packs
 //! (ten documents, ten labelled queries each).  Nothing in it is copied from
 //! UD, MIRACL or any other third-party corpus, so the numbers here are a
 //! regression net rather than a benchmark of those corpora — see the plan's §7.
 //!
-//! For every pack this file checks:
+//! Every pack is in exactly one state, and the fixture says which:
+//!
+//! * **measured** (`th`, `de`, `fr`, `zh`, `en`) - the profile has a word-level
+//!   pipeline, so the word rate has a pinned target and the reference
+//!   `Sag2ZhV1` rate is pinned as the baseline.
+//! * **deferred** (`ru`, `ar`, `hi`, `el`, `vi`, `pl`) - the profile still
+//!   tokenises per character because the segmenter or stemmer is plan §5
+//!   batch 2 (Snowball for ru/pl/el, an Arabic stemmer, Indic word boundaries
+//!   for hi, Vietnamese word boundaries).  Their word rate is printed but not
+//!   asserted: a target would only restate the gap.
+//! * **dictionary required** (`ja`, `ko`) - these cannot tokenise without a
+//!   runtime dictionary, and CI has none.  They must return
+//!   [`AnalysisError::DictionaryMissing`](sag2_core::AnalysisError) instead of
+//!   a character stream, so they contribute no word-rate or R@10 number here.
+//!
+//! For every measured pack this file checks:
 //!
 //! 1. **word rate** - the share of the pack's content words that tokenise to
 //!    exactly one token.  The multilingual profile has to reach the pack's
@@ -36,7 +51,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use sag2_core::{tokenize, tokenize_with, Profile};
+use sag2_core::{tokenize, tokenize_with, AnalysisError, Profile};
 use sag2_index::{CorpusIndex, Document, IndexOptions, QueryMode, RebuildPolicy};
 use serde::Deserialize;
 
@@ -68,9 +83,25 @@ struct Pack {
     lang: String,
     /// `"chars"` or `"words"`: which stream the decoys in [`decoys`] reorder.
     decoy: String,
-    target_word_rate: f64,
-    target_query_gain: f64,
-    baseline_word_rate: f64,
+    /// The profile still tokenises per character; plan §5 batch 2 owns the
+    /// segmenter or stemmer, so the word rate is reported but not asserted.
+    #[serde(default)]
+    deferred: bool,
+    /// The profile cannot tokenise without a runtime dictionary (ja/ko), so
+    /// there is nothing to measure offline.
+    #[serde(default)]
+    dictionary_required: bool,
+    /// The word rate the profile must reach - `Some` for measured packs only.
+    #[serde(default)]
+    target_word_rate: Option<f64>,
+    /// The `Sag2ZhV1` word rate recorded for this pack - `Some` for measured
+    /// packs only.
+    #[serde(default)]
+    baseline_word_rate: Option<f64>,
+    /// The Phrase3 gain over Lexical the pack asks for - `Some` for every pack
+    /// whose queries are evaluated, `None` for the dictionary packs.
+    #[serde(default)]
+    target_query_gain: Option<f64>,
     content_words: Vec<String>,
     docs: Vec<PackDocument>,
     queries: Vec<PackQuery>,
@@ -109,13 +140,11 @@ fn packs() -> Vec<Pack> {
     packs
 }
 
-/// The profile a pack's word rate is measured with.
+/// The profile a pack is measured with.
 ///
 /// Chinese and English are the reference pipeline's own languages; every other
 /// pack names its language in the profile identifier, which also proves the
-/// identifier parser agrees with the fixture.  Japanese and Korean segment with
-/// a runtime dictionary that CI has no copy of, so their word rate here is the
-/// documented dictionary-free fallback (`tokenize_with` without a segmenter).
+/// identifier parser agrees with the fixture.
 fn profile(pack: &Pack) -> Profile {
     match pack.lang.as_str() {
         "zh" | "en" => Profile::Sag2ZhV1,
@@ -125,26 +154,17 @@ fn profile(pack: &Pack) -> Profile {
     }
 }
 
-/// The profile a pack's index is built with.
-///
-/// A `multilingual-v1-ja`/`-ko` index cannot be built without its dictionary,
-/// and the fixture has to run offline, so those two packs are evaluated through
-/// the reference pipeline (the character-level baseline for Korean and the
-/// dictionary-free jieba stream for Japanese).  Their target only asks Phrase3
-/// not to trail Lexical.
-fn index_profile(pack: &Pack) -> Profile {
-    match pack.lang.as_str() {
-        "zh" | "en" | "ja" | "ko" => Profile::Sag2ZhV1,
-        _ => profile(pack),
-    }
-}
-
 /// `(hits, total)` for one profile: content words that come out as one token.
 fn word_rate(profile: Profile, pack: &Pack) -> (usize, usize) {
     let hits = pack
         .content_words
         .iter()
-        .filter(|word| tokenize_with(profile, word).len() == 1)
+        .filter(|word| {
+            tokenize_with(profile, word)
+                .expect("a dictionary-free profile always tokenises")
+                .len()
+                == 1
+        })
         .count();
     (hits, pack.content_words.len())
 }
@@ -158,21 +178,22 @@ fn word_rate(profile: Profile, pack: &Pack) -> (usize, usize) {
 ///   the token stream is real words, so the decoy keeps every word and loses
 ///   the order.  A `Lexical` expression (the `OR` of the words) retrieves it as
 ///   readily as the document; a phrase expression does not.
-/// * `"chars"` (Russian, Arabic, Hindi, Greek, Korean) - the token stream is
-///   single characters, so the decoy is the character sequence rotated and
-///   joined without spaces: every character is still there, no three-character
-///   window of the original survives.
+/// * `"chars"` (Russian, Arabic, Hindi, Greek, Polish, Korean) - the token
+///   stream is single characters, so the decoy is the character sequence
+///   rotated and joined without spaces: every character is still there, no
+///   three-character window of the original survives.
 ///
 /// Decoy `k` of a document rotates its stream by `(k + 1) * 7` positions, which
 /// is deterministic and keeps the same multiset of tokens.
 fn decoys(pack: &Pack) -> Vec<(String, String)> {
-    let profile = index_profile(pack);
+    let profile = profile(pack);
     let mut decoys = Vec::new();
     for document in &pack.docs {
         let stream: Vec<String> = if pack.decoy == "chars" {
             document.text.chars().map(String::from).collect()
         } else {
             tokenize_with(profile, &document.text)
+                .expect("a dictionary-free profile always tokenises")
         };
         if stream.len() < 2 {
             continue;
@@ -221,7 +242,7 @@ fn build_index(directory: &Path, pack: &Pack) -> (CorpusIndex, usize) {
         &format!("multilingual-fixture-{}", pack.lang),
         IndexOptions {
             chunk_chars: CHUNK_CHARS,
-            profile: index_profile(pack),
+            profile: profile(pack),
             rebuild: RebuildPolicy::Always,
             ..IndexOptions::default()
         },
@@ -269,13 +290,15 @@ fn recall_at_10(index: &CorpusIndex, pack: &Pack, mode: QueryMode) -> (f64, Vec<
 }
 
 #[test]
-fn the_fixture_covers_twelve_languages() {
+fn the_fixture_covers_thirteen_languages_in_three_states() {
     let packs = packs();
-    assert_eq!(packs.len(), 12, "one pack per language");
+    assert_eq!(packs.len(), 13, "one pack per language");
     let languages: BTreeSet<&str> = packs.iter().map(|pack| pack.lang.as_str()).collect();
     assert_eq!(
         languages,
-        BTreeSet::from(["ar", "de", "el", "en", "fr", "hi", "ja", "ko", "ru", "th", "vi", "zh"])
+        BTreeSet::from([
+            "ar", "de", "el", "en", "fr", "hi", "ja", "ko", "pl", "ru", "th", "vi", "zh"
+        ])
     );
     for pack in &packs {
         assert_eq!(pack.docs.len(), 10, "{}: ten documents", pack.lang);
@@ -303,37 +326,127 @@ fn the_fixture_covers_twelve_languages() {
             "{}: profile parses",
             pack.lang
         );
+        // A pack is measured (both word-rate fields), deferred (neither, and
+        // no gain target), or dictionary-required (no word rate at all).
+        let measured = pack.target_word_rate.is_some() && pack.baseline_word_rate.is_some();
+        if pack.dictionary_required {
+            assert!(
+                !measured,
+                "{}: a dictionary pack measures nothing",
+                pack.lang
+            );
+            assert!(!pack.deferred, "{}: dictionary is not deferred", pack.lang);
+            assert_eq!(
+                pack.target_query_gain, None,
+                "{}: no R@10 target",
+                pack.lang
+            );
+            assert!(matches!(pack.lang.as_str(), "ja" | "ko"));
+        } else if pack.deferred {
+            assert!(
+                !measured,
+                "{}: a deferred pack does not pin a tautological target",
+                pack.lang
+            );
+            assert_eq!(
+                pack.target_query_gain,
+                Some(0.0),
+                "{}: a deferred pack asks only that Phrase3 not trail Lexical",
+                pack.lang
+            );
+        } else {
+            assert!(measured, "{}: a measured pack pins both rates", pack.lang);
+            assert!(
+                pack.target_query_gain.is_some(),
+                "{}: a measured pack pins its gain",
+                pack.lang
+            );
+        }
+    }
+}
+
+#[test]
+fn a_dictionary_profile_refuses_the_character_fallback() {
+    // C2: `ja`/`ko` without a dictionary are a typed error, never the
+    // character tokens the old wrapper handed back.
+    let all = packs();
+    let dictionary: Vec<&Pack> = all.iter().filter(|pack| pack.dictionary_required).collect();
+    assert_eq!(dictionary.len(), 2, "ja and ko");
+    for pack in dictionary {
+        let profile = profile(pack);
+        for word in &pack.content_words {
+            match tokenize_with(profile, word) {
+                Err(AnalysisError::DictionaryMissing { language }) => {
+                    assert_eq!(
+                        Profile::Multilingual { language },
+                        profile,
+                        "{}: the error names the profile's language",
+                        pack.lang
+                    );
+                }
+                other => panic!(
+                    "{}: {word:?} must be DictionaryMissing, got {other:?}",
+                    pack.lang
+                ),
+            }
+        }
     }
 }
 
 #[test]
 fn word_rates_meet_the_targets_and_the_baseline_is_pinned() {
     let mut table = String::from(
-        "\nlanguage  profile                 words  hits  rate    target  baseline  profile-word-rate\n",
+        "\nlanguage  profile                 words  hits  rate    target  baseline  state\n",
     );
     let mut failures = Vec::new();
     for pack in &packs() {
         let multilingual = profile(pack);
+        if pack.dictionary_required {
+            table.push_str(&format!(
+                "{:<9} {:<23} {:>5}  {:>4}  {:<7} {:<7} {:<9} dictionary required\n",
+                pack.lang,
+                multilingual.as_str(),
+                pack.content_words.len(),
+                "-",
+                "-",
+                "-",
+                "-"
+            ));
+            continue;
+        }
         let (hits, words) = word_rate(multilingual, pack);
         let rate = hits as f64 / words as f64;
         let (baseline_hits, baseline_words) = word_rate(Profile::Sag2ZhV1, pack);
         let baseline = baseline_hits as f64 / baseline_words as f64;
+        let state = if pack.deferred {
+            "deferred (§5 batch 2)"
+        } else {
+            "measured"
+        };
         table.push_str(&format!(
-            "{:<9} {:<23} {words:>5}  {hits:>4}  {rate:<7.3} {:<7.3} {baseline:<9.3}\n",
+            "{:<9} {:<23} {words:>5}  {hits:>4}  {rate:<7.3} {:<7} {baseline:<9.3} {state}\n",
             pack.lang,
             multilingual.as_str(),
-            pack.target_word_rate,
+            pack.target_word_rate
+                .map(|target| format!("{target:.3}"))
+                .unwrap_or_else(|| "-".to_owned()),
         ));
-        if rate + WORD_RATE_EPSILON < pack.target_word_rate {
+        let Some(target) = pack.target_word_rate else {
+            continue;
+        };
+        if rate + WORD_RATE_EPSILON < target {
             failures.push(format!(
-                "{}: word rate {rate:.3} is below the target {:.3} (content words {:?})",
-                pack.lang, pack.target_word_rate, pack.content_words
+                "{}: word rate {rate:.3} is below the target {target:.3} (content words {:?})",
+                pack.lang, pack.content_words
             ));
         }
-        if (baseline - pack.baseline_word_rate).abs() > WORD_RATE_EPSILON {
+        let Some(pinned) = pack.baseline_word_rate else {
+            continue;
+        };
+        if (baseline - pinned).abs() > WORD_RATE_EPSILON {
             failures.push(format!(
-                "{}: the Sag2ZhV1 baseline moved from {:.3} to {baseline:.3}",
-                pack.lang, pack.baseline_word_rate
+                "{}: the Sag2ZhV1 baseline moved from {pinned:.3} to {baseline:.3}",
+                pack.lang
             ));
         }
     }
@@ -349,16 +462,28 @@ fn phrase3_recall_clears_every_target() {
     );
     let mut failures = Vec::new();
     for pack in &packs() {
-        let evaluated = index_profile(pack);
+        let multilingual = profile(pack);
+        if pack.dictionary_required {
+            table.push_str(&format!(
+                "{:<9} {:<23} {:>6}  {:<8} {:<8} {:<7} dictionary required\n",
+                pack.lang,
+                multilingual.as_str(),
+                "-",
+                "-",
+                "-",
+                "-"
+            ));
+            continue;
+        }
         let (index, chunks) = build_index(directory.path(), pack);
         let (lexical, lexical_outcomes) = recall_at_10(&index, pack, QueryMode::Lexical);
         let (phrases, phrase_outcomes) = recall_at_10(&index, pack, QueryMode::Phrase3);
         let gain = phrases - lexical;
+        let target = pack.target_query_gain.unwrap_or(0.0);
         table.push_str(&format!(
-            "{:<9} {:<23} {chunks:>6}  {lexical:<8.3} {phrases:<8.3} {gain:<+7.3} {:.3}\n",
+            "{:<9} {:<23} {chunks:>6}  {lexical:<8.3} {phrases:<8.3} {gain:<+7.3} {target:.3}\n",
             pack.lang,
-            evaluated.as_str(),
-            pack.target_query_gain,
+            multilingual.as_str(),
         ));
         if phrases + EPSILON < lexical {
             failures.push(format!(
@@ -368,11 +493,10 @@ fn phrase3_recall_clears_every_target() {
                 describe(&phrase_outcomes)
             ));
         }
-        if gain + EPSILON < pack.target_query_gain {
+        if gain + EPSILON < target {
             failures.push(format!(
-                "{}: Phrase3 gain {gain:+.3} is below the target {:.3}\nlexical:\n{}\nphrase3:\n{}",
+                "{}: Phrase3 gain {gain:+.3} is below the target {target:.3}\nlexical:\n{}\nphrase3:\n{}",
                 pack.lang,
-                pack.target_query_gain,
                 describe(&lexical_outcomes),
                 describe(&phrase_outcomes)
             ));
@@ -399,7 +523,10 @@ fn the_reference_profile_never_normalises_the_fixture() {
     // `Sag2ZhV1` entry point the goldens pin.
     for pack in &packs() {
         for word in &pack.content_words {
-            assert_eq!(tokenize_with(Profile::Sag2ZhV1, word), tokenize(word));
+            assert_eq!(
+                tokenize_with(Profile::Sag2ZhV1, word).expect("the reference profile tokenises"),
+                tokenize(word)
+            );
         }
     }
 }

@@ -9,6 +9,12 @@
 use sag2_core::analysis::normalize::{fold_script, normalize};
 use sag2_core::{tokenize, tokenize_with, Language, Profile};
 
+/// [`tokenize_with`] for a profile that never needs a dictionary; the tests
+/// below all use one, so the typed error is a test failure here.
+fn tokens(profile: Profile, text: &str) -> Vec<String> {
+    tokenize_with(profile, text).expect("a dictionary-free profile always tokenises")
+}
+
 /// German exercises the shared Latin fold in both cases plus NFKC.
 const GERMAN: [(&str, &str); 22] = [
     ("Straße", "strasse"),
@@ -185,7 +191,7 @@ fn unaffected_languages_keep_their_text() {
     assert_table(Language::Other, &CHINESE);
     // And the reference profile never enters normalisation at all.
     for (text, _) in &CHINESE {
-        assert_eq!(tokenize_with(Profile::Sag2ZhV1, text), tokenize(text));
+        assert_eq!(tokens(Profile::Sag2ZhV1, text), tokenize(text));
     }
 }
 
@@ -202,7 +208,7 @@ fn the_fold_leaves_unaffected_languages_alone() {
 fn the_reference_profile_never_normalises() {
     // `Sag2ZhV1` keeps the certified tokens even where a German profile folds.
     assert_ne!(
-        tokenize_with(
+        tokens(
             Profile::Multilingual {
                 language: Language::De
             },
@@ -210,8 +216,5 @@ fn the_reference_profile_never_normalises() {
         ),
         tokenize("Straße")
     );
-    assert_eq!(
-        tokenize("Straße"),
-        tokenize_with(Profile::Sag2ZhV1, "Straße")
-    );
+    assert_eq!(tokenize("Straße"), tokens(Profile::Sag2ZhV1, "Straße"));
 }

@@ -1521,17 +1521,16 @@ fn read_index_goldens(options: &Options) -> Result<Vec<IndexGolden>, String> {
     Ok(entries)
 }
 
-/// The `rust_index_metadata` rows this build writes: the design §3.3 v1 key
-/// set plus the analysis profile and dictionary provenance every build records.
+/// The `rust_index_metadata` rows a default build declares: the design §3.3 v1
+/// key set, which is exactly what `golden/index_expected.jsonl` records.
+///
+/// The multilingual plan's `analysis`/`analysis_dict` rows are conditional
+/// (`sag2_index::build`): a `Sag2ZhV1` build does not write them, so the keys a
+/// default index carries are the reference dump's keys.
 fn expected_rust_metadata() -> BTreeMap<&'static str, &'static str> {
     let versions = &sag2_index::RUNTIME_VERSIONS;
     [
         ("format_version", sag2_index::FORMAT_VERSION_STR),
-        ("analysis", Profile::Sag2ZhV1.as_str()),
-        (
-            sag2_index::ANALYSIS_DICT_KEY,
-            sag2_index::ANALYSIS_DICT_NONE,
-        ),
         ("tokenizer_version", versions.tokenizer_version),
         ("chunk_policy_version", versions.chunk_policy_version),
         ("jieba_dict_sha256", versions.jieba_dict_sha256),
@@ -1549,20 +1548,16 @@ fn expected_rust_metadata() -> BTreeMap<&'static str, &'static str> {
 /// The `rust_index_metadata/keys` comparison, as the `(expected, actual)`
 /// strings a failure reports.
 ///
-/// `expected` is what this build declares and `golden` what the recorded
-/// fixtures require.  The goldens record the design §3.3 v1 key set, which
-/// every build still has to carry; `analysis` and `analysis_dict` are the
-/// multilingual plan's additions to that set, and design §3.2 rule 4 makes an
-/// unknown key ignorable for a 1.x reader.  So the declared set is compared
-/// exactly (an undeclared key is a failure) and the recorded set as a required
-/// subset.
+/// All three sets must be equal: what this build declares, what the index
+/// carries, and what the recorded fixtures require.  A superset of the golden
+/// keys is a difference too, because the reference build never wrote an extra
+/// row (design §3.3).
 fn metadata_key_failure(
     expected: &[&str],
     actual: &[&str],
     golden: &[&str],
 ) -> Option<(String, String)> {
-    let golden_missing = golden.iter().filter(|key| !actual.contains(*key)).count();
-    if actual == expected && golden_missing == 0 {
+    if actual == expected && actual == golden {
         return None;
     }
     Some((format!("{expected:?}"), format!("{actual:?}")))
@@ -5214,24 +5209,31 @@ mod tests {
     }
 
     #[test]
-    fn the_provenance_key_failure_names_the_declared_set() {
-        let expected = ["analysis", "format_version"];
-        let actual = ["format_version"];
-        let golden = ["format_version"];
+    fn the_provenance_key_set_is_compared_exactly() {
+        let declared = ["format_version", "tokenizer_version"];
+        let golden = declared;
 
-        // The build dropped a declared key: the expected column is the
-        // declared set, not the golden's, which does not carry `analysis`.
+        // A declared key the index does not carry is a failure.
         let (expected_column, actual_column) =
-            metadata_key_failure(&expected, &actual, &golden).expect("a key-set failure");
-        assert_eq!(expected_column, format!("{expected:?}"));
-        assert_eq!(actual_column, format!("{actual:?}"));
+            metadata_key_failure(&declared, &["format_version"], &golden)
+                .expect("a key-set failure");
+        assert_eq!(expected_column, format!("{declared:?}"));
+        assert_eq!(actual_column, r#"["format_version"]"#);
 
-        // A missing golden key still fails and still names the declared set.
-        let (expected_column, _) =
-            metadata_key_failure(&expected, &["analysis"], &golden).expect("a golden-key failure");
-        assert_eq!(expected_column, format!("{expected:?}"));
+        // An extra row is a failure too: before the C1 fix every build wrote
+        // `analysis` and `analysis_dict`, and a golden set without them must
+        // reject that superset.
+        let with_analysis = ["analysis", "format_version", "tokenizer_version"];
+        metadata_key_failure(&declared, &with_analysis, &golden)
+            .expect("a superset of the declared set is a failure");
+        metadata_key_failure(&declared, &with_analysis, &with_analysis)
+            .expect("a superset of the golden set is a failure");
 
-        assert_eq!(metadata_key_failure(&expected, &expected, &golden), None);
+        // A golden set that disagrees with the declared set fails as well.
+        metadata_key_failure(&declared, &declared, &with_analysis)
+            .expect("the golden set must equal the declared set");
+
+        assert_eq!(metadata_key_failure(&declared, &declared, &golden), None);
     }
 
     #[test]

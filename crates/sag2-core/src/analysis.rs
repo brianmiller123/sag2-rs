@@ -24,7 +24,7 @@ pub mod segment;
 pub use segment::DictionaryAnalysis;
 
 use crate::ascii_cut;
-use crate::tokenize::{keep, tokenize_default};
+use crate::tokenize::{keep, tokenize_default, tokenize_normalised};
 
 /// The language a multilingual profile is built for.
 ///
@@ -189,6 +189,18 @@ pub enum AnalysisError {
         /// The language whose profile needs one.
         language: Language,
     },
+    /// A segmenter failed on the text itself.
+    ///
+    /// Thai `newmm` returns an error instead of a token stream for input it
+    /// cannot cover; the caller gets that error and never a character-level
+    /// fallback, because a fallback would silently change the token stream the
+    /// index records.
+    Segmentation {
+        /// The language whose segmenter failed.
+        language: Language,
+        /// The segmenter's own error.
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 impl AnalysisError {
@@ -228,6 +240,13 @@ impl fmt::Display for AnalysisError {
                     language: *language
                 }
             ),
+            AnalysisError::Segmentation { language, source } => write!(
+                formatter,
+                "cannot segment {} input: {source}",
+                Profile::Multilingual {
+                    language: *language
+                }
+            ),
         }
     }
 }
@@ -236,6 +255,7 @@ impl std::error::Error for AnalysisError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             AnalysisError::Dictionary { source, .. } => Some(source.as_ref()),
+            AnalysisError::Segmentation { source, .. } => Some(source.as_ref()),
             AnalysisError::DictionaryMissing { .. }
             | AnalysisError::DictionaryUnsupported { .. } => None,
         }
@@ -297,14 +317,13 @@ impl FromStr for Profile {
 /// except for [`Language::Th`], where [`thai_tokens`] supplies the word
 /// boundaries and keeps the certified ASCII model and the final filters.
 ///
-/// This is the convenience wrapper for dictionary-free pipelines.
-/// [`Language::Ja`] and [`Language::Ko`] segment with a dictionary, so their
-/// callers resolve [`segment::DictionaryAnalysis`] first and use
-/// [`tokenize_with_segmenter`].  Index build and open refuse those profiles
-/// without a resolved dictionary ([`AnalysisError::DictionaryMissing`]), so this
-/// entry point can never produce the stored token stream for them.
-pub fn tokenize_with(profile: Profile, text: &str) -> Vec<String> {
-    tokenize_with_segmenter(profile, text, None).expect("a dictionary-free pipeline cannot fail")
+/// This is the dictionary-free entry point.  [`Language::Ja`] and
+/// [`Language::Ko`] cannot tokenise without a dictionary, so they return
+/// [`AnalysisError::DictionaryMissing`] here rather than a character-level
+/// stream that would not match the index: their callers resolve
+/// [`segment::DictionaryAnalysis`] first and use [`tokenize_with_segmenter`].
+pub fn tokenize_with(profile: Profile, text: &str) -> Result<Vec<String>, AnalysisError> {
+    tokenize_with_segmenter(profile, text, None)
 }
 
 /// Tokenize `text` with `profile`, using `dictionary` when the profile needs one.
@@ -312,9 +331,9 @@ pub fn tokenize_with(profile: Profile, text: &str) -> Vec<String> {
 /// The returned tokens always come from one pipeline: the dictionary profiles
 /// segment the normalised text with the supplied [`segment::DictionaryAnalysis`]
 /// and apply the same `HAS_CONTENT`/stopword filter as every other profile.  The
-/// only failure is the dictionary itself (an unreadable or malformed dictionary
-/// at segmentation time); with `dictionary = None` this is exactly
-/// [`tokenize_with`].
+/// failures are the dictionary itself (missing, unreadable or malformed) and the
+/// segmenter's own error; a profile that needs a dictionary never produces
+/// character tokens.
 pub fn tokenize_with_segmenter(
     profile: Profile,
     text: &str,
@@ -324,16 +343,16 @@ pub fn tokenize_with_segmenter(
         Profile::Sag2ZhV1 => Ok(tokenize_default(text)),
         Profile::Multilingual { language } => {
             let normalised = normalize::normalize(language, text);
-            if profile.dictionary_language().is_some() {
-                if let Some(dictionary) = dictionary {
-                    let mut tokens = dictionary.segment(&normalised)?;
-                    tokens.retain(|token| keep(token));
-                    return Ok(tokens);
-                }
+            if let Some(missing) = profile.dictionary_language() {
+                let dictionary =
+                    dictionary.ok_or(AnalysisError::DictionaryMissing { language: missing })?;
+                let mut tokens = dictionary.segment(&normalised)?;
+                tokens.retain(|token| keep(token));
+                return Ok(tokens);
             }
             match language {
-                Language::Th => Ok(thai_tokens(&normalised)),
-                _ => Ok(tokenize_default(&normalised)),
+                Language::Th => thai_tokens(&normalised),
+                _ => Ok(tokenize_normalised(&normalised)),
             }
         }
     }
@@ -348,9 +367,9 @@ pub fn tokenize_with_segmenter(
 /// profile.  The reference `[._-]` split and the 2-/3-codepoint `FREQ`
 /// expansion do not apply: a Thai word is exactly what the segmenter produced,
 /// so `newmm`'s boundaries are the only word boundaries.
-fn thai_tokens(normalised: &str) -> Vec<String> {
+fn thai_tokens(normalised: &str) -> Result<Vec<String>, AnalysisError> {
     let mut tokens = Vec::new();
-    for word in segment::thai::segment(normalised) {
+    for word in segment::thai::segment(normalised)? {
         if word.is_ascii() {
             ascii_cut::cut_run(&word, &mut tokens);
         } else {
@@ -358,7 +377,7 @@ fn thai_tokens(normalised: &str) -> Vec<String> {
         }
     }
     tokens.retain(|token| keep(token));
-    tokens
+    Ok(tokens)
 }
 
 #[cfg(test)]
@@ -367,6 +386,11 @@ mod tests {
         tokenize_with, tokenize_with_segmenter, AnalysisError, DictionaryAnalysis, Language,
         Profile, REMOVED_MULTILINGUAL_V1,
     };
+
+    /// [`tokenize_with`] for a profile that never needs a dictionary.
+    fn tokens(profile: Profile, text: &str) -> Vec<String> {
+        tokenize_with(profile, text).expect("a dictionary-free profile always tokenizes")
+    }
     use std::str::FromStr;
 
     const LANGUAGES: [Language; 13] = [
@@ -418,7 +442,7 @@ mod tests {
     fn the_reference_profile_does_not_normalize() {
         for text in ["Straße", "Αθήνα", "مُحَمَّد", "Việt"] {
             assert_eq!(
-                tokenize_with(Profile::Sag2ZhV1, text),
+                tokens(Profile::Sag2ZhV1, text),
                 crate::tokenize(text),
                 "{text:?}"
             );
@@ -430,8 +454,8 @@ mod tests {
         let german = Profile::Multilingual {
             language: Language::De,
         };
-        assert_eq!(tokenize_with(german, "Straße"), ["strasse"]);
-        assert_ne!(tokenize_with(german, "Straße"), crate::tokenize("Straße"));
+        assert_eq!(tokens(german, "Straße"), ["strasse"]);
+        assert_ne!(tokens(german, "Straße"), crate::tokenize("Straße"));
     }
 
     #[test]
@@ -454,6 +478,25 @@ mod tests {
                     assert_eq!(found, language)
                 }
                 other => panic!("unexpected {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_dictionary_profile_never_degrades_to_characters() {
+        for language in [Language::Ja, Language::Ko] {
+            let profile = Profile::Multilingual { language };
+            match tokenize_with(profile, "東京") {
+                Err(AnalysisError::DictionaryMissing { language: found }) => {
+                    assert_eq!(found, language)
+                }
+                other => panic!("{language:?} must refuse without a dictionary, got {other:?}"),
+            }
+            match crate::match_query_with(crate::QueryMode::Lexical, profile, "東京") {
+                Err(AnalysisError::DictionaryMissing { language: found }) => {
+                    assert_eq!(found, language)
+                }
+                other => panic!("{language:?} must not build an expression, got {other:?}"),
             }
         }
     }
@@ -503,7 +546,7 @@ mod tests {
         for text in ["Where was Alston born?", "中华人民共和国成立了"] {
             assert_eq!(
                 tokenize_with_segmenter(Profile::Sag2ZhV1, text, None).expect("no dictionary"),
-                tokenize_with(Profile::Sag2ZhV1, text)
+                tokens(Profile::Sag2ZhV1, text)
             );
         }
     }

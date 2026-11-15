@@ -67,10 +67,19 @@ License: the DUCET file is distributed under the Unicode Terms of Use
 | field | value |
 | --- | --- |
 | source | `https://raw.githubusercontent.com/PyThaiNLP/pythainlp/dev/pythainlp/corpus/words_th.txt` |
+| upstream commit | `PyThaiNLP/pythainlp` `dev` @ `269d0f9e940b71e1f4cfb8913cdef622d3bd378c` (2026-11-13) |
+| pinned URL | `https://raw.githubusercontent.com/PyThaiNLP/pythainlp/269d0f9e940b71e1f4cfb8913cdef622d3bd378c/pythainlp/corpus/words_th.txt` |
 | sha256 | `12bf4d04e8d59a8b235eb9e7ac59b18e5f4d56320f25e75e9c9f8f565543b481` |
 | bytes | 1,520,294 |
 | lines | 62,109 |
 | license | CC0-1.0 (public domain dedication) |
+
+The commit is the `dev` tip the file was captured from; that tree and its
+descendants carry the digest above, while the release branch's copy differs
+(`35f65d43…`, 62,107 lines), which is why the URL is pinned to a commit and not
+to a branch name.  `crates/sag2-core/src/analysis/segment/thai.rs` asserts the
+digest, the byte count and the line count, so an edit to the vendored file is a
+test failure rather than a silent re-segmentation.
 
 It is vendored because `nlpo3` 1.4.0 (Apache-2.0) implements Thai `newmm`
 segmentation but ships no dictionary. One word per line; 611 of the lines are
@@ -94,8 +103,9 @@ third-party licence or attribution attached to it.
 
 | field | value |
 | --- | --- |
-| languages | `ru ar hi el vi th ja ko de fr zh en` (one JSON line each) |
+| languages | `ru ar hi el vi th pl ja ko de fr zh en` (one JSON line each) |
 | per language | 10 documents (2-4 sentences), 10 labelled queries, 12 content words |
+| states | `measured` (th de fr zh en: pinned word-rate target and baseline), `deferred` (ru ar hi el vi pl: plan §5 batch 2 has the segmenter/stemmer, so only the rate is printed), `dictionary required` (ja ko: asserted to return `AnalysisError::DictionaryMissing`, never a character stream) |
 | used for | word-rate targets, the pinned `Sag2ZhV1` baseline, and the Lexical-vs-Phrase3 R@10 comparison |
 
 The R@10 evaluation adds decoy documents derived deterministically from the

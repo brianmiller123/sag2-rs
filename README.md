@@ -148,49 +148,64 @@ SAG2_DICT_DIR=/path/to/ko-dic SAG2_DICT_LANG=ko \
 
 ## Languages
 
-`Profile::Sag2ZhV1` is the certified pipeline and the default everywhere.
+`Profile::Sag2ZhV1` is the certified pipeline and the default everywhere, and a
+default index carries none of the plan's provenance rows: an absent `analysis`
+reads back as `sag2-zh-v1` and an absent `analysis_dict` as `none`, so the key
+set stays exactly the ten keys design §3.3 fixes (Gate D compares it exactly).
 `Profile::Multilingual { language }` normalises and (where one exists) segments
-per language; its identifier is persisted in `rust_index_metadata.analysis`
-(`multilingual-v1-<lang>`), so an index always reads back through the pipeline
+per language; it persists `rust_index_metadata.analysis`
+(`multilingual-v1-<lang>`) and, only for a profile that actually loaded a
+dictionary, `analysis_dict`, so an index always reads back through the pipeline
 that built it.
 
-| language | profile | analysis | dictionary | word rate | Phrase3 R@10 gain |
+| language | profile | analysis | word rate | Phrase3 R@10 gain | state |
 |---|---|---|---|---|---|
-| Russian | `multilingual-v1-ru` | normalise, character tokens | no | 0.00 | +0.10 |
-| Arabic | `multilingual-v1-ar` | normalise (hamza/alef/tatweel), character tokens | no | 0.00 | +0.20 |
-| Hindi | `multilingual-v1-hi` | character tokens | no | 0.00 | +0.00 |
-| Greek | `multilingual-v1-el` | normalise (strip tonos/dialytika), character tokens | no | 0.00 | +0.20 |
-| Vietnamese | `multilingual-v1-vi` | normalise (strip tone marks) to ASCII syllables | no | 0.17 | +0.00 |
-| Thai | `multilingual-v1-th` | `newmm` words (nlpo3 + CC0 word list) | no | 0.92 | +0.00 |
-| Japanese | `multilingual-v1-ja` | `lindera` words | **yes** | 0.67* | +0.00* |
-| Korean | `multilingual-v1-ko` | `lindera` words | **yes** | 0.17* | +0.00* |
-| German | `multilingual-v1-de` | normalise (ß/ø/æ/... fold) + ASCII words | no | 0.92 | +0.00 |
-| French | `multilingual-v1-fr` | normalise (shared fold) + ASCII words | no | 0.50 | +0.00 |
-| Chinese | `sag2-zh-v1` | jieba 0.42.1 words (the reference pipeline) | no | 0.75 | +0.00 |
-| English | `sag2-zh-v1` | ASCII words (the reference pipeline) | no | 1.00 | +0.00 |
+| Russian | `multilingual-v1-ru` | normalise, character tokens | 0.00 | +0.10 | deferred |
+| Arabic | `multilingual-v1-ar` | normalise (hamza/alef/tatweel), character tokens | 0.00 | +0.20 | deferred |
+| Hindi | `multilingual-v1-hi` | character tokens | 0.00 | +0.00 | deferred |
+| Greek | `multilingual-v1-el` | normalise (strip tonos/dialytika), character tokens | 0.00 | +0.20 | deferred |
+| Vietnamese | `multilingual-v1-vi` | normalise (strip tone marks) to ASCII syllables | 0.17 | +0.00 | deferred |
+| Polish | `multilingual-v1-pl` | normalise (Latin fold); remaining diacritics split | 0.58 | +0.00 | deferred |
+| Thai | `multilingual-v1-th` | `newmm` words (nlpo3 + CC0 word list) | 0.92 | +0.00 | measured |
+| Japanese | `multilingual-v1-ja` | `lindera` words (runtime dictionary) | - | - | dictionary required |
+| Korean | `multilingual-v1-ko` | `lindera` words (runtime dictionary) | - | - | dictionary required |
+| German | `multilingual-v1-de` | normalise (ß/ø/æ/... fold) + ASCII words | 0.92 | +0.00 | measured |
+| French | `multilingual-v1-fr` | normalise (shared fold) + ASCII words | 0.50 | +0.00 | measured |
+| Chinese | `sag2-zh-v1` | jieba 0.42.1 words (the reference pipeline) | 0.75 | +0.00 | measured |
+| English | `sag2-zh-v1` | ASCII words (the reference pipeline) | 1.00 | +0.00 | measured |
 
 The numbers are measured by `crates/sag2-core/tests/multilingual.rs` on the
 self-authored fixture in `crates/sag2-core/tests/data/multilingual.jsonl`
-(ten documents and ten labelled queries per language).  `word rate` is the
-share of the pack's content words that come out as exactly one token; the
-`Sag2ZhV1` baseline of every pack is pinned in the fixture as well, so the
-default path cannot move unnoticed.  `Phrase3 R@10 gain` is
-`recall@10(Phrase3) - recall@10(Lexical)` on the same pack.  Rows marked `*`
-are the **dictionary-free** fallback: CI has no ipadic/ko-dic, so those two
-packs are indexed through the reference pipeline there (character-level for
-Korean, the jieba stream for Japanese) and only the "not worse" assertion
-applies.
+(thirteen packs, ten documents and ten labelled queries each).  `word rate` is
+the share of the pack's content words that come out as exactly one token.
+
+The `state` column is what the fixture asserts:
+
+* **measured** - the profile has a word-level pipeline, so the word rate has a
+  pinned target and the `Sag2ZhV1` rate is pinned as the baseline; a change on
+  either side fails the test.
+* **deferred** - the profile still tokenises per character and the segmenter or
+  stemmer is plan §5 batch 2 (Snowball for ru/pl/el, an Arabic stemmer, Indic
+  word boundaries for hi, Vietnamese word boundaries).  The word rate is
+  reported but **not** asserted, because a target would only restate the gap.
+* **dictionary required** - `ja`/`ko` cannot tokenise without a runtime
+  dictionary and CI has none, so there is nothing to measure offline.  Those
+  profiles now return `AnalysisError::DictionaryMissing` instead of a
+  character-level stream, which is asserted for every content word.
+
+`Phrase3 R@10 gain` is `recall@10(Phrase3) - recall@10(Lexical)` on the same
+pack; it never trails Lexical in any pack.
 
 What the table says, plainly: Thai, German, French, Chinese and English produce
 words (0.50-1.00); Vietnamese's normalisation turns its syllables into ASCII
-tokens, which is why it moves off the reference baseline (0.00 -> 0.17); and
-Russian, Arabic, Hindi, Greek and Korean still tokenise per character (0.00).
-For those five the *recall* gain comes from the query side - `Phrase3` keeps
-the characters adjacent instead of OR-ing them - and a word segmenter for them
-is still the plan's open batch (§5: stemming and segmentation for ru/ar/hi/el).  The "≥ 10 pts" figures in the plan's §1 are the
-PUD-scale measurements of the Python prototype; this fixture cannot reproduce
-corpus-scale ranking effects on ten documents, and the pinned gains above are
-what the port currently demonstrates on its own data.
+tokens (0.00 -> 0.17) and Polish's Latin fold helps some of its words (0.50 ->
+0.58) without giving it word boundaries; and Russian, Arabic, Hindi, Greek and
+Korean still tokenise per character.  For those the *recall* gain comes from
+the query side - `Phrase3` keeps the characters adjacent instead of OR-ing
+them.  The "≥ 10 pts" figures in the plan's §1 are the PUD-scale measurements
+of the Python prototype; this fixture cannot reproduce corpus-scale ranking
+effects on ten documents, and the pinned gains above are what the port
+currently demonstrates on its own data.
 
 ## Query modes
 

@@ -62,7 +62,7 @@ fn queries_use_the_index_profile_pipeline() {
     for mode in [QueryMode::Lexical, QueryMode::Phrase3] {
         assert_eq!(
             index.match_query_with(mode, QUERY).expect("expression"),
-            match_query_with(mode, GERMAN, QUERY),
+            match_query_with(mode, GERMAN, QUERY).expect("expression"),
             "{mode:?}"
         );
     }

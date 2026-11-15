@@ -59,20 +59,28 @@ pub fn quote_term(term: &str) -> String {
 /// `match_query`: the de-duplicated `OR` of quoted tokens (`sag2.py:69-89`),
 /// tokenised by the reference [`Profile::Sag2ZhV1`] pipeline.
 pub fn match_query(query: &str) -> String {
+    // The reference profile is dictionary-free by construction: `tokenize`
+    // never consults a dictionary, so this cannot fail.
     match_query_with(QueryMode::Lexical, Profile::Sag2ZhV1, query)
+        .expect("the reference profile never needs a dictionary")
 }
 
 /// The expression for `query` built by `mode` and tokenised by `profile`
 /// without a dictionary.
 ///
 /// This is the convenience wrapper: it is byte-identical to
-/// [`match_query_with_segmenter`] with `dictionary = None` and never fails.
-/// A Japanese or Korean index passes its resolved
-/// [`DictionaryAnalysis`] to [`match_query_with_segmenter`] instead, so the
-/// query stream and the stored stream come from the same dictionary.
-pub fn match_query_with(mode: QueryMode, profile: Profile, query: &str) -> String {
+/// [`match_query_with_segmenter`] with `dictionary = None`.  A Japanese or
+/// Korean profile has no dictionary-free pipeline, so it returns
+/// [`AnalysisError::DictionaryMissing`] rather than a character-level
+/// expression; an index passes its resolved [`DictionaryAnalysis`] to
+/// [`match_query_with_segmenter`] instead, so the query stream and the stored
+/// stream come from the same dictionary.
+pub fn match_query_with(
+    mode: QueryMode,
+    profile: Profile,
+    query: &str,
+) -> Result<String, AnalysisError> {
     match_query_with_segmenter(mode, profile, None, query)
-        .expect("a dictionary-free pipeline cannot fail")
 }
 
 /// [`match_query_with`] with the dictionary an index was opened with.
@@ -212,6 +220,13 @@ fn push_phrase(phrases: &mut Vec<String>, seen: &mut HashSet<String>, tokens: &[
 #[cfg(test)]
 mod tests {
     use super::{match_query, match_query_with, quote_term, QueryMode};
+
+    /// [`match_query_with`] for a profile that never needs a dictionary; a
+    /// typed error would be a test failure here.
+    fn expression(mode: QueryMode, profile: crate::Profile, query: &str) -> String {
+        match_query_with(mode, profile, query).expect("a dictionary-free profile always tokenizes")
+    }
+
     use crate::Profile;
 
     #[test]
@@ -234,13 +249,13 @@ mod tests {
     #[test]
     fn lexical_mode_is_the_pinned_match_query() {
         // The strings this module already pinned must come through
-        // `match_query_with(Lexical, ..)` byte for byte.
+        // `expression(Lexical, ..)` byte for byte.
         assert_eq!(
-            match_query_with(QueryMode::Lexical, Profile::Sag2ZhV1, "Anchor anchor"),
+            expression(QueryMode::Lexical, Profile::Sag2ZhV1, "Anchor anchor"),
             match_query("Anchor anchor")
         );
         assert_eq!(
-            match_query_with(
+            expression(
                 QueryMode::Lexical,
                 Profile::Sag2ZhV1,
                 "Where was Alston born?"
@@ -254,11 +269,11 @@ mod tests {
         // One-token chunks are quoted terms; the unigram fallback repeats
         // nothing already emitted.
         assert_eq!(
-            match_query_with(QueryMode::Phrase3, Profile::Sag2ZhV1, "Anchor anchor"),
+            expression(QueryMode::Phrase3, Profile::Sag2ZhV1, "Anchor anchor"),
             "\"anchor\""
         );
         assert_eq!(
-            match_query_with(
+            expression(
                 QueryMode::Phrase3,
                 Profile::Sag2ZhV1,
                 "Where was Alston born?"
@@ -266,7 +281,7 @@ mod tests {
             "\"alston\" OR \"born\""
         );
         assert_eq!(
-            match_query_with(
+            expression(
                 QueryMode::Phrase3,
                 Profile::Sag2ZhV1,
                 "anchor birthplace depicts"
@@ -280,7 +295,7 @@ mod tests {
         // No whitespace: three-token windows over the whole stream and then
         // the unigrams; the seven-token stream is too long to be one phrase.
         assert_eq!(
-            match_query_with(
+            expression(
                 QueryMode::Phrase3,
                 Profile::Sag2ZhV1,
                 "中华人民共和国成立了"
@@ -293,7 +308,7 @@ mod tests {
             )
         );
         assert_eq!(
-            match_query_with(QueryMode::Phrase3, Profile::Sag2ZhV1, "北京大学在哪里"),
+            expression(QueryMode::Phrase3, Profile::Sag2ZhV1, "北京大学在哪里"),
             concat!(
                 "\"北京 大学 北京大学\" OR \"大学 北京大学 哪里\" OR ",
                 "\"北京\" OR \"大学\" OR \"北京大学\" OR \"哪里\""
@@ -306,7 +321,7 @@ mod tests {
         // Each tokenised word is a run of single characters, so the whole
         // chunk phrase and its windows carry the word order the unigrams lose.
         assert_eq!(
-            match_query_with(
+            expression(
                 QueryMode::Phrase3,
                 Profile::Sag2ZhV1,
                 "кто родился в Москве"
@@ -320,7 +335,7 @@ mod tests {
             )
         );
         assert_eq!(
-            match_query_with(
+            expression(
                 QueryMode::Phrase3,
                 Profile::Sag2ZhV1,
                 "памятник Александру Пушкину"
@@ -343,7 +358,7 @@ mod tests {
         // Thai has no whitespace: every window is a phrase over characters the
         // tokenizer surfaces one by one.
         assert_eq!(
-            match_query_with(
+            expression(
                 QueryMode::Phrase3,
                 Profile::Sag2ZhV1,
                 "กรุงเทพมหานครเป็นเมืองหลวง"
@@ -381,7 +396,7 @@ mod tests {
             .map(|chunk| chunk.iter().collect())
             .collect();
         let query = chunks.join(" ");
-        let expression = match_query_with(QueryMode::Phrase3, Profile::Sag2ZhV1, &query);
+        let expression = expression(QueryMode::Phrase3, Profile::Sag2ZhV1, &query);
         let terms: Vec<&str> = expression.split(" OR ").collect();
         let phrase = |chunk: &str| {
             quote_term(

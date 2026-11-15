@@ -10,6 +10,12 @@
 
 use sag2_core::{tokenize, tokenize_with, Language, Profile};
 
+/// [`tokenize_with`] for a profile that never needs a dictionary; the tests
+/// below all use one, so the typed error is a test failure here.
+fn tokens(profile: Profile, text: &str) -> Vec<String> {
+    tokenize_with(profile, text).expect("a dictionary-free profile always tokenises")
+}
+
 /// `multilingual-v1-th`.
 fn thai() -> Profile {
     Profile::Multilingual {
@@ -182,7 +188,7 @@ const DEFAULT: [(&str, &[&str]); 19] = [
 #[test]
 fn thai_words_are_pinned() {
     for (text, expected) in THAI {
-        assert_eq!(tokenize_with(thai(), text), expected, "{text:?}");
+        assert_eq!(tokens(thai(), text), expected, "{text:?}");
     }
 }
 
@@ -190,7 +196,7 @@ fn thai_words_are_pinned() {
 fn the_default_profile_is_unchanged_for_those_inputs() {
     for (text, expected) in DEFAULT {
         assert_eq!(tokenize(text), expected, "{text:?}");
-        assert_eq!(tokenize_with(Profile::Sag2ZhV1, text), expected, "{text:?}");
+        assert_eq!(tokens(Profile::Sag2ZhV1, text), expected, "{text:?}");
     }
 }
 
@@ -200,7 +206,7 @@ fn mixed_thai_latin_and_digits_keep_the_ascii_model() {
     // and digit stretches then take the certified ASCII cut, which splits
     // `29,900` at the non-alphanumeric byte exactly as the reference does.
     assert_eq!(
-        tokenize_with(thai(), "ราคา iPhone 15 Pro คือ 29,900 บาท"),
+        tokens(thai(), "ราคา iPhone 15 Pro คือ 29,900 บาท"),
         [
             "ราคา",
             "iphone",
@@ -218,12 +224,9 @@ fn mixed_thai_latin_and_digits_keep_the_ascii_model() {
 fn the_reference_filters_apply_to_thai_tokens() {
     // `the` and `is` are reference stopwords and `.` has no content: the final
     // filter is the one every profile shares.
-    assert_eq!(tokenize_with(thai(), "the ราคา is ราคา."), ["ราคา", "ราคา"]);
+    assert_eq!(tokens(thai(), "the ราคา is ราคา."), ["ราคา", "ราคา"]);
     // Whitespace between Thai words is dropped, not tokenized.
-    assert_eq!(
-        tokenize_with(thai(), " \tห้องสมุด\n"),
-        ["ห\u{e49}องสม\u{e38}ด"]
-    );
+    assert_eq!(tokens(thai(), " \tห้องสมุด\n"), ["ห\u{e49}องสม\u{e38}ด"]);
 }
 
 /// The content words of a five-sentence sample, by hand: `(sentence, words)`.
@@ -256,7 +259,7 @@ fn content_words_are_whole_tokens() {
     let mut matched = 0;
     let mut total = 0;
     for (text, words) in CONTENT_WORDS {
-        let tokens = tokenize_with(thai(), text);
+        let tokens = tokens(thai(), text);
         assert_eq!(tokens.concat(), text, "no code point is dropped: {text:?}");
         for word in words {
             total += 1;

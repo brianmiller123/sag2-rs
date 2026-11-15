@@ -19,11 +19,13 @@
 //! key predates profiles and is the reference pipeline.
 //!
 //! The dictionary a Japanese or Korean profile segments with is provenance too:
-//! `rust_index_metadata.analysis_dict` records `"none"` or the dictionary
-//! fingerprint, and opening the index with another dictionary is an
-//! [`OpenError::IncompatibleIndex`] whatever the rebuild policy says.  A profile
-//! that needs a dictionary and gets none is [`OpenError::Analysis`] wrapping
-//! [`AnalysisError::DictionaryMissing`].
+//! `rust_index_metadata.analysis_dict` records the fingerprint of the directory
+//! the build loaded, and opening the index with another dictionary is an
+//! [`OpenError::IncompatibleIndex`] whatever the rebuild policy says.  A
+//! dictionary-free build writes no such row (an absent row reads as
+//! [`ANALYSIS_DICT_NONE`]), so a default index keeps exactly the ten design
+//! §3.3 keys.  A profile that needs a dictionary and gets none is
+//! [`OpenError::Analysis`] wrapping [`AnalysisError::DictionaryMissing`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -57,9 +59,10 @@ pub const ANALYSIS_DICT_KEY: &str = "analysis_dict";
 /// The [`ANALYSIS_DICT_KEY`] value of a dictionary-free profile.
 ///
 /// It is deliberately not a hash, so it can never collide with a
-/// [`DictionaryAnalysis::fingerprint`] (64 lowercase hex digits).  An index
-/// without the key predates this provenance and reads as `"none"`, which is
-/// what every index built before the dictionary profiles was.
+/// [`DictionaryAnalysis::fingerprint`] (64 lowercase hex digits).  No build
+/// writes it - an absent row *is* this value, which keeps a default index at the
+/// ten design §3.3 keys - but a hand-edited row equal to it still reads as a
+/// dictionary-free provenance.
 pub const ANALYSIS_DICT_NONE: &str = "none";
 
 /// Design §3.3 example: every feature that changes the token stream is in the
