@@ -30,6 +30,7 @@ pub fn normalize(language: Language, text: &str) -> String {
 /// |---|---|
 /// | every language | `ß→ss æ→ae œ→oe ø→o ł→l đ→d ð→d þ→th ı→i ſ→s` (both cases) |
 /// | [`Language::El`], [`Language::Vi`] | `NFD`, drop every combining mark, `NFKC` |
+/// | [`Language::De`] | `ä→ae ö→oe ü→ue` (both cases) |
 /// | [`Language::Ar`] | `أإآٱ→ا`, `ى→ي`, `ؤ→و`, `ئ→ي`; delete `U+0640` and `U+064B–U+0652`; `ة` is kept |
 /// | other languages | no further rule |
 ///
@@ -40,6 +41,7 @@ pub fn fold_script(language: Language, text: &str) -> String {
     let folded = fold_latin(text);
     match language {
         Language::El | Language::Vi => nfkc(&strip_marks(&nfd(&folded))),
+        Language::De => fold_german(&folded),
         Language::Ar => fold_arabic(&folded),
         _ => folded,
     }
@@ -61,6 +63,27 @@ fn fold_latin(text: &str) -> String {
             'þ' | 'Þ' => folded.push_str("th"),
             'ı' => folded.push('i'),
             'ſ' => folded.push('s'),
+            other => folded.push(other),
+        }
+    }
+    folded
+}
+
+/// The German umlaut expansion (DIN 5007-2 style), including the uppercase
+/// spellings: `Müller` and the transliteration `Mueller` reach one term.
+///
+/// This is not a diacritic strip.  FTS5 `unicode61` already removes the umlaut
+/// (`müller` indexes as `muller`), but it cannot bridge `muller` and `mueller`;
+/// the transliteration is the spelling a German user types on an ASCII
+/// keyboard, so the fold has to produce it.  `ß→ss` is the shared Latin fold's
+/// rule and runs first.
+fn fold_german(text: &str) -> String {
+    let mut folded = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            'ä' | 'Ä' => folded.push_str("ae"),
+            'ö' | 'Ö' => folded.push_str("oe"),
+            'ü' | 'Ü' => folded.push_str("ue"),
             other => folded.push(other),
         }
     }

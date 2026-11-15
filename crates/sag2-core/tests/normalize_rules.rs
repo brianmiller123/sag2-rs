@@ -15,8 +15,9 @@ fn tokens(profile: Profile, text: &str) -> Vec<String> {
     tokenize_with(profile, text).expect("a dictionary-free profile always tokenises")
 }
 
-/// German exercises the shared Latin fold in both cases plus NFKC.
-const GERMAN: [(&str, &str); 22] = [
+/// German exercises the shared Latin fold in both cases plus NFKC, and the
+/// DIN 5007-2 umlaut expansion that makes `Müller` and `Mueller` one term.
+const GERMAN: [(&str, &str); 30] = [
     ("Straße", "strasse"),
     ("STRASSE", "strasse"),
     ("ẞ", "ss"),
@@ -32,7 +33,15 @@ const GERMAN: [(&str, &str); 22] = [
     ("Þingvellir", "thingvellir"),
     ("ıi", "ii"),
     ("ſ", "s"),
-    ("Müller", "müller"),
+    ("Müller", "mueller"),
+    ("MÜLLER", "mueller"),
+    ("Mueller", "mueller"),
+    ("für", "fuer"),
+    ("über", "ueber"),
+    ("Öl", "oel"),
+    ("Ärger", "aerger"),
+    ("Grüße", "gruesse"),
+    ("Fußgänger", "fussgaenger"),
     ("GROSS", "gross"),
     ("Café", "café"),
     ("L'œuvre", "l'oeuvre"),
@@ -160,6 +169,77 @@ fn assert_table(language: Language, table: &[(&str, &str)]) {
 #[test]
 fn german_folds_the_shared_latin_letters() {
     assert_table(Language::De, &GERMAN);
+}
+
+#[test]
+fn german_expands_the_umlauts() {
+    // The realistic German ASCII spelling is transliteration, not deaccenting:
+    // `Mueller` must reach `Müller`.  FTS5 `unicode61` removes diacritics
+    // (`müller` indexes as `muller`) but cannot bridge `muller` and `mueller`,
+    // so this is the fold the German profile needs.
+    for (input, expected) in [
+        ("Müller", "mueller"),
+        ("MÜLLER", "mueller"),
+        ("mueller", "mueller"),
+        ("für", "fuer"),
+        ("Straße", "strasse"),
+        ("Strasse", "strasse"),
+    ] {
+        assert_eq!(normalize(Language::De, input), expected, "{input:?}");
+    }
+    // The umlaut expansion is the only German rule; French-style stripping is
+    // not part of it, and the shared Latin fold still runs first.
+    assert_eq!(fold_script(Language::De, "Müller"), "Mueller");
+    assert_eq!(fold_script(Language::De, "Café"), "Café");
+}
+
+#[test]
+fn german_typing_without_the_umlaut_reaches_the_same_token_stream() {
+    let german = Profile::Multilingual {
+        language: Language::De,
+    };
+    for (accented, transliterated) in [
+        ("Müller", "Mueller"),
+        ("für", "fuer"),
+        ("Straße", "Strasse"),
+        ("Fußgänger", "Fussgaenger"),
+    ] {
+        assert_eq!(
+            tokens(german, accented),
+            tokens(german, transliterated),
+            "{accented:?}"
+        );
+    }
+}
+
+#[test]
+fn the_german_fold_is_idempotent() {
+    for text in [
+        "Müller",
+        "MÜLLER",
+        "mueller",
+        "Straße",
+        "für",
+        "Fußgänger",
+        "schön",
+    ] {
+        let once = normalize(Language::De, text);
+        assert_eq!(normalize(Language::De, &once), once, "{text:?}");
+    }
+}
+
+#[test]
+fn the_default_profile_still_shreds_the_accented_words() {
+    // `Sag2ZhV1` never enters `normalize`: the German fold is a multilingual
+    // profile rule, so the certified tokens for these words do not move.
+    assert_eq!(
+        tokenize("Müller bibliothèque"),
+        ["m", "ü", "ller", "biblioth", "è", "que"]
+    );
+    assert_eq!(
+        tokens(Profile::Sag2ZhV1, "Müller bibliothèque"),
+        tokenize("Müller bibliothèque")
+    );
 }
 
 #[test]

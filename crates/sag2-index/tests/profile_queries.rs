@@ -35,11 +35,18 @@ fn corpus() -> [Document<'static>; 2] {
 }
 
 fn build(profile: Profile) -> (tempfile::TempDir, CorpusIndex) {
+    build_documents(profile, &corpus())
+}
+
+fn build_documents(
+    profile: Profile,
+    documents: &[Document<'static>],
+) -> (tempfile::TempDir, CorpusIndex) {
     let directory = tempfile::tempdir().expect("temp dir");
     let path = directory.path().join("index.sqlite");
     let (index, _) = CorpusIndex::open(
         &path,
-        &corpus(),
+        documents,
         "fixture",
         IndexOptions {
             chunk_chars: 2200,
@@ -158,4 +165,83 @@ fn expansion_terms_follow_the_index_profile() {
             .expansion_terms(QUERY, &seeds, 10)
             .expect("reference expansion")
     );
+}
+
+/// The L1 win the French profile relies on instead of a fold.
+///
+/// The multilingual word run stores the whole word next to its code points
+/// (`b i b l i o t h è q u e bibliothèque`), and FTS5 `unicode61` removes
+/// diacritics by default, so the body token `bibliothèque` is also indexed as
+/// `bibliotheque`.  A query typed without accents therefore reaches it.  This
+/// is why French has no fold: stripping the marks would only merge homographs
+/// (`cote`/`côté`/`côte`) for recall that L1 already banked.
+#[test]
+fn a_word_token_is_what_makes_the_diacritic_free_query_match() {
+    const FRENCH: Profile = Profile::Multilingual {
+        language: Language::Fr,
+    };
+    let documents = [
+        Document {
+            title: "Bibliothèque",
+            text: "La bibliothèque est ouverte ce matin.",
+            path: None,
+            idx: None,
+        },
+        Document {
+            title: "Port",
+            text: "Le port ouvre tôt le matin.",
+            path: None,
+            idx: None,
+        },
+    ];
+    let (_directory, index) = build_documents(FRENCH, &documents);
+
+    for query in ["bibliotheque", "bibliothèque"] {
+        let expression = index
+            .match_query_with(QueryMode::Lexical, query)
+            .expect("expression");
+        let hits = index
+            .retrieve(&expression, &Default::default(), 10, None)
+            .expect("retrieve");
+        assert!(
+            hits.iter().any(|hit| hit.title == "Bibliothèque"),
+            "{query:?} must reach the accented document through {expression:?}"
+        );
+    }
+}
+
+/// The German fold's reason to exist: the realistic ASCII spelling of `Müller`
+/// is the transliteration `mueller`, and FTS5 `unicode61` removes the umlaut
+/// (`müller` indexes as `muller`) but cannot bridge `muller` to `mueller`.
+#[test]
+fn the_german_fold_makes_the_transliterated_query_match() {
+    let documents = [
+        Document {
+            title: "Müller",
+            text: "Müller arbeitet am Bahnhof.",
+            path: None,
+            idx: None,
+        },
+        Document {
+            title: "Hafen",
+            text: "Der Hafen öffnet früh am Morgen.",
+            path: None,
+            idx: None,
+        },
+    ];
+    let (_directory, index) = build_documents(GERMAN, &documents);
+
+    for query in ["Müller", "mueller", "MUELLER"] {
+        let expression = index
+            .match_query_with(QueryMode::Lexical, query)
+            .expect("expression");
+        assert_eq!(expression, "\"mueller\"", "{query:?}");
+        let hits = index
+            .retrieve(&expression, &Default::default(), 10, None)
+            .expect("retrieve");
+        assert!(
+            hits.iter().any(|hit| hit.title == "Müller"),
+            "{query:?} must reach the `Müller` document"
+        );
+    }
 }
