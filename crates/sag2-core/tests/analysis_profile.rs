@@ -239,6 +239,24 @@ fn a_multilingual_profile_leaves_han_runs_to_jieba() {
 }
 
 #[test]
+fn a_mixed_han_and_ascii_run_is_cut_at_the_script_boundary() {
+    // `segment` ends a CJK run where the classifier leaves the CJK range, so
+    // `最多20个` reaches jieba as `最多` and `个` instead of the one mixed block
+    // `emit_block` cuts for the reference pipeline.  The multilingual profile
+    // does not reproduce Python's `finalseg` buffer for the ASCII part, so the
+    // split is the decision: `最多` alone routes as two characters here.  Pin
+    // both sides so the divergence is a decision rather than an accident.
+    let other = Profile::Multilingual {
+        language: Language::Other,
+    };
+    assert_eq!(tokens(other, "最多20个"), ["最", "多", "20", "个"]);
+    // The reference pipeline feeds the mixed block to jieba whole, so `最多`
+    // stays one word there; the multilingual split is the difference the
+    // segment boundary makes.
+    assert_eq!(tokenize("最多20个"), ["最多", "20", "个"]);
+}
+
+#[test]
 fn a_multilingual_profile_ends_a_word_at_the_ascii_interface_characters() {
     // The multilingual classifier is the script-based word set (L1), not the
     // reference's `[._-]` interface set, so a compound keeps only its parts.

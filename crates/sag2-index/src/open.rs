@@ -21,11 +21,19 @@
 //! The dictionary a Japanese profile segments with is provenance too:
 //! `rust_index_metadata.analysis_dict` records the fingerprint of the directory
 //! the build loaded, and opening the index with another dictionary is an
-//! [`OpenError::IncompatibleIndex`] whatever the rebuild policy says.  A
-//! dictionary-free build writes no such row (an absent row reads as
+//! [`OpenError::IncompatibleIndex`] whatever the rebuild policy says.
+//! A dictionary-free build writes no such row (an absent row reads as
 //! [`ANALYSIS_DICT_NONE`]), so a default index keeps exactly the ten design
 //! §3.3 keys.  A profile that needs a dictionary and gets none is
 //! [`OpenError::Analysis`] wrapping [`AnalysisError::DictionaryMissing`].
+//!
+//! The multilingual pipeline is versioned for the same reason.
+//! `rust_index_metadata.analysis_version` records [`MULTILINGUAL_VERSION`] for
+//! every non-default profile: the nine design version keys are identical across
+//! multilingual pipeline revisions, so they cannot tell two token streams
+//! apart.  An absent or different value is a stale index (one from before the
+//! key existed is stale by definition); a rebuild policy replaces it, and a
+//! read-only open reports [`OpenError::AnalysisVersion`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -55,6 +63,21 @@ pub const ANALYSIS_KEY: &str = "analysis";
 
 /// The `rust_index_metadata` key that records the dictionary provenance.
 pub const ANALYSIS_DICT_KEY: &str = "analysis_dict";
+
+/// The `rust_index_metadata` key that records the multilingual pipeline
+/// revision a non-default profile's tokens came from.
+pub const ANALYSIS_VERSION_KEY: &str = "analysis_version";
+
+/// The multilingual pipeline revision this build writes.
+///
+/// One constant for every `multilingual-v1-<lang>` profile: the value names the
+/// pipeline (normaliser, word policy, language folds), not the language, so a
+/// profile id keeps naming exactly one token stream.  Bump it whenever the
+/// multilingual tokenizer or normaliser changes; an index recorded under another
+/// value (or without the key, which every pre-batch index is) is stale by
+/// definition and is rebuilt, never read with a tokenizer that did not produce
+/// its tokens.  The reference profile records no such row.
+pub const MULTILINGUAL_VERSION: &str = "ml-1";
 
 /// The [`ANALYSIS_DICT_KEY`] value of a dictionary-free profile.
 ///
@@ -210,6 +233,9 @@ pub enum RebuildReason {
     },
     /// The file has index tables but no usable provenance row.
     CompiledIn,
+    /// The index records another multilingual pipeline revision, or none: its
+    /// tokens came from a tokenizer this build no longer has.
+    AnalysisVersionChanged,
 }
 
 /// The observable outcome of [`open`].
@@ -268,6 +294,19 @@ pub enum OpenError {
         index: String,
         /// The value this build certifies.
         runtime: String,
+    },
+    /// A multilingual index does not record the pipeline revision that produced
+    /// its tokens, or records another one.
+    ///
+    /// The nine design version keys are identical across pipeline revisions, so
+    /// they cannot tell two token streams apart.  An index from before the key
+    /// existed is stale by definition; under a rebuild policy it is rebuilt,
+    /// and a read-only open reports this error.
+    AnalysisVersion {
+        /// The recorded revision; `None` when the key is absent.
+        index: Option<String>,
+        /// The revision this build writes.
+        runtime: &'static str,
     },
     /// `rust_index_metadata.analysis` names another analysis profile; never
     /// rebuilt, because rebuilding under the requested profile would hide the
@@ -344,6 +383,18 @@ impl std::fmt::Display for OpenError {
                 formatter,
                 "index {field} {index} is incompatible with runtime {runtime}"
             ),
+            OpenError::AnalysisVersion { index, runtime } => match index {
+                Some(found) => write!(
+                    formatter,
+                    "index analysis_version {found} is incompatible with runtime {runtime}"
+                ),
+                None => write!(
+                    formatter,
+                    "index has no analysis_version: a multilingual index built before \
+                     the pipeline was versioned is stale by definition (this build \
+                     writes {runtime}); rebuild it"
+                ),
+            },
             OpenError::AnalysisMismatch { index, expected } => match index {
                 Some(found) if found == REMOVED_MULTILINGUAL_V1 => write!(
                     formatter,
@@ -447,7 +498,11 @@ pub enum Decision {
 /// `profile` is the analysis profile the caller reads with.  An index built
 /// under another profile is rejected under every [`RebuildPolicy`] - before the
 /// signature is even considered - because a rebuild would silently replace the
-/// token stream the file was built for.
+/// token stream the file was built for.  A multilingual profile additionally
+/// requires the recorded [`ANALYSIS_VERSION_KEY`] to name this build's
+/// [`MULTILINGUAL_VERSION`]; a stale or unrecorded pipeline revision is a
+/// rebuild under [`RebuildPolicy::OnCorpusChange`] and
+/// [`RebuildPolicy::Always`], and a rejection under [`RebuildPolicy::Strict`].
 ///
 /// This is the dictionary-free form: a profile that does not segment with a
 /// dictionary has no fingerprint, so [`decide_with_dictionary`] is the entry
@@ -504,6 +559,17 @@ pub fn decide_with_dictionary(
     if let Err(error) = check_analysis(analysis, profile) {
         return Decision::Reject(error);
     }
+    // A multilingual index must record the pipeline that produced its tokens.
+    // An index from before the key existed, or under another revision, is stale
+    // by definition: a rebuild policy replaces it, `Strict` reports why.
+    if let Err(error) = check_analysis_version(existing.rust_metadata.as_ref(), profile) {
+        return match policy {
+            RebuildPolicy::Strict => Decision::Reject(error),
+            RebuildPolicy::OnCorpusChange | RebuildPolicy::Always => {
+                Decision::Rebuild(RebuildReason::AnalysisVersionChanged)
+            }
+        };
+    }
     if let Err(error) = check_dictionary(existing.rust_metadata.as_ref(), dictionary) {
         return Decision::Reject(error);
     }
@@ -550,6 +616,36 @@ fn check_analysis(stored: Option<&str>, profile: Profile) -> Result<(), OpenErro
         None => Err(OpenError::AnalysisMismatch {
             index: None,
             expected: profile,
+        }),
+    }
+}
+
+/// Require the recorded multilingual pipeline revision.
+///
+/// The reference profile records no `analysis_version` row and is unaffected:
+/// its token stream is the one the nine design version keys already certify.
+/// A multilingual profile must record the revision that produced its tokens,
+/// because those same nine keys are identical across pipeline revisions and
+/// cannot tell one stream from another.  An absent row belongs to an index from
+/// before the pipeline was versioned, which is stale by definition.
+fn check_analysis_version(
+    metadata: Option<&BTreeMap<String, String>>,
+    profile: Profile,
+) -> Result<(), OpenError> {
+    if profile == Profile::Sag2ZhV1 {
+        return Ok(());
+    }
+    let stored =
+        metadata.and_then(|metadata| metadata.get(ANALYSIS_VERSION_KEY).map(String::as_str));
+    match stored {
+        Some(value) if value == MULTILINGUAL_VERSION => Ok(()),
+        Some(value) => Err(OpenError::AnalysisVersion {
+            index: Some(value.to_owned()),
+            runtime: MULTILINGUAL_VERSION,
+        }),
+        None => Err(OpenError::AnalysisVersion {
+            index: None,
+            runtime: MULTILINGUAL_VERSION,
         }),
     }
 }
@@ -632,6 +728,7 @@ fn check_versions(
         });
     }
     check_analysis(metadata.get("analysis").map(String::as_str), profile)?;
+    check_analysis_version(Some(metadata), profile)?;
     check_dictionary(Some(metadata), dictionary)
 }
 
@@ -942,8 +1039,8 @@ mod tests {
 
     use super::{
         decide, decide_with_dictionary, Decision, ExistingIndex, Language, OpenError, Profile,
-        RebuildPolicy, RebuildReason, RuntimeVersions, FORMAT_VERSION, REMOVED_MULTILINGUAL_V1,
-        RUNTIME_VERSIONS,
+        RebuildPolicy, RebuildReason, RuntimeVersions, ANALYSIS_VERSION_KEY, FORMAT_VERSION,
+        MULTILINGUAL_VERSION, REMOVED_MULTILINGUAL_V1, RUNTIME_VERSIONS,
     };
 
     const MULTILINGUAL: Profile = Profile::Multilingual {
@@ -1010,6 +1107,18 @@ mod tests {
             ("sag_rank_sha256", "rank-1"),
             ("sag2_rs_version", "0.1.0"),
         ])
+    }
+
+    /// The metadata of a current multilingual index: the ten design keys plus
+    /// `analysis` and `analysis_version`.
+    fn multilingual_metadata() -> BTreeMap<String, String> {
+        let mut metadata = current_metadata();
+        metadata.insert("analysis".to_owned(), MULTILINGUAL.as_str().to_owned());
+        metadata.insert(
+            ANALYSIS_VERSION_KEY.to_owned(),
+            MULTILINGUAL_VERSION.to_owned(),
+        );
+        metadata
     }
 
     fn rejection(decision: Decision) -> OpenError {
@@ -1286,9 +1395,7 @@ mod tests {
 
     #[test]
     fn a_multilingual_index_is_reused_only_under_its_own_profile() {
-        let mut metadata = current_metadata();
-        metadata.insert("analysis".to_owned(), "multilingual-v1-ja".to_owned());
-        let rust = existing(Some(EXPECTED), Some(metadata));
+        let rust = existing(Some(EXPECTED), Some(multilingual_metadata()));
         is_reuse(decide(
             RebuildPolicy::Strict,
             &rust,
@@ -1305,6 +1412,99 @@ mod tests {
                 Profile::Sag2ZhV1
             )),
             OpenError::AnalysisMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn a_multilingual_index_without_a_pipeline_version_is_stale() {
+        // Every index built before the multilingual pipeline was versioned
+        // records `analysis` but no `analysis_version`; its tokens came from a
+        // tokenizer this build no longer has.
+        let mut metadata = current_metadata();
+        metadata.insert("analysis".to_owned(), MULTILINGUAL.as_str().to_owned());
+        let rust = existing(Some(EXPECTED), Some(metadata));
+
+        let error = rejection(decide(
+            RebuildPolicy::Strict,
+            &rust,
+            EXPECTED,
+            &RUNTIME,
+            MULTILINGUAL,
+        ));
+        match &error {
+            OpenError::AnalysisVersion { index, runtime } => {
+                assert_eq!(*index, None);
+                assert_eq!(*runtime, MULTILINGUAL_VERSION);
+            }
+            other => panic!("unexpected {other}"),
+        }
+        let message = error.to_string();
+        assert!(message.contains("stale by definition"), "{message}");
+        assert!(message.contains("rebuild it"), "{message}");
+
+        for policy in [RebuildPolicy::OnCorpusChange, RebuildPolicy::Always] {
+            assert_eq!(
+                is_rebuild(decide(policy, &rust, EXPECTED, &RUNTIME, MULTILINGUAL)),
+                Some(RebuildReason::AnalysisVersionChanged),
+                "{policy:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_bumped_multilingual_pipeline_version_is_stale() {
+        // Simulates the next pipeline revision: the recorded value is not this
+        // build's constant.
+        let mut metadata = multilingual_metadata();
+        metadata.insert(ANALYSIS_VERSION_KEY.to_owned(), "ml-0".to_owned());
+        let rust = existing(Some(EXPECTED), Some(metadata));
+
+        match rejection(decide(
+            RebuildPolicy::Strict,
+            &rust,
+            EXPECTED,
+            &RUNTIME,
+            MULTILINGUAL,
+        )) {
+            OpenError::AnalysisVersion { index, runtime } => {
+                assert_eq!(index.as_deref(), Some("ml-0"));
+                assert_eq!(runtime, MULTILINGUAL_VERSION);
+            }
+            other => panic!("unexpected {other}"),
+        }
+        assert_eq!(
+            is_rebuild(decide(
+                RebuildPolicy::OnCorpusChange,
+                &rust,
+                EXPECTED,
+                &RUNTIME,
+                MULTILINGUAL
+            )),
+            Some(RebuildReason::AnalysisVersionChanged)
+        );
+    }
+
+    #[test]
+    fn the_reference_profile_ignores_the_pipeline_version() {
+        // The default key set is the ten design keys exactly: no
+        // `analysis_version` row, and its absence must not stale an index.
+        let rust = existing(Some(EXPECTED), Some(current_metadata()));
+        is_reuse(decide(
+            RebuildPolicy::Strict,
+            &rust,
+            EXPECTED,
+            &RUNTIME,
+            Profile::Sag2ZhV1,
+        ));
+        // A stray row is an unknown key (design §3.2 rule 4), not a stale one.
+        let mut stray = current_metadata();
+        stray.insert(ANALYSIS_VERSION_KEY.to_owned(), "ml-0".to_owned());
+        is_reuse(decide(
+            RebuildPolicy::Strict,
+            &existing(Some(EXPECTED), Some(stray)),
+            EXPECTED,
+            &RUNTIME,
+            Profile::Sag2ZhV1,
         ));
     }
 
@@ -1461,6 +1661,10 @@ mod tests {
             .to_owned(),
         );
         metadata.insert(
+            ANALYSIS_VERSION_KEY.to_owned(),
+            MULTILINGUAL_VERSION.to_owned(),
+        );
+        metadata.insert(
             crate::open::ANALYSIS_DICT_KEY.to_owned(),
             dictionary.to_owned(),
         );
@@ -1547,6 +1751,10 @@ mod tests {
             let mut metadata = current_metadata();
             metadata.insert("analysis".to_owned(), MULTILINGUAL.as_str().to_owned());
             metadata.insert(
+                ANALYSIS_VERSION_KEY.to_owned(),
+                MULTILINGUAL_VERSION.to_owned(),
+            );
+            metadata.insert(
                 crate::open::ANALYSIS_DICT_KEY.to_owned(),
                 crate::open::ANALYSIS_DICT_NONE.to_owned(),
             );
@@ -1584,9 +1792,7 @@ mod tests {
             None,
         ));
         // A dictionary profile cannot read it: the missing row is `none`.
-        let mut ja = current_metadata();
-        ja.insert("analysis".to_owned(), MULTILINGUAL.as_str().to_owned());
-        let ja = existing(Some(EXPECTED), Some(ja));
+        let ja = existing(Some(EXPECTED), Some(multilingual_metadata()));
         assert!(matches!(
             rejection(decide_with_dictionary(
                 RebuildPolicy::Always,

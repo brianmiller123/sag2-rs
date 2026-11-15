@@ -233,6 +233,42 @@ fn german_emits_the_code_points_and_both_ascii_spellings() {
 }
 
 #[test]
+fn the_german_variants_are_canonical_invariant() {
+    // The gate reads `lower(nfkc(text))`, not the raw input, so the NFD
+    // spelling of the word emits the same stream as its NFC form: an ASCII
+    // `muller` query reaches an NFD corpus the same way it reaches an NFC one.
+    let german = Profile::Multilingual {
+        language: Language::De,
+    };
+    assert_eq!(tokens(german, "Mu\u{0308}ller"), tokens(german, "Müller"));
+    assert_eq!(
+        tokens(german, "Mu\u{0308}ller"),
+        ["m", "ü", "l", "l", "e", "r", "mueller", "muller"]
+    );
+    // `lower` turns `ẞ` into `ß`, which is in the gate's set too.
+    assert_eq!(tokens(german, "ẞ"), ["ß", "ss"]);
+}
+
+#[test]
+fn a_non_composing_mark_does_not_desync_the_german_variants() {
+    // `deaccent` deletes combining marks, so a second walk over a deaccented
+    // text could merge two word runs (`x` + U+0308 + `Bäckerei` is two runs
+    // before the strip and one after) and shift every later word's variants.
+    // The spelling is derived from the paired accented run instead, so the
+    // German word after the mark keeps both spellings.
+    let german = Profile::Multilingual {
+        language: Language::De,
+    };
+    let stream = tokens(german, "Müller q\u{0308}Bäckerei");
+    for expected in ["mueller", "muller", "baeckerei", "backerei"] {
+        assert!(
+            stream.iter().any(|token| token == expected),
+            "{expected:?} missing from {stream:?}"
+        );
+    }
+}
+
+#[test]
 fn only_german_gets_the_second_ascii_spelling() {
     // The extra spelling is a German rule, read from the pre-fold text: the
     // same text under another language keeps its L1 stream.

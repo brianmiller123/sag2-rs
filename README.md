@@ -138,7 +138,11 @@ The dictionary is provenance, not a hint:
   digests, path-independent); opening the index with another dictionary is
   `OpenError::IncompatibleIndex` and never rebuilds;
 * a missing, unreadable or malformed directory is `AnalysisError::Dictionary`,
-  never a panic.
+  never a panic;
+* `SAG2_DICT_DIR` is ambient state: the CLI reads it only for a profile that
+  segments with a dictionary, so a stale export never fails an unrelated
+  `sag2-zh-v1` build.  An explicit `--dict-dir` is an instruction about the
+  build in hand and still errors on a dictionary-free profile.
 
 The offline end-to-end test loads a real dictionary only when
 `SAG2_DICT_DIR` points at one (it is `#[ignore]`d in CI):
@@ -160,9 +164,12 @@ mark, or a digit - instead of the reference classifier's ASCII + `U+4E00-U+9FD5`
 set; Han text still goes through jieba.  A word run the reference pipeline would
 have shredded emits its code points *and* the whole run, so a word-level index
 does not cost the code-point recall the non-ASCII packs rely on.  The profile
-persists `rust_index_metadata.analysis` (`multilingual-v1-<lang>`) and, only for
-a profile that actually loaded a dictionary, `analysis_dict`, so an index always
-reads back through the pipeline that built it.
+persists `rust_index_metadata.analysis` (`multilingual-v1-<lang>`),
+`analysis_version` (`ml-1`, the multilingual pipeline revision — bumped
+whenever the tokenizer or normaliser changes, so an index from another revision
+is rebuilt rather than read with a tokenizer that did not produce its tokens)
+and, only for a profile that actually loaded a dictionary, `analysis_dict`, so
+an index always reads back through the pipeline that built it.
 
 | language | profile | analysis | word rate | Phrase3 R@10 gain | state |
 |---|---|---|---|---|---|

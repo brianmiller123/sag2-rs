@@ -77,7 +77,7 @@ pub fn run(args: &[String]) -> Result<ExitCode, String> {
     let options = IndexOptions {
         chunk_chars,
         profile,
-        dictionary_dir: options::dictionary_dir(dictionary_dir),
+        dictionary_dir: options::dictionary_dir(profile, dictionary_dir),
         rebuild: RebuildPolicy::OnCorpusChange,
         ..IndexOptions::default()
     };

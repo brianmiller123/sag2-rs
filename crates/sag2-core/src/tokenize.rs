@@ -215,32 +215,38 @@ pub(crate) fn tokenize_multilingual(
     normalised: &str,
     original: &str,
 ) -> Vec<String> {
-    // Both extra German spellings come from the pre-fold text, and the fold's
-    // maps never move a word boundary, so their word runs pair up with
-    // `normalised`'s one for one.  Text without an umlaut needs neither.
-    let (accented_text, deaccented_text) =
-        if language == Language::De && has_german_umlaut(original) {
-            (
-                unicode::lower(&unicode::nfkc(original)),
-                normalize::deaccent(original),
-            )
-        } else {
-            (String::new(), String::new())
-        };
+    // The paired spelling is the pre-fold word run.  That pairing is exact:
+    // `fold_script`'s maps rewrite letters as letters and never create or
+    // delete a boundary, and `normalised` and `accented` are both built from
+    // the same `lower(nfkc(original))`, so they have the same segments.
+    //
+    // The deaccented spelling is derived from each paired run instead of being
+    // read from a re-segmented deaccented text: `strip_marks` deletes combining
+    // marks, which can merge two word runs (`x` + U+0308 + `y` is two runs
+    // before the strip and one after), and a second walk would silently shift
+    // every later word's variants.
+    let accented_text = if language == Language::De {
+        unicode::lower(&unicode::nfkc(original))
+    } else {
+        String::new()
+    };
     let accented = word_runs(&accented_text);
-    let deaccented = word_runs(&deaccented_text);
-    let mut variants = accented.iter().zip(deaccented.iter());
+    let mut variants = accented.iter();
     let mut words: Vec<String> = Vec::new();
     for_each_segment(normalised, |kind, segment| {
         let variant = if kind == Segment::Word {
-            variants
-                .next()
-                .map(|(accented, deaccented)| (*accented, *deaccented))
+            variants.next().copied()
         } else {
             None
         };
         emit_segment(segment, kind, variant, &mut words);
     });
+    // Debug builds (and every test) fail on a desync instead of dropping the
+    // variants of the words after it.
+    debug_assert!(
+        variants.next().is_none(),
+        "the German variants must pair one for one with the word runs"
+    );
     finish(words)
 }
 
@@ -284,6 +290,14 @@ fn word_runs(text: &str) -> Vec<&str> {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Segment {
     /// A CJK run: the jieba path, exactly as in the reference pipeline.
+    ///
+    /// The run ends where the classifier leaves the CJK range, so a mixed
+    /// Han+ASCII run (`最多20个`) reaches jieba as `最多` and `个` instead of the
+    /// one block [`emit_block`] cuts for the reference pipeline.  The
+    /// multilingual pipeline takes its word boundaries from
+    /// [`is_word_character`] and does not reproduce Python's `finalseg` buffer
+    /// for the ASCII part, so splitting at the script boundary is this
+    /// profile's decision, not an accident.
     Cjk,
     /// A maximal run of [`is_word_character`] code points.
     Word,
@@ -302,12 +316,7 @@ fn segment(character: char) -> Segment {
 }
 
 /// Emit one multilingual segment.
-fn emit_segment(
-    segment: &str,
-    kind: Segment,
-    variant: Option<(&str, &str)>,
-    out: &mut Vec<String>,
-) {
+fn emit_segment(segment: &str, kind: Segment, variant: Option<&str>, out: &mut Vec<String>) {
     match kind {
         Segment::Cjk => emit_block(segment, true, out),
         Segment::Word => {
@@ -315,12 +324,13 @@ fn emit_segment(
             // carries the spelling FTS `unicode61` indexes for the umlaut, so
             // both ASCII spellings reach the word.  Order: the pre-fold code
             // points, the transliteration, the deaccented spelling.
-            if let Some((accented, deaccented)) = variant {
+            if let Some(accented) = variant {
                 if has_german_umlaut(accented) {
                     out.extend(accented.chars().map(String::from));
                     out.push(segment.to_owned());
+                    let deaccented = normalize::deaccent(accented);
                     if deaccented != segment {
-                        out.push(deaccented.to_owned());
+                        out.push(deaccented);
                     }
                     return;
                 }
@@ -344,12 +354,15 @@ fn emit_segment(
     }
 }
 
-/// Whether `word` contains a character the German fold expands into two
-/// letters: such a word has a transliteration and a deaccented spelling that
-/// differ, and both have to be emitted.
+/// Whether `word` carries a character the German fold rewrites.
+///
+/// `ä/ö/ü` expand into two letters, so the transliteration and the deaccented
+/// spelling differ and both are emitted.  `ß/ẞ` also trigger the emission, but
+/// the shared Latin fold already maps them to `ss` on both sides, so their two
+/// spellings are the same string and only one token results.
 fn has_german_umlaut(word: &str) -> bool {
     word.chars()
-        .any(|character| matches!(character, 'ä' | 'ö' | 'ü' | 'ß' | 'Ä' | 'Ö' | 'Ü'))
+        .any(|character| matches!(character, 'ä' | 'ö' | 'ü' | 'ß' | 'Ä' | 'Ö' | 'Ü' | 'ẞ'))
 }
 
 /// Rules 3-5 and the final filter, over the words a splitter produced.

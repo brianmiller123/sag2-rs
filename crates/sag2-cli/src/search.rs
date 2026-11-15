@@ -91,12 +91,19 @@ pub fn run(args: &[String]) -> Result<ExitCode, String> {
     let path = path.ok_or_else(|| format!("--index is required\n{USAGE}"))?;
     let query = query.ok_or_else(|| format!("--query is required\n{USAGE}"))?;
 
-    let opened = open_recorded(
-        &path,
-        options::dictionary_dir(dictionary_dir).as_deref(),
-        QueryOptions::default(),
-    )
-    .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
+    // `SAG2_DICT_DIR` is ambient, so the recorded profile decides whether it
+    // is read: a stale export must not fail a search over a dictionary-free
+    // index.  An unreadable index is left to `open_recorded` to report.
+    let recorded = sag2_index::inspect(&path)
+        .ok()
+        .and_then(|existing| sag2_index::recorded_profile(&existing).ok());
+    let dictionary_dir = match recorded {
+        Some(profile) => options::dictionary_dir(profile, dictionary_dir),
+        None => dictionary_dir,
+    };
+
+    let opened = open_recorded(&path, dictionary_dir.as_deref(), QueryOptions::default())
+        .map_err(|error| format!("cannot open {}: {error}", path.display()))?;
 
     println!("index:      {}", path.display());
     println!("profile:    {}", opened.profile());

@@ -22,6 +22,15 @@ fn stdout(output: &Output) -> String {
     String::from_utf8(output.stdout.clone()).expect("stdout is UTF-8")
 }
 
+/// [`run`] with `SAG2_DICT_DIR` set, for the ambient-state cases.
+fn run_with_dictionary_environment(arguments: &[&str], dictionary: &Path) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_sag2-cli"))
+        .args(arguments)
+        .env("SAG2_DICT_DIR", dictionary)
+        .output()
+        .expect("the binary runs")
+}
+
 fn stderr(output: &Output) -> String {
     String::from_utf8(output.stderr.clone()).expect("stderr is UTF-8")
 }
@@ -200,50 +209,88 @@ fn refused_open_exits_three_with_the_typed_error() {
 
 /// A dictionary directory is refused by every profile that does not read one.
 ///
-/// Silently ignoring it is how a Korean build comes to look as though it ran
-/// morphological analysis, so the index boundary and the CLI both report it.
+/// Silently ignoring an explicit `--dict-dir` is how a Korean build comes to
+/// look as though it ran morphological analysis, so the index boundary and the
+/// CLI both report it.
 #[test]
-fn a_dictionary_directory_for_a_dictionary_free_profile_is_refused() {
+fn an_explicit_dictionary_directory_is_refused_by_a_dictionary_free_profile() {
     let directory = tempfile::tempdir().expect("temp dir");
     let corpus = write_corpus(directory.path());
     let dictionary = tempfile::tempdir().expect("dictionary dir");
-    let index = directory.path().join("ko.sqlite");
 
-    let refused = run(&[
-        "build",
-        "--input",
-        &corpus,
-        "--output",
-        index.to_str().expect("index path"),
-        "--profile",
-        "multilingual-v1-ko",
-        "--dict-dir",
-        dictionary.path().to_str().expect("dictionary path"),
-    ]);
-    assert_eq!(refused.status.code(), Some(3), "{}", stderr(&refused));
-    assert!(
-        stderr(&refused).contains("profile multilingual-v1-ko does not use a dictionary"),
-        "{}",
-        stderr(&refused)
-    );
-    assert!(!index.exists(), "a refused build must not write an index");
+    for profile in ["multilingual-v1-ko", "sag2-zh-v1"] {
+        let index = directory.path().join(format!("{profile}.sqlite"));
+        let refused = run(&[
+            "build",
+            "--input",
+            &corpus,
+            "--output",
+            index.to_str().expect("index path"),
+            "--profile",
+            profile,
+            "--dict-dir",
+            dictionary.path().to_str().expect("dictionary path"),
+        ]);
+        assert_eq!(refused.status.code(), Some(3), "{}", stderr(&refused));
+        assert!(
+            stderr(&refused).contains(&format!("profile {profile} does not use a dictionary")),
+            "{}",
+            stderr(&refused)
+        );
+        assert!(!index.exists(), "a refused build must not write an index");
 
-    // The same profile builds without one: Korean is dictionary-free.
-    let built = run(&[
-        "build",
-        "--input",
-        &corpus,
-        "--output",
-        index.to_str().expect("index path"),
-        "--profile",
-        "multilingual-v1-ko",
-    ]);
-    assert_eq!(built.status.code(), Some(0), "{}", stderr(&built));
-    assert!(
-        stdout(&built).contains("profile:     multilingual-v1-ko"),
-        "{}",
-        stdout(&built)
-    );
+        // The same profile builds without one: neither reads a dictionary.
+        let built = run(&[
+            "build",
+            "--input",
+            &corpus,
+            "--output",
+            index.to_str().expect("index path"),
+            "--profile",
+            profile,
+        ]);
+        assert_eq!(built.status.code(), Some(0), "{}", stderr(&built));
+        assert!(
+            stdout(&built).contains(&format!("profile:     {profile}")),
+            "{}",
+            stdout(&built)
+        );
+    }
+}
+
+/// `SAG2_DICT_DIR` is ambient state: it outlives the build that exported it and
+/// must not turn an unrelated dictionary-free build into a failure.
+#[test]
+fn an_ambient_dictionary_directory_is_ignored_by_a_dictionary_free_profile() {
+    let directory = tempfile::tempdir().expect("temp dir");
+    let corpus = write_corpus(directory.path());
+    let dictionary = tempfile::tempdir().expect("dictionary dir");
+
+    for profile in ["multilingual-v1-ko", "sag2-zh-v1"] {
+        let index = directory.path().join(format!("ambient-{profile}.sqlite"));
+        let built = run_with_dictionary_environment(
+            &[
+                "build",
+                "--input",
+                &corpus,
+                "--output",
+                index.to_str().expect("index path"),
+                "--profile",
+                profile,
+            ],
+            dictionary.path(),
+        );
+        assert_eq!(built.status.code(), Some(0), "{}", stderr(&built));
+        assert!(
+            index.exists(),
+            "the ambient variable must not stop the build"
+        );
+        assert!(
+            stdout(&built).contains(&format!("profile:     {profile}")),
+            "{}",
+            stdout(&built)
+        );
+    }
 }
 
 /// The committed `golden/indexes/C0.sqlite` was written by `sag2.py`, which

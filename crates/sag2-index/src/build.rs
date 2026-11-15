@@ -569,12 +569,14 @@ fn load_statistics(
 
 /// The v1 `rust_index_metadata` rows (design §3.3).
 ///
-/// The ten design keys are unconditional.  The multilingual plan's two
-/// provenance keys are written only when they carry information: a
-/// [`Profile::Sag2ZhV1`] index records neither, because an absent `analysis`
-/// row reads back as `sag2-zh-v1` and an absent `analysis_dict` row as `none`
-/// (see [`crate::recorded_profile`]).  That keeps a default index at exactly
-/// the key set Gate D certifies.
+/// The ten design keys are unconditional.  The multilingual plan's provenance
+/// keys are written only when they carry information: a [`Profile::Sag2ZhV1`]
+/// index records none of them (ten rows), because an absent `analysis` row reads
+/// back as `sag2-zh-v1` and an absent `analysis_dict` row as `none` (see
+/// [`crate::recorded_profile`]).  A dictionary-free multilingual profile records
+/// `analysis` and `analysis_version` (eleven rows), and a dictionary-backed one
+/// adds `analysis_dict` (twelve).  That keeps a default index at exactly the key
+/// set Gate D certifies.
 fn write_rust_metadata(
     tx: &Transaction<'_>,
     versions: &RuntimeVersions,
@@ -601,6 +603,10 @@ fn write_rust_metadata(
     ];
     if profile != Profile::Sag2ZhV1 {
         rows.push((crate::open::ANALYSIS_KEY, profile.as_str()));
+        rows.push((
+            crate::open::ANALYSIS_VERSION_KEY,
+            crate::open::MULTILINGUAL_VERSION,
+        ));
         let fingerprint = dictionary.unwrap_or(crate::open::ANALYSIS_DICT_NONE);
         if fingerprint != crate::open::ANALYSIS_DICT_NONE {
             rows.push((crate::open::ANALYSIS_DICT_KEY, fingerprint));
@@ -956,10 +962,10 @@ mod tests {
             .expect("rows")
             .collect::<Result<_, _>>()
             .expect("keys");
-        // The ten design keys plus `analysis`; a dictionary-free profile must
-        // not record `analysis_dict = none`, because an absent row already
-        // reads as `none` (C1).
-        assert_eq!(keys.len(), 11, "{keys:?}");
+        // The ten design keys plus `analysis` and `analysis_version`; a
+        // dictionary-free profile must not record `analysis_dict = none`,
+        // because an absent row already reads as `none` (C1).
+        assert_eq!(keys.len(), 12, "{keys:?}");
         assert!(keys.contains(&"analysis".to_owned()));
         assert!(!keys.contains(&"analysis_dict".to_owned()));
         let analysis: String = db
@@ -970,6 +976,106 @@ mod tests {
             )
             .expect("analysis row");
         assert_eq!(analysis, "multilingual-v1-de");
+        let version: String = db
+            .query_row(
+                "SELECT value FROM rust_index_metadata WHERE key='analysis_version'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("analysis_version row");
+        assert_eq!(version, crate::open::MULTILINGUAL_VERSION);
+    }
+
+    #[test]
+    fn a_multilingual_index_from_another_pipeline_is_rebuilt() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("index.sqlite");
+        let corpus = [Document {
+            title: "Markt",
+            text: "Der Markt öffnet früh am Morgen.",
+            path: None,
+            idx: None,
+        }];
+        let mut options = materialised(2200);
+        options.profile = MULTILINGUAL;
+        CorpusIndex::open(&path, &corpus, "fixture", options.clone()).expect("build");
+
+        // Simulate an index built by another multilingual pipeline revision:
+        // the nine design keys still match, only `analysis_version` moved.
+        let db = Connection::open(&path).expect("open");
+        db.execute(
+            "UPDATE rust_index_metadata SET value='ml-0' WHERE key='analysis_version'",
+            [],
+        )
+        .expect("stale the version row");
+        drop(db);
+
+        options.rebuild = RebuildPolicy::Strict;
+        match CorpusIndex::open(&path, &corpus, "fixture", options.clone())
+            .expect_err("a stale pipeline revision must not be reused")
+        {
+            OpenError::AnalysisVersion { index, runtime } => {
+                assert_eq!(index.as_deref(), Some("ml-0"));
+                assert_eq!(runtime, crate::open::MULTILINGUAL_VERSION);
+            }
+            other => panic!("unexpected {other}"),
+        }
+
+        // A corpus-change rebuild replaces the token stream and records this
+        // build's revision again.
+        options.rebuild = RebuildPolicy::OnCorpusChange;
+        let (_, outcome) = CorpusIndex::open(&path, &corpus, "fixture", options).expect("rebuild");
+        assert_eq!(
+            outcome.rebuilt,
+            Some(crate::open::RebuildReason::AnalysisVersionChanged)
+        );
+        let db = Connection::open(&path).expect("open");
+        let version: String = db
+            .query_row(
+                "SELECT value FROM rust_index_metadata WHERE key='analysis_version'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("analysis_version row");
+        assert_eq!(version, crate::open::MULTILINGUAL_VERSION);
+    }
+
+    #[test]
+    fn a_multilingual_index_without_the_version_row_is_rebuilt() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("index.sqlite");
+        let corpus = [Document {
+            title: "Markt",
+            text: "Der Markt öffnet früh am Morgen.",
+            path: None,
+            idx: None,
+        }];
+        let mut options = materialised(2200);
+        options.profile = MULTILINGUAL;
+        CorpusIndex::open(&path, &corpus, "fixture", options.clone()).expect("build");
+
+        // An index from before the pipeline was versioned records no row.
+        Connection::open(&path)
+            .expect("open")
+            .execute(
+                "DELETE FROM rust_index_metadata WHERE key='analysis_version'",
+                [],
+            )
+            .expect("drop the version row");
+
+        options.rebuild = RebuildPolicy::Strict;
+        match CorpusIndex::open(&path, &corpus, "fixture", options.clone())
+            .expect_err("an unversioned multilingual index is stale")
+        {
+            OpenError::AnalysisVersion { index, .. } => assert_eq!(index, None),
+            other => panic!("unexpected {other}"),
+        }
+        options.rebuild = RebuildPolicy::OnCorpusChange;
+        let (_, outcome) = CorpusIndex::open(&path, &corpus, "fixture", options).expect("rebuild");
+        assert_eq!(
+            outcome.rebuilt,
+            Some(crate::open::RebuildReason::AnalysisVersionChanged)
+        );
     }
 
     #[test]
