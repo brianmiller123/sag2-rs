@@ -48,11 +48,15 @@ impl LinderaSegmenter {
     /// A missing directory, a missing component or a malformed dictionary all
     /// come back as [`AnalysisError::Dictionary`]; nothing aborts the process.
     ///
-    /// The fingerprint is computed here, from the same directory the loader
-    /// reads, so the value an index records always describes the lattice that
-    /// was actually loaded (C7).  `open` is the only place that produces a
-    /// segmenter, so there is no path that records a fingerprint from one scan
-    /// and segments with another.
+    /// The fingerprint is computed in this call, from the same directory
+    /// argument the loader is given, and is the only fingerprint the segmenter
+    /// exposes (C7).  That is not an atomic snapshot: the scan and the load are
+    /// two reads of the directory, so a directory mutated in between could be
+    /// described by a fingerprint of the earlier contents.  A dictionary is a
+    /// deploy-time artifact and is assumed static for the duration of an open;
+    /// `open` only ever needs to guarantee that the recorded value and the
+    /// segmenter come from *one* directory argument, not from two call sites
+    /// that could disagree.
     pub fn open(dir: &Path) -> Result<Self, AnalysisError> {
         if !dir.is_dir() {
             return Err(AnalysisError::dictionary(
@@ -73,7 +77,12 @@ impl LinderaSegmenter {
         })
     }
 
-    /// The fingerprint of the directory this segmenter loaded.
+    /// The fingerprint [`open`](Self::open) computed for the directory it was
+    /// given.
+    ///
+    /// It is the only fingerprint this segmenter publishes, so a caller cannot
+    /// pair the lattice with a fingerprint from somewhere else; see `open` for
+    /// what that does and does not guarantee about a mutating directory.
     pub fn dictionary_fingerprint(&self) -> &str {
         &self.fingerprint
     }

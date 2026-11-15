@@ -22,6 +22,34 @@ use crate::analysis::{AnalysisError, Language};
 /// for byte; see `data/PROVENANCE.md`.
 static WORDS: &str = include_str!("../../../data/thai/words_th.txt");
 
+// Test-only fault injection for the error arm of `segment` (D1).
+//
+// `newmm` reports an input it cannot span as `Err`, but no text in the test
+// suite reaches that branch, so a reverted `expect`/`unwrap_or_default` would
+// go unnoticed.  The unit tests set this flag to drive the failure path through
+// `segment` and `crate::analysis::tokenize_with`.  A thread-local (rather than
+// a global) keeps concurrent tests in one process independent: segmentation
+// runs on the calling thread.
+#[cfg(test)]
+thread_local! {
+    pub(crate) static FORCE_SEGMENT_ERROR: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// What [`FORCE_SEGMENT_ERROR`] reports as the segmenter's error.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct ForcedSegmentationFailure;
+
+#[cfg(test)]
+impl std::fmt::Display for ForcedSegmentationFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("forced segmentation failure (test-only fault injection)")
+    }
+}
+
+#[cfg(test)]
+impl std::error::Error for ForcedSegmentationFailure {}
+
 /// The tokenizer over [`WORDS`], built once per process.
 ///
 /// One word per line; a few entries are multi-word expressions that keep their
@@ -44,6 +72,13 @@ static TOKENIZER: LazyLock<NewmmTokenizer> =
 /// [`AnalysisError::Segmentation`] here, never an abort and never a
 /// character-level fallback.
 pub fn segment(text: &str) -> Result<Vec<String>, AnalysisError> {
+    #[cfg(test)]
+    if FORCE_SEGMENT_ERROR.with(std::cell::Cell::get) {
+        return Err(AnalysisError::Segmentation {
+            language: Language::Th,
+            source: Box::new(ForcedSegmentationFailure),
+        });
+    }
     let tokens =
         TOKENIZER
             .segment(text, true, false)

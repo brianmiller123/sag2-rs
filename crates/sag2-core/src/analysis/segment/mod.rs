@@ -57,9 +57,11 @@ impl DictionaryAnalysis {
         let dir = dictionary_dir.ok_or(AnalysisError::DictionaryMissing { language })?;
         #[cfg(feature = "lindera")]
         {
-            // One `open` produces both the segmenter and its fingerprint, so
-            // the recorded value cannot come from a different scan than the
-            // lattice the index tokenises with (C7).
+            // One `open` produces both the segmenter and its fingerprint from
+            // one directory argument, so the recorded value cannot come from a
+            // different directory than the lattice the index tokenises with
+            // (C7); a dictionary mutated while it is being opened is out of
+            // scope, as `open`'s own documentation says.
             let segmenter = lindera_seg::LinderaSegmenter::open(dir)?;
             Ok(Some(DictionaryAnalysis {
                 language,

@@ -483,6 +483,45 @@ mod tests {
     }
 
     #[test]
+    fn a_thai_segmentation_failure_surfaces_through_tokenize_with() {
+        // D1: `newmm` never fails on real text, so the error arm is driven
+        // through the test-only fault injection seam.  If `segment`'s `Err`
+        // were swallowed (`Ok(Vec::new())`, `unwrap_or_default`), this test
+        // would see `Ok` and fail.
+        use crate::analysis::segment::thai::{ForcedSegmentationFailure, FORCE_SEGMENT_ERROR};
+        use std::error::Error as _;
+
+        let thai = Profile::Multilingual {
+            language: Language::Th,
+        };
+        FORCE_SEGMENT_ERROR.with(|flag| flag.set(true));
+        let failed = tokenize_with(thai, "ห้องสมุด");
+        FORCE_SEGMENT_ERROR.with(|flag| flag.set(false));
+
+        let error = failed.expect_err("the injected segmenter failure reaches the caller");
+        match &error {
+            AnalysisError::Segmentation { language, source } => {
+                assert_eq!(*language, Language::Th);
+                assert!(
+                    source.downcast_ref::<ForcedSegmentationFailure>().is_some(),
+                    "the segmenter's own error is the source"
+                );
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        assert!(
+            error.source().is_some(),
+            "`AnalysisError::Segmentation` must expose its source"
+        );
+        // The flag is thread-local and cleared, so the pipeline is healthy.
+        assert_eq!(
+            tokens(thai, "ห้องสมุด"),
+            ["ห้องสมุด"],
+            "the injected failure is not sticky"
+        );
+    }
+
+    #[test]
     fn a_dictionary_profile_never_degrades_to_characters() {
         for language in [Language::Ja, Language::Ko] {
             let profile = Profile::Multilingual { language };
