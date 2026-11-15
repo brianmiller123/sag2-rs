@@ -122,7 +122,16 @@ fn class(character: char) -> Class {
 }
 
 /// Tokenize `text` exactly like `sag2.tokenize` (design §4.1, §4.2).
+///
+/// This is [`crate::analysis::tokenize_with`] with
+/// [`Profile::Sag2ZhV1`](crate::analysis::Profile::Sag2ZhV1), the certified
+/// reference pipeline; it is the one entry point whose bytes the goldens pin.
 pub fn tokenize(text: &str) -> Vec<String> {
+    crate::analysis::tokenize_with(crate::analysis::Profile::Sag2ZhV1, text)
+}
+
+/// The §4 pipeline itself: what every profile starts from (design §4.1-§4.3).
+pub(crate) fn tokenize_default(text: &str) -> Vec<String> {
     let normalised = unicode::lower(&unicode::nfkc(text));
     let mut words: Vec<String> = Vec::new();
     let mut block_start = 0_usize;

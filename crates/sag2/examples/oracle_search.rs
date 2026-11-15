@@ -11,11 +11,11 @@
 
 use std::path::PathBuf;
 
-use sag2::{search, BatchedJudge, OracleJudge, SearchOptions, TraceEntry};
+use sag2::{search, BatchedJudge, OracleJudge, Profile, SearchOptions, TraceEntry};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../golden/indexes/C0.sqlite");
-    let index = sag2::open_existing(&path)?;
+    let index = sag2::open_existing(&path, Profile::Sag2ZhV1)?;
 
     let judge = BatchedJudge::new(OracleJudge::new());
     let result = search(

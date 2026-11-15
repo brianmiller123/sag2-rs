@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use futures_core::future::Future;
 use sag2::{
-    AsyncIndex, BatchedJudge, CorpusIndex, Document, IndexOptions, Judge, OracleJudge,
+    AsyncIndex, BatchedJudge, CorpusIndex, Document, IndexOptions, Judge, OracleJudge, Profile,
     RebuildPolicy, SearchOptions,
 };
 
@@ -58,6 +58,7 @@ fn open_index(directory: &Path) -> CorpusIndex {
             chunk_chars: 2200,
             index_workers: 1,
             source_dir: None,
+            profile: Profile::Sag2ZhV1,
             rebuild: RebuildPolicy::Always,
         },
     )
@@ -131,7 +132,9 @@ fn async_open_reads_an_existing_index() {
     let _ = open_index(directory.path());
 
     runtime().block_on(async {
-        let index = AsyncIndex::open(&path).await.expect("async open");
+        let index = AsyncIndex::open(&path, Profile::Sag2ZhV1)
+            .await
+            .expect("async open");
         let expression = index.index().match_query("anchor").expect("query");
         let hits = assert_send(index.retrieve(&expression, BTreeSet::new(), 3, None))
             .await

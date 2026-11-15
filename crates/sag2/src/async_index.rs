@@ -31,9 +31,9 @@
 //! # #[cfg(feature = "tiktoken")]
 //! # async fn run() -> Result<(), Box<dyn std::error::Error>> {
 //! use std::sync::Arc;
-//! use sag2::{AsyncIndex, BatchedJudge, Judge, OracleJudge, SearchOptions};
+//! use sag2::{AsyncIndex, BatchedJudge, Judge, OracleJudge, Profile, SearchOptions};
 //!
-//! let index = AsyncIndex::open("golden/indexes/C0.sqlite").await?;
+//! let index = AsyncIndex::open("golden/indexes/C0.sqlite", Profile::Sag2ZhV1).await?;
 //! let judge: Arc<dyn Judge> = Arc::new(BatchedJudge::new(OracleJudge::new()));
 //! let result = index
 //!     .search(judge, "anchor birthplace depicts", SearchOptions::default())
@@ -52,7 +52,7 @@ use tokio::sync::Semaphore;
 
 use crate::{
     open_existing, search as search_sync, CorpusIndex, ExpansionError, ExpansionTerm, Hit, Judge,
-    OpenError, QueryError, SearchError, SearchOptions, SearchResult, Seed,
+    OpenError, Profile, QueryError, SearchError, SearchOptions, SearchResult, Seed,
 };
 
 /// A failure of the async wrappers.
@@ -133,11 +133,11 @@ impl AsyncIndex {
     /// Open an existing index file on the blocking pool.
     ///
     /// The file is validated against the signature stored in its `metadata`
-    /// row, exactly like [`crate::open_existing`].  The permit count becomes
-    /// the index's query worker count.
-    pub async fn open(path: impl AsRef<Path>) -> Result<Self, AsyncError> {
+    /// row and against `profile`, exactly like [`crate::open_existing`].  The
+    /// permit count becomes the index's query worker count.
+    pub async fn open(path: impl AsRef<Path>, profile: Profile) -> Result<Self, AsyncError> {
         let path: PathBuf = path.as_ref().to_owned();
-        let index = tokio::task::spawn_blocking(move || open_existing(path))
+        let index = tokio::task::spawn_blocking(move || open_existing(path, profile))
             .await
             .map_err(|_| AsyncError::Cancelled)??;
         Ok(AsyncIndex::new(index))

@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 use sag2_index::{
-    open, open_readonly, IndexOptions, OpenError, QueryOptions, RebuildPolicy, CHUNK_POLICY,
-    INDEX_SCHEMA,
+    open, open_readonly, IndexOptions, OpenError, Profile, QueryOptions, RebuildPolicy,
+    CHUNK_POLICY, INDEX_SCHEMA,
 };
 
 fn golden() -> PathBuf {
@@ -38,6 +38,7 @@ fn opens_a_python_built_index_and_loads_its_statistics() {
     let index = open_readonly(
         &fixture_path("C0"),
         &signature_of("C0"),
+        Profile::Sag2ZhV1,
         QueryOptions::default(),
     )
     .expect("C0 opens");
@@ -60,6 +61,7 @@ fn rejects_a_signature_from_another_corpus() {
     let error = open_readonly(
         &fixture_path("C0"),
         &sag2_index::signature("not-fixture", 2200, None),
+        Profile::Sag2ZhV1,
         QueryOptions::default(),
     )
     .expect_err("must refuse");
@@ -70,11 +72,32 @@ fn rejects_a_signature_from_another_corpus() {
 }
 
 #[test]
+fn a_python_built_fixture_reads_only_as_the_reference_profile() {
+    // `golden/indexes/*.sqlite` predate `rust_index_metadata.analysis`; they
+    // were tokenised by the reference pipeline and nothing else.
+    let error = open_readonly(
+        &fixture_path("C0"),
+        &signature_of("C0"),
+        Profile::MultilingualV1,
+        QueryOptions::default(),
+    )
+    .expect_err("must refuse");
+    match error {
+        OpenError::AnalysisMismatch { index, expected } => {
+            assert_eq!(index, None);
+            assert_eq!(expected, Profile::MultilingualV1);
+        }
+        other => panic!("unexpected error: {other}"),
+    }
+}
+
+#[test]
 fn workers_one_and_eight_produce_identical_hits() {
     let signature = signature_of("C1-rare140");
     let single = open_readonly(
         &fixture_path("C1-rare140"),
         &signature,
+        Profile::Sag2ZhV1,
         QueryOptions {
             workers: 1,
             cache_entries: 256,
@@ -84,6 +107,7 @@ fn workers_one_and_eight_produce_identical_hits() {
     let many = open_readonly(
         &fixture_path("C1-rare140"),
         &signature,
+        Profile::Sag2ZhV1,
         QueryOptions {
             workers: 8,
             cache_entries: 256,
@@ -153,6 +177,7 @@ fn format_version_mismatch_is_refused_and_never_rebuilds() {
             chunk_chars: 2200,
             index_workers: 1,
             source_dir: None,
+            profile: Profile::Sag2ZhV1,
             rebuild,
         };
         match open(&tampered, &options, "fixture") {
@@ -192,6 +217,7 @@ fn foreign_database_is_refused_instead_of_dropped() {
         chunk_chars: 2200,
         index_workers: 1,
         source_dir: None,
+        profile: Profile::Sag2ZhV1,
         rebuild: RebuildPolicy::Strict,
     };
     assert!(matches!(
@@ -234,6 +260,7 @@ fn signature_mismatch_follows_the_policy() {
         chunk_chars: 2200,
         index_workers: 1,
         source_dir: None,
+        profile: Profile::Sag2ZhV1,
         rebuild: RebuildPolicy::Strict,
     };
     assert!(matches!(

@@ -12,13 +12,18 @@
 //! The free [`open`] entry point has no corpus, so a decision that would build
 //! returns [`OpenError::BuildUnavailable`]; [`CorpusIndex::open`] carries the
 //! corpus and performs the build (§3.4).
+//!
+//! The analysis profile follows the same fail-closed rule: the profile a caller
+//! reads with must match `rust_index_metadata.analysis`, because reading an
+//! index with another tokenizer would mix two token streams.  A row without the
+//! key predates profiles and is the reference pipeline.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
-use sag2_core::DEFAULT_CHUNK_CHARS;
+use sag2_core::{Profile, DEFAULT_CHUNK_CHARS};
 
 use crate::build::{self, BuildError, Document};
 use crate::pool::{QueryOptions, QueryPool};
@@ -118,6 +123,11 @@ pub struct IndexOptions {
     pub index_workers: usize,
     /// Build the contentless `source_dir` layout against this directory.
     pub source_dir: Option<PathBuf>,
+    /// The analysis profile the index is built and read with.
+    ///
+    /// Persisted as `rust_index_metadata.analysis`; opening an index under a
+    /// different profile is refused rather than silently re-tokenised.
+    pub profile: Profile,
     /// How hard the open may try to make the index match the corpus.
     pub rebuild: RebuildPolicy,
 }
@@ -128,6 +138,7 @@ impl Default for IndexOptions {
             chunk_chars: DEFAULT_CHUNK_CHARS,
             index_workers: 1,
             source_dir: None,
+            profile: Profile::Sag2ZhV1,
             rebuild: RebuildPolicy::Strict,
         }
     }
@@ -215,6 +226,16 @@ pub enum OpenError {
         /// The value this build certifies.
         runtime: String,
     },
+    /// `rust_index_metadata.analysis` names another analysis profile; never
+    /// rebuilt, because rebuilding under the requested profile would hide the
+    /// mismatch.
+    AnalysisMismatch {
+        /// The recorded profile; `None` for an index that predates the key
+        /// (implicitly [`Profile::Sag2ZhV1`], the reference pipeline).
+        index: Option<String>,
+        /// The profile the caller asked for.
+        expected: Profile,
+    },
     /// The `chunks` schema is the `source_dir` variant, which P0 does not read.
     SourceDirUnsupported,
     /// The caller supplied no corpus, so a build decision is refused.
@@ -270,6 +291,17 @@ impl std::fmt::Display for OpenError {
                 formatter,
                 "index {field} {index} is incompatible with runtime {runtime}"
             ),
+            OpenError::AnalysisMismatch { index, expected } => match index {
+                Some(found) => write!(
+                    formatter,
+                    "index analysis profile {found} cannot be read as {expected}"
+                ),
+                None => write!(
+                    formatter,
+                    "index predates analysis profiles (implicitly {}) and cannot be read as {expected}",
+                    Profile::Sag2ZhV1
+                ),
+            },
             OpenError::SourceDirUnsupported => write!(
                 formatter,
                 "reading source_dir indexes needs the source tree; P0 reads materialised chunks"
@@ -340,11 +372,16 @@ pub enum Decision {
 }
 
 /// Apply the §3.4 decision table.
+///
+/// `profile` is the analysis profile the caller reads with.  An index built
+/// under another profile is rejected under every [`RebuildPolicy`]: a rebuild
+/// would silently replace the token stream the file was built for.
 pub fn decide(
     policy: RebuildPolicy,
     existing: &ExistingIndex,
     expected_signature: &str,
     runtime: &RuntimeVersions,
+    profile: Profile,
 ) -> Decision {
     if !existing.file_exists {
         return Decision::Build;
@@ -374,12 +411,15 @@ pub fn decide(
     }
 
     match &existing.rust_metadata {
-        None => match policy {
+        None => match check_analysis(None, profile) {
+            Err(error) => Decision::Reject(error),
             // Python-built index: readable, provenance is `Python`.
-            RebuildPolicy::Always => Decision::Rebuild(RebuildReason::CompiledIn),
-            RebuildPolicy::Strict | RebuildPolicy::OnCorpusChange => Decision::Reuse,
+            Ok(()) => match policy {
+                RebuildPolicy::Always => Decision::Rebuild(RebuildReason::CompiledIn),
+                RebuildPolicy::Strict | RebuildPolicy::OnCorpusChange => Decision::Reuse,
+            },
         },
-        Some(metadata) => match check_versions(metadata, runtime) {
+        Some(metadata) => match check_versions(metadata, runtime, profile) {
             Err(error) => Decision::Reject(error),
             Ok(()) => match policy {
                 RebuildPolicy::Always => Decision::Rebuild(RebuildReason::CompiledIn),
@@ -389,9 +429,29 @@ pub fn decide(
     }
 }
 
+/// Compare the recorded `analysis` value with the requested profile.
+///
+/// A row without the key predates profiles; it was tokenised by the reference
+/// pipeline, so it reads as [`Profile::Sag2ZhV1`] and nothing else.
+fn check_analysis(stored: Option<&str>, profile: Profile) -> Result<(), OpenError> {
+    match stored {
+        Some(value) if value == profile.as_str() => Ok(()),
+        Some(value) => Err(OpenError::AnalysisMismatch {
+            index: Some(value.to_owned()),
+            expected: profile,
+        }),
+        None if profile == Profile::Sag2ZhV1 => Ok(()),
+        None => Err(OpenError::AnalysisMismatch {
+            index: None,
+            expected: profile,
+        }),
+    }
+}
+
 fn check_versions(
     metadata: &BTreeMap<String, String>,
     runtime: &RuntimeVersions,
+    profile: Profile,
 ) -> Result<(), OpenError> {
     let format = metadata
         .get("format_version")
@@ -434,7 +494,7 @@ fn check_versions(
             runtime: expected.to_owned(),
         });
     }
-    Ok(())
+    check_analysis(metadata.get("analysis").map(String::as_str), profile)
 }
 
 /// Read the open-relevant facts about `path` without writing anything.
@@ -502,11 +562,17 @@ pub fn open(
         options.source_dir.as_deref(),
     );
     let existing = inspect(path)?;
-    match decide(options.rebuild, &existing, &expected, &RUNTIME_VERSIONS) {
+    match decide(
+        options.rebuild,
+        &existing,
+        &expected,
+        &RUNTIME_VERSIONS,
+        options.profile,
+    ) {
         Decision::Reject(error) => Err(error),
         Decision::Build | Decision::Rebuild(_) => Err(OpenError::BuildUnavailable),
         Decision::Reuse => Ok((
-            open_readonly(path, &expected, QueryOptions::default())?,
+            open_readonly(path, &expected, options.profile, QueryOptions::default())?,
             OpenOutcome::reused(),
         )),
     }
@@ -530,7 +596,13 @@ impl CorpusIndex {
             options.source_dir.as_deref(),
         );
         let existing = inspect(path)?;
-        let outcome = match decide(options.rebuild, &existing, &expected, &RUNTIME_VERSIONS) {
+        let outcome = match decide(
+            options.rebuild,
+            &existing,
+            &expected,
+            &RUNTIME_VERSIONS,
+            options.profile,
+        ) {
             Decision::Reject(error) => return Err(error),
             Decision::Reuse => OpenOutcome::reused(),
             Decision::Build => {
@@ -549,24 +621,33 @@ impl CorpusIndex {
             }
         };
         Ok((
-            open_readonly(path, &expected, QueryOptions::default())?,
+            open_readonly(path, &expected, options.profile, QueryOptions::default())?,
             outcome,
         ))
     }
 }
 
-/// Open `path` read-only, verifying that it was built for `expected_signature`.
+/// Open `path` read-only, verifying that it was built for `expected_signature`
+/// and `profile`.
 pub fn open_readonly(
     path: &Path,
     expected_signature: &str,
+    profile: Profile,
     options: QueryOptions,
 ) -> Result<CorpusIndex, OpenError> {
-    open_readonly_with(path, expected_signature, options, &RUNTIME_VERSIONS)
+    open_readonly_with(
+        path,
+        expected_signature,
+        profile,
+        options,
+        &RUNTIME_VERSIONS,
+    )
 }
 
 fn open_readonly_with(
     path: &Path,
     expected_signature: &str,
+    profile: Profile,
     options: QueryOptions,
     runtime: &RuntimeVersions,
 ) -> Result<CorpusIndex, OpenError> {
@@ -581,8 +662,9 @@ fn open_readonly_with(
             found: stored,
         });
     }
-    if let Some(metadata) = &existing.rust_metadata {
-        check_versions(metadata, runtime)?;
+    match &existing.rust_metadata {
+        Some(metadata) => check_versions(metadata, runtime, profile)?,
+        None => check_analysis(None, profile)?,
     }
 
     let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
@@ -618,8 +700,8 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        decide, Decision, ExistingIndex, OpenError, RebuildPolicy, RebuildReason, RuntimeVersions,
-        FORMAT_VERSION, RUNTIME_VERSIONS,
+        decide, Decision, ExistingIndex, OpenError, Profile, RebuildPolicy, RebuildReason,
+        RuntimeVersions, FORMAT_VERSION, RUNTIME_VERSIONS,
     };
 
     const EXPECTED: &str =
@@ -671,6 +753,7 @@ mod tests {
     fn current_metadata() -> BTreeMap<String, String> {
         rust_metadata(&[
             ("format_version", "1"),
+            ("analysis", "sag2-zh-v1"),
             ("tokenizer_version", "tokera-1"),
             ("chunk_policy_version", "desktop-sentences-v1"),
             ("jieba_dict_sha256", "dict-1"),
@@ -710,7 +793,7 @@ mod tests {
             RebuildPolicy::Always,
         ] {
             assert!(matches!(
-                decide(policy, &missing, EXPECTED, &RUNTIME),
+                decide(policy, &missing, EXPECTED, &RUNTIME, Profile::Sag2ZhV1),
                 Decision::Build
             ));
         }
@@ -723,7 +806,13 @@ mod tests {
             ..ExistingIndex::default()
         };
         assert!(matches!(
-            decide(RebuildPolicy::Strict, &empty, EXPECTED, &RUNTIME),
+            decide(
+                RebuildPolicy::Strict,
+                &empty,
+                EXPECTED,
+                &RUNTIME,
+                Profile::Sag2ZhV1
+            ),
             Decision::Build
         ));
     }
@@ -738,7 +827,13 @@ mod tests {
             rust_metadata: None,
         };
         assert!(matches!(
-            rejection(decide(RebuildPolicy::Strict, &foreign, EXPECTED, &RUNTIME)),
+            rejection(decide(
+                RebuildPolicy::Strict,
+                &foreign,
+                EXPECTED,
+                &RUNTIME,
+                Profile::Sag2ZhV1
+            )),
             OpenError::ForeignDatabase
         ));
         assert!(matches!(
@@ -746,12 +841,19 @@ mod tests {
                 RebuildPolicy::OnCorpusChange,
                 &foreign,
                 EXPECTED,
-                &RUNTIME
+                &RUNTIME,
+                Profile::Sag2ZhV1,
             )),
             OpenError::ForeignDatabase
         ));
         assert_eq!(
-            is_rebuild(decide(RebuildPolicy::Always, &foreign, EXPECTED, &RUNTIME)),
+            is_rebuild(decide(
+                RebuildPolicy::Always,
+                &foreign,
+                EXPECTED,
+                &RUNTIME,
+                Profile::Sag2ZhV1
+            )),
             Some(RebuildReason::CompiledIn)
         );
     }
@@ -759,7 +861,13 @@ mod tests {
     #[test]
     fn signature_change_rebuilds_or_rejects_by_policy() {
         let changed = existing(Some(OTHER), None);
-        match rejection(decide(RebuildPolicy::Strict, &changed, EXPECTED, &RUNTIME)) {
+        match rejection(decide(
+            RebuildPolicy::Strict,
+            &changed,
+            EXPECTED,
+            &RUNTIME,
+            Profile::Sag2ZhV1,
+        )) {
             OpenError::IndexSignatureMismatch { field } => assert_eq!(field, "fingerprint"),
             other => panic!("unexpected {other}"),
         }
@@ -768,14 +876,21 @@ mod tests {
                 RebuildPolicy::OnCorpusChange,
                 &changed,
                 EXPECTED,
-                &RUNTIME
+                &RUNTIME,
+                Profile::Sag2ZhV1,
             )),
             Some(RebuildReason::SignatureChanged {
                 field: "fingerprint"
             })
         );
         assert_eq!(
-            is_rebuild(decide(RebuildPolicy::Always, &changed, EXPECTED, &RUNTIME)),
+            is_rebuild(decide(
+                RebuildPolicy::Always,
+                &changed,
+                EXPECTED,
+                &RUNTIME,
+                Profile::Sag2ZhV1
+            )),
             Some(RebuildReason::SignatureChanged {
                 field: "fingerprint"
             })
@@ -785,15 +900,28 @@ mod tests {
     #[test]
     fn python_built_index_is_reused_and_always_rebuilds() {
         let python = existing(Some(EXPECTED), None);
-        is_reuse(decide(RebuildPolicy::Strict, &python, EXPECTED, &RUNTIME));
+        is_reuse(decide(
+            RebuildPolicy::Strict,
+            &python,
+            EXPECTED,
+            &RUNTIME,
+            Profile::Sag2ZhV1,
+        ));
         is_reuse(decide(
             RebuildPolicy::OnCorpusChange,
             &python,
             EXPECTED,
             &RUNTIME,
+            Profile::Sag2ZhV1,
         ));
         assert_eq!(
-            is_rebuild(decide(RebuildPolicy::Always, &python, EXPECTED, &RUNTIME)),
+            is_rebuild(decide(
+                RebuildPolicy::Always,
+                &python,
+                EXPECTED,
+                &RUNTIME,
+                Profile::Sag2ZhV1
+            )),
             Some(RebuildReason::CompiledIn)
         );
     }
@@ -801,12 +929,19 @@ mod tests {
     #[test]
     fn rust_built_index_is_reused_when_versions_match() {
         let rust = existing(Some(EXPECTED), Some(current_metadata()));
-        is_reuse(decide(RebuildPolicy::Strict, &rust, EXPECTED, &RUNTIME));
+        is_reuse(decide(
+            RebuildPolicy::Strict,
+            &rust,
+            EXPECTED,
+            &RUNTIME,
+            Profile::Sag2ZhV1,
+        ));
         is_reuse(decide(
             RebuildPolicy::OnCorpusChange,
             &rust,
             EXPECTED,
             &RUNTIME,
+            Profile::Sag2ZhV1,
         ));
     }
 
@@ -822,7 +957,7 @@ mod tests {
                 RebuildPolicy::OnCorpusChange,
                 RebuildPolicy::Always,
             ] {
-                match rejection(decide(policy, &rust, EXPECTED, &RUNTIME)) {
+                match rejection(decide(policy, &rust, EXPECTED, &RUNTIME, Profile::Sag2ZhV1)) {
                     OpenError::UnsupportedIndexVersion { supported, .. } => {
                         assert_eq!(supported, FORMAT_VERSION)
                     }
@@ -843,7 +978,7 @@ mod tests {
                 RebuildPolicy::OnCorpusChange,
                 RebuildPolicy::Always,
             ] {
-                match rejection(decide(policy, &rust, EXPECTED, &RUNTIME)) {
+                match rejection(decide(policy, &rust, EXPECTED, &RUNTIME, Profile::Sag2ZhV1)) {
                     OpenError::MissingVersionKey(field) => assert_eq!(field, key),
                     other => panic!("{key}: unexpected {other}"),
                 }
@@ -877,10 +1012,128 @@ mod tests {
                 RebuildPolicy::OnCorpusChange,
                 RebuildPolicy::Always,
             ] {
-                match rejection(decide(policy, &rust, EXPECTED, &RUNTIME)) {
+                match rejection(decide(policy, &rust, EXPECTED, &RUNTIME, Profile::Sag2ZhV1)) {
                     OpenError::IncompatibleIndex { field, .. } => assert_eq!(field, key),
                     other => panic!("unexpected {other}"),
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn another_analysis_profile_is_rejected_by_every_policy() {
+        let rust = existing(Some(EXPECTED), Some(current_metadata()));
+        for policy in [
+            RebuildPolicy::Strict,
+            RebuildPolicy::OnCorpusChange,
+            RebuildPolicy::Always,
+        ] {
+            match rejection(decide(
+                policy,
+                &rust,
+                EXPECTED,
+                &RUNTIME,
+                Profile::MultilingualV1,
+            )) {
+                OpenError::AnalysisMismatch { index, expected } => {
+                    assert_eq!(index.as_deref(), Some("sag2-zh-v1"));
+                    assert_eq!(expected, Profile::MultilingualV1);
+                }
+                other => panic!("{policy:?} must refuse, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_multilingual_index_is_reused_only_under_its_own_profile() {
+        let mut metadata = current_metadata();
+        metadata.insert("analysis".to_owned(), "multilingual-v1".to_owned());
+        let rust = existing(Some(EXPECTED), Some(metadata));
+        is_reuse(decide(
+            RebuildPolicy::Strict,
+            &rust,
+            EXPECTED,
+            &RUNTIME,
+            Profile::MultilingualV1,
+        ));
+        assert!(matches!(
+            rejection(decide(
+                RebuildPolicy::Strict,
+                &rust,
+                EXPECTED,
+                &RUNTIME,
+                Profile::Sag2ZhV1
+            )),
+            OpenError::AnalysisMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn a_row_without_analysis_is_the_reference_profile() {
+        let mut metadata = current_metadata();
+        metadata.remove("analysis");
+        let rust = existing(Some(EXPECTED), Some(metadata));
+        is_reuse(decide(
+            RebuildPolicy::Strict,
+            &rust,
+            EXPECTED,
+            &RUNTIME,
+            Profile::Sag2ZhV1,
+        ));
+        match rejection(decide(
+            RebuildPolicy::Strict,
+            &rust,
+            EXPECTED,
+            &RUNTIME,
+            Profile::MultilingualV1,
+        )) {
+            OpenError::AnalysisMismatch { index, expected } => {
+                assert_eq!(index, None);
+                assert_eq!(expected, Profile::MultilingualV1);
+            }
+            other => panic!("unexpected {other}"),
+        }
+    }
+
+    #[test]
+    fn a_python_index_is_never_read_as_multilingual() {
+        let python = existing(Some(EXPECTED), None);
+        is_reuse(decide(
+            RebuildPolicy::Strict,
+            &python,
+            EXPECTED,
+            &RUNTIME,
+            Profile::Sag2ZhV1,
+        ));
+        assert!(matches!(
+            rejection(decide(
+                RebuildPolicy::OnCorpusChange,
+                &python,
+                EXPECTED,
+                &RUNTIME,
+                Profile::MultilingualV1
+            )),
+            OpenError::AnalysisMismatch { index: None, .. }
+        ));
+    }
+
+    #[test]
+    fn an_unknown_analysis_value_is_rejected() {
+        let mut metadata = current_metadata();
+        metadata.insert("analysis".to_owned(), "sag2-zh-v0".to_owned());
+        let rust = existing(Some(EXPECTED), Some(metadata));
+        for profile in [Profile::Sag2ZhV1, Profile::MultilingualV1] {
+            match rejection(decide(
+                RebuildPolicy::Always,
+                &rust,
+                EXPECTED,
+                &RUNTIME,
+                profile,
+            )) {
+                OpenError::AnalysisMismatch { index, .. } => {
+                    assert_eq!(index.as_deref(), Some("sag2-zh-v0"))
+                }
+                other => panic!("unexpected {other}"),
             }
         }
     }

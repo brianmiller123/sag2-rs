@@ -13,7 +13,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, Transaction};
-use sag2_core::{chunk_document, diversity_tokens, tokenize, utf16_length};
+use sag2_core::{chunk_document, diversity_tokens, tokenize_with, utf16_length, Profile};
 use sag2_json::{compact_json, Object, Value};
 use sha2::{Digest, Sha256};
 
@@ -235,7 +235,12 @@ pub fn build(
     }
 
     let mut chunk_id = 0_i64;
-    for prepared in prepare_documents(&pending, options.chunk_chars, options.index_workers) {
+    for prepared in prepare_documents(
+        &pending,
+        options.chunk_chars,
+        options.index_workers,
+        options.profile,
+    ) {
         for chunk in &prepared.chunks {
             chunk_id += 1;
             let document_id = (prepared.position + 1) as i64;
@@ -289,8 +294,9 @@ pub fn build(
         options.chunk_chars,
         contentless,
         &expected,
+        options.profile,
     )?;
-    write_rust_metadata(&tx, versions)?;
+    write_rust_metadata(&tx, versions, options.profile)?;
     tx.commit()?;
     Ok(())
 }
@@ -330,7 +336,11 @@ struct PreparedDocument {
     chunks: Vec<PreparedChunk>,
 }
 
-fn prepare_document(document: &PendingDocument, chunk_chars: usize) -> PreparedDocument {
+fn prepare_document(
+    document: &PendingDocument,
+    chunk_chars: usize,
+    profile: Profile,
+) -> PreparedDocument {
     let chunks = chunk_document(
         &document.content,
         chunk_chars,
@@ -341,12 +351,12 @@ fn prepare_document(document: &PendingDocument, chunk_chars: usize) -> PreparedD
         title: document.title.clone(),
         full_doc: document.full_doc.clone(),
         source_id: document.source_id.clone(),
-        title_tokens: join_tokens(&document.title),
+        title_tokens: join_tokens(&document.title, profile),
         chunks: chunks
             .into_iter()
             .map(|chunk| PreparedChunk {
-                heading_tokens: join_tokens(&chunk.heading),
-                body_tokens: join_tokens(&chunk.content),
+                heading_tokens: join_tokens(&chunk.heading, profile),
+                body_tokens: join_tokens(&chunk.content, profile),
                 heading: chunk.heading,
                 content: chunk.content,
                 spans: chunk.spans,
@@ -362,12 +372,13 @@ fn prepare_documents(
     documents: &[PendingDocument],
     chunk_chars: usize,
     index_workers: usize,
+    profile: Profile,
 ) -> Vec<PreparedDocument> {
     let workers = index_workers.max(1).min(documents.len().max(1));
     if workers <= 1 {
         return documents
             .iter()
-            .map(|document| prepare_document(document, chunk_chars))
+            .map(|document| prepare_document(document, chunk_chars, profile))
             .collect();
     }
     let stride = documents.len().div_ceil(workers);
@@ -378,7 +389,7 @@ fn prepare_documents(
                 scope.spawn(move || {
                     slice
                         .iter()
-                        .map(|document| prepare_document(document, chunk_chars))
+                        .map(|document| prepare_document(document, chunk_chars, profile))
                         .collect::<Vec<_>>()
                 })
             })
@@ -401,8 +412,8 @@ fn spans_json(spans: &[(usize, usize)]) -> String {
     ))
 }
 
-fn join_tokens(text: &str) -> String {
-    tokenize(text).join(" ")
+fn join_tokens(text: &str, profile: Profile) -> String {
+    tokenize_with(profile, text).join(" ")
 }
 
 /// `sag2.py:328-401` `_load_statistics`.
@@ -412,6 +423,7 @@ fn load_statistics(
     chunk_chars: usize,
     contentless: bool,
     signature: &str,
+    profile: Profile,
 ) -> Result<(), BuildError> {
     tx.execute(
         "CREATE TABLE IF NOT EXISTS index_statistics \
@@ -448,7 +460,7 @@ fn load_statistics(
     let mut term_frequencies: BTreeMap<String, i64> = BTreeMap::new();
     let mut count = 0_i64;
     for document in corpus {
-        let words = tokenize(&document.title);
+        let words = tokenize_with(profile, &document.title);
         if words.len() >= 2 {
             title_phrases.insert(words);
         }
@@ -521,6 +533,7 @@ fn load_statistics(
 fn write_rust_metadata(
     tx: &Transaction<'_>,
     versions: &RuntimeVersions,
+    profile: Profile,
 ) -> Result<(), rusqlite::Error> {
     tx.execute(
         "CREATE TABLE IF NOT EXISTS rust_index_metadata \
@@ -528,8 +541,9 @@ fn write_rust_metadata(
         [],
     )?;
     tx.execute("DELETE FROM rust_index_metadata", [])?;
-    let rows: [(&str, &str); 10] = [
+    let rows: [(&str, &str); 11] = [
         ("format_version", crate::open::FORMAT_VERSION_STR),
+        ("analysis", profile.as_str()),
         ("tokenizer_version", versions.tokenizer_version),
         ("chunk_policy_version", versions.chunk_policy_version),
         ("jieba_dict_sha256", versions.jieba_dict_sha256),
@@ -665,13 +679,14 @@ mod tests {
 
     use super::*;
     use crate::open::{IndexOptions, RebuildPolicy, RUNTIME_VERSIONS};
-    use crate::{CorpusIndex, OpenAction};
+    use crate::{CorpusIndex, OpenAction, OpenError, QueryOptions};
 
     fn materialised(chunk_chars: usize) -> IndexOptions {
         IndexOptions {
             chunk_chars,
             index_workers: 1,
             source_dir: None,
+            profile: Profile::Sag2ZhV1,
             rebuild: RebuildPolicy::Always,
         }
     }
@@ -760,7 +775,7 @@ mod tests {
                 row.get(0)
             })
             .expect("rust keys");
-        assert_eq!(rust_keys, 10);
+        assert_eq!(rust_keys, 11);
         let fts_sql: String = db
             .query_row(
                 "SELECT sql FROM sqlite_master WHERE name='chunk_fts'",
@@ -790,6 +805,72 @@ mod tests {
     }
 
     #[test]
+    fn the_build_records_the_profile_and_a_mismatch_fails_closed() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("index.sqlite");
+        let corpus = [Document {
+            title: "Guide",
+            text: "Alice Paul birthplace.",
+            path: None,
+            idx: None,
+        }];
+        let mut options = materialised(2200);
+        options.profile = Profile::MultilingualV1;
+        CorpusIndex::open(&path, &corpus, "fixture", options.clone()).expect("build");
+
+        let db = Connection::open(&path).expect("open");
+        let recorded: String = db
+            .query_row(
+                "SELECT value FROM rust_index_metadata WHERE key='analysis'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("analysis row");
+        drop(db);
+        assert_eq!(recorded, Profile::MultilingualV1.as_str());
+
+        // Same corpus, same signature, other profile: refused, never rebuilt.
+        let mut reference = options.clone();
+        reference.profile = Profile::Sag2ZhV1;
+        reference.rebuild = RebuildPolicy::Strict;
+        match CorpusIndex::open(&path, &corpus, "fixture", reference.clone()) {
+            Err(OpenError::AnalysisMismatch { index, expected }) => {
+                assert_eq!(index.as_deref(), Some(Profile::MultilingualV1.as_str()));
+                assert_eq!(expected, Profile::Sag2ZhV1);
+            }
+            other => panic!("the reader must refuse, got {other:?}"),
+        }
+
+        // The read-only path refuses it too.
+        let signature = crate::signature("fixture", 2200, None);
+        assert!(matches!(
+            crate::open_readonly(
+                &path,
+                &signature,
+                Profile::Sag2ZhV1,
+                QueryOptions::default()
+            ),
+            Err(OpenError::AnalysisMismatch { .. })
+        ));
+        assert!(crate::open_readonly(
+            &path,
+            &signature,
+            Profile::MultilingualV1,
+            QueryOptions::default()
+        )
+        .is_ok());
+
+        // A row without the key predates profiles and reads as Sag2ZhV1.
+        let db = Connection::open(&path).expect("open");
+        db.execute("DELETE FROM rust_index_metadata WHERE key='analysis'", [])
+            .expect("drop the analysis row");
+        drop(db);
+        let (_, outcome) = CorpusIndex::open(&path, &corpus, "fixture", reference)
+            .expect("a legacy row opens as the reference profile");
+        assert_eq!(outcome.action, OpenAction::Reused);
+    }
+
+    #[test]
     fn builds_a_source_dir_index_with_contentless_fts() {
         let directory = tempfile::tempdir().expect("temp dir");
         let file = directory.path().join("dsid_1__Guide.md");
@@ -806,6 +887,7 @@ mod tests {
             chunk_chars: 512,
             index_workers: 1,
             source_dir: Some(directory.path().to_owned()),
+            profile: Profile::Sag2ZhV1,
             rebuild: RebuildPolicy::Always,
         };
         build(&path, &corpus, "fixture", &options, &RUNTIME_VERSIONS).expect("build");
@@ -875,6 +957,7 @@ mod tests {
                 chunk_chars: 512,
                 index_workers: workers,
                 source_dir: None,
+                profile: Profile::Sag2ZhV1,
                 rebuild: RebuildPolicy::Always,
             };
             build(&path, &corpus, "fixture", &options, &RUNTIME_VERSIONS).expect("build");

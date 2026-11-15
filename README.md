@@ -25,7 +25,7 @@ No judge, no payload builder, no async runtime. This path also builds with
 `default-features = false`:
 
 ```rust
-let index = sag2::open_existing("index.sqlite")?;      // read-only, signature-checked
+let index = sag2::open_existing("index.sqlite", sag2::Profile::Sag2ZhV1)?;  // read-only, signature- and profile-checked
 let expression = index.match_query("anchor birthplace depicts")?;
 let hits = index.retrieve(&expression, &Default::default(), 5, None)?;
 for hit in hits {
@@ -47,7 +47,7 @@ fixture transport the gates replay (a real deployment implements `Judge` or
 `Transport`; HTTP arrives in P3):
 
 ```rust
-let index = sag2::open_existing("index.sqlite")?;
+let index = sag2::open_existing("index.sqlite", sag2::Profile::Sag2ZhV1)?;
 let judge = sag2::BatchedJudge::new(sag2::OracleJudge::new());
 let result = sag2::search(&index, &judge, "anchor birthplace depicts", &SearchOptions::default())?;
 for candidate in result.candidates.iter().take(5) {
@@ -66,7 +66,7 @@ blocking pool. `AsyncIndex` caps in-flight work at the index's query-worker
 count, so overload becomes async waiting instead of unbounded blocking threads:
 
 ```rust
-let index = sag2::AsyncIndex::open("index.sqlite").await?;
+let index = sag2::AsyncIndex::open("index.sqlite", sag2::Profile::Sag2ZhV1).await?;
 let judge: std::sync::Arc<dyn sag2::Judge> =
     std::sync::Arc::new(sag2::BatchedJudge::new(sag2::OracleJudge::new()));
 let result = index.search(judge, "anchor birthplace depicts", SearchOptions::default()).await?;

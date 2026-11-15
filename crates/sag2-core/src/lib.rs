@@ -10,6 +10,7 @@
 #![deny(unsafe_code)]
 #![deny(missing_docs)]
 
+pub mod analysis;
 mod ascii_cut;
 mod chunk;
 mod collate;
@@ -20,6 +21,7 @@ mod query;
 mod tokenize;
 mod unicode;
 
+pub use analysis::{tokenize_with, Profile, UnknownProfile};
 pub use chunk::{chunk_document, source_content, utf16_length, Chunk, DEFAULT_CHUNK_CHARS};
 pub use collate::sort_key;
 pub use dict::{

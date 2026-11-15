@@ -28,7 +28,8 @@ use std::process::ExitCode;
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use sag2_index::{
-    open_readonly, CorpusIndex, ExpansionQuery, ExpansionTerm, QueryError, QueryOptions, Seed,
+    open_readonly, CorpusIndex, ExpansionQuery, ExpansionTerm, Profile, QueryError, QueryOptions,
+    Seed,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -699,8 +700,13 @@ fn run_gate_a(options: &Options) -> Result<ExitCode, String> {
         fs::write(&cached, &bytes)
             .map_err(|error| format!("cannot write {}: {error}", cached.display()))?;
         let signature = signatures[&fixture.fixture].clone();
-        let index = open_readonly(&cached, &signature, QueryOptions::default())
-            .map_err(|error| format!("cannot open fixture {}: {error}", fixture.fixture))?;
+        let index = open_readonly(
+            &cached,
+            &signature,
+            Profile::Sag2ZhV1,
+            QueryOptions::default(),
+        )
+        .map_err(|error| format!("cannot open fixture {}: {error}", fixture.fixture))?;
         if index.statistics().total as usize != fixture.chunks {
             return Err(format!(
                 "fixture {} holds {} chunks, manifest says {}",
@@ -1370,6 +1376,7 @@ fn gate_d_index(
                 chunk_chars: golden.chunk_chars,
                 index_workers: 1,
                 source_dir: source_dir.clone(),
+                profile: Profile::Sag2ZhV1,
                 rebuild: sag2_index::RebuildPolicy::Always,
             },
         );
@@ -1513,11 +1520,13 @@ fn read_index_goldens(options: &Options) -> Result<Vec<IndexGolden>, String> {
     Ok(entries)
 }
 
-/// The `rust_index_metadata` rows this build writes (design §3.3).
+/// The `rust_index_metadata` rows this build writes: the design §3.3 v1 key
+/// set plus the analysis profile every build records.
 fn expected_rust_metadata() -> BTreeMap<&'static str, &'static str> {
     let versions = &sag2_index::RUNTIME_VERSIONS;
     [
         ("format_version", sag2_index::FORMAT_VERSION_STR),
+        ("analysis", Profile::Sag2ZhV1.as_str()),
         ("tokenizer_version", versions.tokenizer_version),
         ("chunk_policy_version", versions.chunk_policy_version),
         ("jieba_dict_sha256", versions.jieba_dict_sha256),
@@ -1927,7 +1936,16 @@ fn compare_index(
     actual_keys.sort_unstable();
     let mut golden_keys: Vec<&str> = golden_keys.iter().map(String::as_str).collect();
     golden_keys.sort_unstable();
-    if actual_keys != expected_keys || expected_keys != golden_keys {
+    // The goldens record the design §3.3 v1 key set, which every build still
+    // has to carry; `analysis` is the multilingual plan's addition to that set,
+    // and design §3.2 rule 4 makes an unknown key ignorable for a 1.x reader.
+    // `actual_keys == expected_keys` keeps the written set exact either way, so
+    // an undeclared key is still a failure.
+    let golden_missing = golden_keys
+        .iter()
+        .filter(|key| !actual_keys.contains(*key))
+        .count();
+    if actual_keys != expected_keys || golden_missing != 0 {
         gate.push(
             fixture,
             "rust_index_metadata/keys",
@@ -2653,9 +2671,13 @@ fn gate_b_expansion(
         let cached = options.cache.join(&fixture.index);
         fs::write(&cached, &bytes)
             .map_err(|error| format!("cannot write {}: {error}", cached.display()))?;
-        let index = open_readonly(&cached, &fixture.signature, QueryOptions::default()).map_err(
-            |error| format!("cannot open expansion fixture {}: {error}", fixture.fixture),
-        )?;
+        let index = open_readonly(
+            &cached,
+            &fixture.signature,
+            Profile::Sag2ZhV1,
+            QueryOptions::default(),
+        )
+        .map_err(|error| format!("cannot open expansion fixture {}: {error}", fixture.fixture))?;
         if index.statistics().total as usize != fixture.chunks {
             return Err(format!(
                 "fixture {} holds {} chunks, manifest says {}",
@@ -4871,6 +4893,7 @@ fn run_gate_c(options: &Options) -> Result<ExitCode, String> {
                 chunk_chars: corpus.chunk_chars,
                 index_workers: case.index_workers,
                 source_dir: None,
+                profile: Profile::Sag2ZhV1,
                 rebuild: sag2_index::RebuildPolicy::Always,
             },
         )

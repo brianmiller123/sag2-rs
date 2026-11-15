@@ -9,9 +9,11 @@
 
 use std::path::PathBuf;
 
+use sag2::Profile;
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../golden/indexes/C0.sqlite");
-    let index = sag2::open_existing(&path)?;
+    let index = sag2::open_existing(&path, Profile::Sag2ZhV1)?;
 
     let expression = index.match_query("anchor birthplace depicts")?;
     let hits = index.retrieve(&expression, &Default::default(), 5, None)?;

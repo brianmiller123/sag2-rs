@@ -11,7 +11,7 @@ use sag2::{
     search, Answer, BatchedJudge, Candidate, CorpusIndex, Hit, Judge, JudgeError, OracleJudge,
     Payload, Response, SearchContext, SearchOptions, Transport,
 };
-use sag2_index::{Document, IndexOptions, RebuildPolicy};
+use sag2_index::{Document, IndexOptions, Profile, RebuildPolicy};
 use sag2_json::Value;
 
 fn corpus() -> [Document<'static>; 5] {
@@ -59,6 +59,7 @@ fn open_index(directory: &Path) -> CorpusIndex {
             chunk_chars: 2200,
             index_workers: 1,
             source_dir: None,
+            profile: Profile::Sag2ZhV1,
             rebuild: RebuildPolicy::Always,
         },
     )

@@ -14,7 +14,7 @@
 //! ```no_run
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! // An index built by this workspace or by the Python implementation.
-//! let index = sag2::open_existing("golden/indexes/C0.sqlite")?;
+//! let index = sag2::open_existing("golden/indexes/C0.sqlite", sag2::Profile::Sag2ZhV1)?;
 //! let expression = index.match_query("anchor birthplace depicts")?;
 //! let hits = index.retrieve(&expression, &Default::default(), 5, None)?;
 //! for hit in hits {
@@ -33,7 +33,7 @@
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! use sag2::{search, BatchedJudge, OracleJudge, SearchOptions};
 //!
-//! let index = sag2::open_existing("golden/indexes/C0.sqlite")?;
+//! let index = sag2::open_existing("golden/indexes/C0.sqlite", sag2::Profile::Sag2ZhV1)?;
 //! let judge = BatchedJudge::new(OracleJudge::new());
 //! let result = search(
 //!     &index,
@@ -96,7 +96,7 @@ pub use judge::{BatchDetail, Judge, JudgeError, RoundUsage, Usage, UsageBatch};
 pub use sag2_index::{
     inspect, open_readonly, BuildError, CorpusIndex, Document, ExpansionError, ExpansionHit,
     ExpansionKind, ExpansionQuery, ExpansionTerm, Hit, IndexOptions, OpenAction, OpenError,
-    OpenOutcome, QueryError, QueryOptions, RebuildPolicy, RebuildReason, Seed, Selected,
+    OpenOutcome, Profile, QueryError, QueryOptions, RebuildPolicy, RebuildReason, Seed, Selected,
     SqliteError, Statistics, StatisticsError,
 };
 /// The facade's ordered JSON object, used where Python has a dict.
@@ -127,19 +127,20 @@ pub const DEFAULT_MAX_HOPS: u8 = 2;
 pub const DEFAULT_EXPANSION_TERM_LIMIT: usize = 20;
 
 /// Open an existing index file read-only, validating it against the signature
-/// stored in its `metadata` row.
+/// stored in its `metadata` row and against `profile`.
 ///
 /// This is the entry point for an index this process did not build — the golden
 /// fixtures, or an index produced by the Python implementation.  The stored
-/// signature is checked, and so is `rust_index_metadata` when the file has it.
-/// Use [`CorpusIndex::open`] when you hold the corpus and want the build/reuse
-/// decision table.
-pub fn open_existing(path: impl AsRef<Path>) -> Result<CorpusIndex, OpenError> {
+/// signature is checked, and so is `rust_index_metadata` when the file has it;
+/// an index built under another [`Profile`] is refused rather than read with
+/// the wrong token stream.  Use [`CorpusIndex::open`] when you hold the corpus
+/// and want the build/reuse decision table.
+pub fn open_existing(path: impl AsRef<Path>, profile: Profile) -> Result<CorpusIndex, OpenError> {
     let path = path.as_ref();
     let existing = inspect(path)?;
     if !existing.file_exists {
         return Err(OpenError::MissingDatabase(path.to_owned()));
     }
     let signature = existing.signature.ok_or(OpenError::MissingSignature)?;
-    open_readonly(path, &signature, QueryOptions::default())
+    open_readonly(path, &signature, profile, QueryOptions::default())
 }
