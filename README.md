@@ -93,7 +93,7 @@ cargo build -p sag2 --features async       # + async wrappers
 cargo build -p sag2 --features lindera     # + Japanese/Korean dictionaries
 ```
 
-### Japanese/Korean dictionaries (feature `lindera`)
+### Dictionaries (feature `lindera`, `SAG2_DICT_DIR`)
 
 `multilingual-v1-ja` and `multilingual-v1-ko` segment with a morphological
 dictionary. Compiled ipadic (≈ 10.5 MB) and ko-dic (≈ 19.9 MB) are far too
@@ -101,8 +101,9 @@ large to ship, so the dictionary is a **runtime directory**: it is not in this
 repository, not vendored, and never downloaded at build time.
 
 The library takes the directory through `IndexOptions::dictionary_dir`; the
-`lindera` feature has to be on (it requires Rust 1.88, while the default build
-keeps the workspace's 1.85):
+CLI takes `--dict-dir` (or the `SAG2_DICT_DIR` environment variable) on both
+`build` and `search`; the `lindera` feature has to be on (it requires Rust
+1.88, while the default build keeps the workspace's 1.85):
 
 ```rust
 let options = sag2::IndexOptions {
@@ -145,7 +146,74 @@ SAG2_DICT_DIR=/path/to/ko-dic SAG2_DICT_LANG=ko \
   cargo test --offline -p sag2-core --features lindera --test lindera_dictionary -- --ignored
 ```
 
-### SQLite integration modes
+## Languages
+
+`Profile::Sag2ZhV1` is the certified pipeline and the default everywhere.
+`Profile::Multilingual { language }` normalises and (where one exists) segments
+per language; its identifier is persisted in `rust_index_metadata.analysis`
+(`multilingual-v1-<lang>`), so an index always reads back through the pipeline
+that built it.
+
+| language | profile | analysis | dictionary | word rate | Phrase3 R@10 gain |
+|---|---|---|---|---|---|
+| Russian | `multilingual-v1-ru` | normalise, character tokens | no | 0.00 | +0.10 |
+| Arabic | `multilingual-v1-ar` | normalise (hamza/alef/tatweel), character tokens | no | 0.00 | +0.20 |
+| Hindi | `multilingual-v1-hi` | character tokens | no | 0.00 | +0.00 |
+| Greek | `multilingual-v1-el` | normalise (strip tonos/dialytika), character tokens | no | 0.00 | +0.20 |
+| Vietnamese | `multilingual-v1-vi` | normalise (strip tone marks) to ASCII syllables | no | 0.17 | +0.00 |
+| Thai | `multilingual-v1-th` | `newmm` words (nlpo3 + CC0 word list) | no | 0.92 | +0.00 |
+| Japanese | `multilingual-v1-ja` | `lindera` words | **yes** | 0.67* | +0.00* |
+| Korean | `multilingual-v1-ko` | `lindera` words | **yes** | 0.17* | +0.00* |
+| German | `multilingual-v1-de` | normalise (ß/ø/æ/... fold) + ASCII words | no | 0.92 | +0.00 |
+| French | `multilingual-v1-fr` | normalise (shared fold) + ASCII words | no | 0.50 | +0.00 |
+| Chinese | `sag2-zh-v1` | jieba 0.42.1 words (the reference pipeline) | no | 0.75 | +0.00 |
+| English | `sag2-zh-v1` | ASCII words (the reference pipeline) | no | 1.00 | +0.00 |
+
+The numbers are measured by `crates/sag2-core/tests/multilingual.rs` on the
+self-authored fixture in `crates/sag2-core/tests/data/multilingual.jsonl`
+(ten documents and ten labelled queries per language).  `word rate` is the
+share of the pack's content words that come out as exactly one token; the
+`Sag2ZhV1` baseline of every pack is pinned in the fixture as well, so the
+default path cannot move unnoticed.  `Phrase3 R@10 gain` is
+`recall@10(Phrase3) - recall@10(Lexical)` on the same pack.  Rows marked `*`
+are the **dictionary-free** fallback: CI has no ipadic/ko-dic, so those two
+packs are indexed through the reference pipeline there (character-level for
+Korean, the jieba stream for Japanese) and only the "not worse" assertion
+applies.
+
+What the table says, plainly: Thai, German, French, Chinese and English produce
+words (0.50-1.00); Vietnamese's normalisation turns its syllables into ASCII
+tokens, which is why it moves off the reference baseline (0.00 -> 0.17); and
+Russian, Arabic, Hindi, Greek and Korean still tokenise per character (0.00).
+For those five the *recall* gain comes from the query side - `Phrase3` keeps
+the characters adjacent instead of OR-ing them - and a word segmenter for them
+is still the plan's open batch (§5: stemming and segmentation for ru/ar/hi/el).  The "≥ 10 pts" figures in the plan's §1 are the
+PUD-scale measurements of the Python prototype; this fixture cannot reproduce
+corpus-scale ranking effects on ten documents, and the pinned gains above are
+what the port currently demonstrates on its own data.
+
+## Query modes
+
+`QueryMode` decides how the query becomes an FTS5 `MATCH` expression; the
+index is never touched.
+
+| mode | expression | notes |
+|---|---|---|
+| `Lexical` (default) | `"term" OR "term" ...`, the de-duplicated unigram `OR` (`sag2.py:95-97`) | byte-identical to the reference; every gate replays this |
+| `Phrase3` | whole-chunk phrases, then every three-token window, then the same unigrams as a fallback | query-side only; the 80-term budget reserves eight slots for the unigram fallback |
+
+`Phrase3` is what a character-level profile needs: without word boundaries the
+`OR` of single characters matches almost every chunk, while a three-character
+window has to exist.  The unigram fallback is not optional - exact phrases
+alone lose Korean recall (90.5% to 49.4% R@10 in the plan's measurements),
+because the character unigrams act as an accidental stemmer for the
+agglutinative particles.  On the fixture above Phrase3 never trails Lexical and
+lifts the character-level packs (ru +0.10, ar/el +0.20).
+
+Use it through the library (`SearchOptions::query_mode`,
+`CorpusIndex::match_query_with`) or the CLI (`--query-mode phrase3`).
+
+## SQLite integration modes
 
 `sag2-index` is the only crate that depends on `rusqlite`; the facade never
 exposes a `rusqlite` type. There are three integration modes:
@@ -162,6 +230,70 @@ exposes a `rusqlite` type. There are three integration modes:
    `rusqlite` 0.37 uses; no crate here declares `links = "sqlite3"`, and adding
    a second SQLite wrapper is unsupported.
 
+## Command line
+
+```sh
+sag2-cli build --input <jsonl|dir> --output <index> \
+               [--profile sag2-zh-v1|multilingual-v1-<lang>] [--dict-dir <path>] [--chunk-chars <n>]
+sag2-cli search --index <path> --query <text> \
+                [--query-mode lexical|phrase3] [--judge oracle] [--limit <n>] [--dict-dir <path>]
+```
+
+`build` takes either a JSONL file (one `{"title", "text", "path"?, "idx"?}`
+object per line) or a directory of UTF-8 files (title = file stem, `path` =
+relative path), and fingerprints the corpus: `sha256` of the file, or of the
+sorted `relpath\0sha256` list for a directory.  `--profile` defaults to
+`sag2-zh-v1`; the identifier is recorded in the index.  `search` opens the
+index **as the profile it records** and tokenises the query with that same
+pipeline.  Exit codes: `0` success, `3` a usage, build or open failure (the
+message is the typed error, never a panic).
+
+```
+$ cargo run --offline -q -p sag2-cli -- build \
+    --input corpus.jsonl --output demo.sqlite --profile multilingual-v1-de
+index:       demo.sqlite
+profile:     multilingual-v1-de
+fingerprint: d3e032288125e2d6ee3308b499699136d37a0313820766979198d7f8452eea0e
+documents:   2
+chunks:      2
+action:      Built
+
+$ cargo run --offline -q -p sag2-cli -- search --index demo.sqlite --query STRASSE
+index:      demo.sqlite
+profile:    multilingual-v1-de
+mode:       lexical
+expression: "strasse"
+judge:      none (BM25 retrieval only)
+hits:       1
+1	doc=1	score=-0.000001	Hafen
+
+$ cargo run --offline -q -p sag2-cli -- search --index demo.sqlite --query STRASSE --query-mode phrase3
+index:      demo.sqlite
+profile:    multilingual-v1-de
+mode:       phrase3
+expression: "strasse"
+judge:      none (BM25 retrieval only)
+hits:       1
+1	doc=1	score=-0.000001	Hafen
+```
+
+`corpus.jsonl` was:
+
+```json
+{"title":"Hafen","text":"Die Straße führt zum alten Hafen. Der Hafen ist ruhig am Morgen."}
+{"title":"Bibliothek","text":"Die Bibliothek öffnet um neun. Studenten lesen dort jeden Abend."}
+```
+
+`--judge oracle` runs the full SAG2 loop with the deterministic fixture judge
+(no network) and prints `jev`/`fusion` scores; omit it for BM25 retrieval only.
+A Japanese or Korean index needs its dictionary on both commands:
+
+```sh
+cargo build -p sag2-cli --features lindera
+SAG2_DICT_DIR=/path/to/ipadic cargo run -p sag2-cli --features lindera -- \
+    search --index ja.sqlite --query 東京
+```
+
 ## Workspace crates
 
 | crate | purpose |
@@ -171,7 +303,7 @@ exposes a `rusqlite` type. There are three integration modes:
 | `sag2-linktest` | independent downstream package proving the static archive links against `rusqlite`'s bundled SQLite 3.50.2 |
 | `sag2-index` | index access and construction: `metadata.signature`, the §3.4 open decision table, the Python schema/statistics/provenance build, cached statistics and `retrieve` with the reference pruning, LRU and epoch semantics |
 | `sag2` | library facade: `rank_dpp` (§9 R5 compensated sums), the judge payload builder, `search_sag2` (§1.3, §8) and the optional async wrappers |
-| `sag2-cli` | `verify --gate A\|B\|C\|D`: replay of the golden retrieve/search cases and the tokenizer/chunk/index gates |
+| `sag2-cli` | `verify --gate A\|B\|C\|D` (replay of the golden retrieve/search cases and the tokenizer/chunk/index gates), `build` (corpus to index) and `search` (query one index) |
 
 ```sh
 cargo build --workspace
@@ -181,7 +313,8 @@ cargo run -p sag2-linktest
 
 CI (`.github/workflows/ci.yml`) runs `fmt --check`, `clippy -D warnings`, the
 test suite on Linux/macOS/Windows, the `--no-default-features` build of every
-crate, and all four gates against the committed `golden/` fixtures.
+crate, the `multilingual` job (the fixture above plus the `lindera` build) and
+all four gates against the committed `golden/` fixtures.
 
 
 ## Gate A (design §1.1)

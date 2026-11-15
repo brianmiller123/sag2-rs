@@ -83,3 +83,23 @@ segments with the same list.
 The file is unmodified; any local edit changes every `multilingual-v1-th` token
 stream and invalidates the pinned segmentations in
 `crates/sag2-core/tests/thai_segmentation.rs`.
+
+# Test fixture: `tests/data/multilingual.jsonl`
+
+`multilingual.jsonl` is the multilingual recall fixture the T7 regression test
+reads (`crates/sag2-core/tests/multilingual.rs`). It is **self-authored**: every
+document, query and content word in it was written for this repository. No text
+is copied from UD, MIRACL, Tatoeba or any other corpus, so there is no
+third-party licence or attribution attached to it.
+
+| field | value |
+| --- | --- |
+| languages | `ru ar hi el vi th ja ko de fr zh en` (one JSON line each) |
+| per language | 10 documents (2-4 sentences), 10 labelled queries, 12 content words |
+| used for | word-rate targets, the pinned `Sag2ZhV1` baseline, and the Lexical-vs-Phrase3 R@10 comparison |
+
+The R@10 evaluation adds decoy documents derived deterministically from the
+fixture itself (its own token stream, rotated: words for the word-level
+profiles, characters for the character-level ones). The decoys are unlabelled
+negatives generated inside the test - they are not part of this file and are
+not a corpus.

@@ -31,11 +31,11 @@ pub use expand::{
     ExpansionError, ExpansionHit, ExpansionKind, ExpansionQuery, ExpansionTerm, Seed, Selected,
 };
 pub use open::{
-    decide, decide_with_dictionary, inspect, open, open_readonly, Decision, ExistingIndex,
-    IndexOptions, OpenAction, OpenError, OpenOutcome, RebuildPolicy, RebuildReason,
-    RuntimeVersions, ANALYSIS_DICT_KEY, ANALYSIS_DICT_NONE, FORMAT_VERSION, FORMAT_VERSION_STR,
-    JIEBA_DICT_SHA256, RUNTIME_VERSIONS, SAG_RANK_SHA256, SQLITE_VERSION, TOKENIZER_VERSION,
-    UCA_KEYS_SHA256, UCA_VERSION, UNICODE_VERSION,
+    decide, decide_with_dictionary, inspect, open, open_readonly, open_recorded, recorded_profile,
+    Decision, ExistingIndex, IndexOptions, OpenAction, OpenError, OpenOutcome, RebuildPolicy,
+    RebuildReason, RuntimeVersions, ANALYSIS_DICT_KEY, ANALYSIS_DICT_NONE, ANALYSIS_KEY,
+    FORMAT_VERSION, FORMAT_VERSION_STR, JIEBA_DICT_SHA256, RUNTIME_VERSIONS, SAG_RANK_SHA256,
+    SQLITE_VERSION, TOKENIZER_VERSION, UCA_KEYS_SHA256, UCA_VERSION, UNICODE_VERSION,
 };
 pub use pool::{register_rank, QueryOptions, QUERY_CACHE_ENTRIES, QUERY_WORKERS};
 pub use py312::sum as py312_sum;

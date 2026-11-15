@@ -48,6 +48,9 @@ pub const FORMAT_VERSION: i64 = 1;
 /// [`FORMAT_VERSION`] in the string form the provenance table stores.
 pub const FORMAT_VERSION_STR: &str = "1";
 
+/// The `rust_index_metadata` key that records the analysis profile.
+pub const ANALYSIS_KEY: &str = "analysis";
+
 /// The `rust_index_metadata` key that records the dictionary provenance.
 pub const ANALYSIS_DICT_KEY: &str = "analysis_dict";
 
@@ -275,6 +278,12 @@ pub enum OpenError {
     SourceDirUnsupported,
     /// The caller supplied no corpus, so a build decision is refused.
     BuildUnavailable,
+    /// `rust_index_metadata.analysis` names a profile this build cannot parse,
+    /// so the file cannot be opened as what it records.
+    UnknownAnalysisProfile {
+        /// The stored value.
+        value: String,
+    },
     /// Building from the corpus failed.
     Build(BuildError),
     /// The analysis pipeline could not be resolved: a dictionary profile has no
@@ -350,6 +359,11 @@ impl std::fmt::Display for OpenError {
             OpenError::SourceDirUnsupported => write!(
                 formatter,
                 "reading source_dir indexes needs the source tree; P0 reads materialised chunks"
+            ),
+            OpenError::UnknownAnalysisProfile { value } => write!(
+                formatter,
+                "index analysis profile {value:?} is not one this build knows; \
+                 rebuild the index with sag2-zh-v1 or multilingual-v1-<lang>"
             ),
             OpenError::BuildUnavailable => write!(
                 formatter,
@@ -804,6 +818,59 @@ pub fn open_readonly(
         options,
         &RUNTIME_VERSIONS,
     )
+}
+
+/// Open an existing index as the profile and dictionary it records.
+///
+/// This is the entry point for a caller that does not know how the file was
+/// built: the profile comes from `rust_index_metadata.analysis` (a row without
+/// the key is [`Profile::Sag2ZhV1`], and an unparseable one is
+/// [`OpenError::UnknownAnalysisProfile`]), and `dictionary_dir` resolves the
+/// runtime dictionary a Japanese or Korean index records.  The recorded
+/// provenance is still validated: the signature, the version keys, the profile
+/// and the dictionary fingerprint all have to agree.
+pub fn open_recorded(
+    path: &Path,
+    dictionary_dir: Option<&Path>,
+    options: QueryOptions,
+) -> Result<CorpusIndex, OpenError> {
+    let existing = inspect(path)?;
+    if !existing.file_exists {
+        return Err(OpenError::MissingDatabase(path.to_owned()));
+    }
+    let signature = existing
+        .signature
+        .clone()
+        .ok_or(OpenError::MissingSignature)?;
+    let profile = recorded_profile(&existing)?;
+    let dictionary = DictionaryAnalysis::resolve(profile, dictionary_dir)?.map(Arc::new);
+    open_readonly_with(
+        path,
+        &signature,
+        profile,
+        dictionary,
+        options,
+        &RUNTIME_VERSIONS,
+    )
+}
+
+/// The profile [`ExistingIndex`] records, without opening the file.
+///
+/// A file with no `analysis` row was built by the reference pipeline (or by
+/// this port before profiles existed), so it reads as [`Profile::Sag2ZhV1`].
+pub fn recorded_profile(existing: &ExistingIndex) -> Result<Profile, OpenError> {
+    let stored = existing
+        .rust_metadata
+        .as_ref()
+        .and_then(|metadata| metadata.get(ANALYSIS_KEY));
+    match stored {
+        None => Ok(Profile::Sag2ZhV1),
+        Some(value) => value
+            .parse::<Profile>()
+            .map_err(|_| OpenError::UnknownAnalysisProfile {
+                value: value.clone(),
+            }),
+    }
 }
 
 fn open_readonly_with(

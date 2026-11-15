@@ -1,6 +1,6 @@
 [package]
 name = "sag2-cli"
-description = "Command line entry points for the SAG2 port; P0 provides gate verification"
+description = "Command line entry points for the SAG2 port: gate verification, index build and search"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

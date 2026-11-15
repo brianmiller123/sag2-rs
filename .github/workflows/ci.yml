@@ -70,6 +70,23 @@ jobs:
           cargo build --locked -p sag2 --no-default-features
           cargo build --locked -p sag2 --no-default-features --features async
 
+  multilingual:
+    name: multilingual fixture
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # The fixture is self-authored and dictionary-free, so it runs anywhere:
+      # `cargo test --offline -p sag2-core --test multilingual -- --nocapture`
+      # is the local form once the dependencies are cached.
+      - name: multilingual fixture (word rate and R@10 table)
+        run: cargo test --locked -p sag2-core --test multilingual -- --nocapture
+      # Japanese/Korean segmentation needs its runtime dictionary at run time,
+      # but the feature itself must build with no dictionary present.
+      - name: lindera dictionary support builds
+        run: cargo build --locked -p sag2-core --features lindera
+
   gates:
     name: gates A-D (offline)
     runs-on: ubuntu-latest

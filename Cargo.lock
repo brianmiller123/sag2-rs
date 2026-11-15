@@ -1271,6 +1271,9 @@ dependencies = [
  "jieba-rs",
  "lindera",
  "nlpo3",
+ "sag2-index",
+ "serde",
+ "serde_json",
  "sha2",
  "tempfile",
 ]
