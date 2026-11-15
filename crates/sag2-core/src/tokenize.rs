@@ -144,9 +144,9 @@ fn class(character: char) -> Class {
 /// in several script families, not only the Indic ones (ccc 9 also in Thai,
 /// Lao, Tibetan, Myanmar, Khmer, Sinhala, Balinese and Sundanese; ccc 7 also in
 /// Myanmar, Balinese, Batak, Javanese and Adlam), which is why the rule is a
-/// class rule and why the word set it changes is pipeline-wide: the `ml-2` bump
-/// applies to every `multilingual-v1-<lang>` profile, not only `-hi`, because
-/// the version names the pipeline rather than the language.
+/// class rule and why the word set it changes is pipeline-wide: the bump that
+/// introduced it applies to every `multilingual-v1-<lang>` profile, not only
+/// `-hi`, because the revision names the pipeline rather than the language.
 fn is_word_character(character: char) -> bool {
     let cp = character as u32;
     if unicode::is_number(cp) {
@@ -225,10 +225,14 @@ pub(crate) fn tokenize_multilingual(
     normalised: &str,
     original: &str,
 ) -> Vec<String> {
-    // The paired spelling is the pre-fold word run.  That pairing is exact:
-    // `fold_script`'s maps rewrite letters as letters and never create or
-    // delete a boundary, and `normalised` and `accented` are both built from
-    // the same `lower(nfkc(original))`, so they have the same segments.
+    // The paired spelling is the pre-fold word run, and it is read only for
+    // German: `fold_german` rewrites letters as letters and never creates or
+    // deletes a boundary, so `normalised` and `accented` - both built from the
+    // same `lower(nfkc(original))` - have the same segments.  The other
+    // language rules are not boundary-neutral (Ukrainian's apostrophe turns a
+    // separator into a word character, Turkish deletes a mark), which is why
+    // the pairing stays scoped to the German rule: no other profile reads a
+    // variant, and the `debug_assert!` below fails closed if one ever does.
     //
     // The deaccented spelling is derived from each paired run instead of being
     // read from a re-segmented deaccented text: `strip_marks` deletes combining

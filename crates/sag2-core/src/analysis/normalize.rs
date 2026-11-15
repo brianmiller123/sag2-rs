@@ -38,7 +38,8 @@ pub fn normalize(language: Language, text: &str) -> String {
 /// | [`Language::Uk`] | `U+0027` and `U+2019` → `U+02BC`, so `м'ясо`, `м’ясо` and `мʼясо` are one word |
 /// | other languages | no further rule |
 ///
-/// The last four rules are the ones `unicode61` cannot supply.  It removes
+/// The [`Language::Tr`], [`Language::Mt`], [`Language::Bg`] and [`Language::Uk`]
+/// rules are the ones `unicode61` cannot supply.  It removes
 /// combining diacritics (`ř`, `ő`, `ș` and `ġ` all fold to their base letter),
 /// so the Latin-script profiles need no rule of their own, but it has no entry
 /// for `ħ` (a letter with stroke, not a decomposed mark) and no Cyrillic table
@@ -160,9 +161,12 @@ fn fold_arabic(text: &str) -> String {
 /// makes [`crate::tokenize`]'s word set end the run, so the word used to be
 /// stored as `i` and `stanbul`.  Mapping the capital first means the mark is
 /// never produced; the filter is left to remove a mark that arrived
-/// decomposed.  `NFKC` composes `I` + U+0307 back into `İ`, so the only U+0307
-/// a caller can deliver to this function is the lowercase residue.  `ı→i` is
-/// the shared Latin fold's rule and has already run.
+/// decomposed.  `NFKC` composes `I` + U+0307 back into `İ`, so a capital dot
+/// cannot reach this function on its own: every other U+0307 here is a mark the
+/// input spelled separately from its base letter - the lowercase residue of
+/// `İ`, or a letter such as `q̇` - and dropping it is the same lossy trade the
+/// shared fold makes for `ø` and `đ`.  `ı→i` is the shared Latin fold's rule
+/// and has already run.
 fn fold_turkish(text: &str) -> String {
     let mut folded = String::with_capacity(text.len());
     for character in text.chars() {

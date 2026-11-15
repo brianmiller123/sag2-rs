@@ -202,12 +202,14 @@ an index always reads back through the pipeline that built it.
 | Maltese | `multilingual-v1-mt` | normalise (`ħ`→`h`) + word runs | 1.00 | +0.00 | measured |
 | Bulgarian | `multilingual-v1-bg` | normalise (`ѝ`→`и`) + word runs | 1.00 | +0.00 | measured |
 | Ukrainian | `multilingual-v1-uk` | normalise (`'`/`’`→`U+02BC`) + word runs | 1.00 | +0.00 | measured |
+| Hebrew | `multilingual-v1-he` | normalise (shared fold) + word runs | - | - | no fixture pack |
 | Chinese | `sag2-zh-v1` | jieba 0.42.1 words (the reference pipeline) | 0.75 | +0.00 | measured |
 | English | `sag2-zh-v1` | ASCII words (the reference pipeline) | 1.00 | +0.00 | measured |
 
 The numbers are measured by `crates/sag2-core/tests/multilingual.rs` on the
 self-authored fixture in `crates/sag2-core/tests/data/multilingual.jsonl`
-(thirty packs, ten documents and ten labelled queries each).  `word rate` is
+(thirty packs, ten documents and at least ten labelled queries each).
+`word rate` is
 the share of the pack's content words that survive as one whole token: a
 multilingual profile emits a run's code points *and* the run, so "exactly one
 token in the stream" would score a correctly segmented `bibliothèque` as a
@@ -259,11 +261,12 @@ Four profiles need a fold of their own, because FTS5 cannot supply it:
   apostrophe is a word boundary (`l'amore` is an article and a noun), and
   folding it there would glue two words into one term.
 
-Those rules change the token stream of the four profiles, so the multilingual
-pipeline revision is `ml-3`.  The value names the pipeline, not the language, so
-every `multilingual-v1-<lang>` index records it; an `ml-2` index is stale by
-definition and `check_analysis_version` makes it rebuild rather than read it
-with a normaliser that did not produce its tokens.
+The normaliser changed, so the multilingual pipeline revision is `ml-3`.  The
+value names the pipeline, not the language: every `multilingual-v1-<lang>` index
+records it, so the bump rebuilds every `ml-2` index once - including the
+profiles whose own token stream is unchanged - rather than reading it with a
+normaliser that did not produce its tokens.  A new profile identifier alone
+never needs a bump; only a change that can move a stored token stream does.
 
 The `state` column is what the fixture asserts:
 
@@ -279,10 +282,18 @@ The `state` column is what the fixture asserts:
   and CI has none, so there is nothing to measure offline.  It returns
   `AnalysisError::DictionaryMissing` instead of a character-level stream, which
   is asserted for every content word.
+* **no fixture pack** - `he` has a registered profile
+  (`multilingual-v1-he`: the shared fold and the word-run policy, no language
+  rule) but no pack in this fixture yet, so its row states the registration, not
+  a measurement.
 
 `Phrase3 R@10 gain` is `recall@10(Phrase3) - recall@10(Lexical)` on the same
-pack; it never trails Lexical in any pack.  Both modes now reach 1.000 on every
-pack, so the fixture no longer separates them: Lexical used to trail on the
+pack; it never trails Lexical in any pack.  The fixture also pins Lexical
+R@10 = 1.000: every labelled query must retrieve its document, which is what
+makes a normaliser rule observable - the word-rate check normalises the word it
+compares, so an in-word substitution cancels out there, while a query is the
+other spelling of the corpus word.  Both modes reach 1.000 on every pack, so the
+fixture does not separate them: Lexical used to trail on the
 character-level packs (ru 0.90, ar/el 0.80) because an `OR` of single
 characters retrieves the word-salad decoys as readily as the document, and the
 word token L1 adds outranks them.  `Phrase3`'s advantage is still the PUD-scale

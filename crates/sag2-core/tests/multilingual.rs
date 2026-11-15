@@ -1,9 +1,10 @@
 //! The multilingual recall fixture: word-rate and R@10 per language.
 //!
 //! `tests/data/multilingual.jsonl` holds thirty self-authored language
-//! packs (ten documents, ten labelled queries each).  Nothing in it is copied
-//! from UD, MIRACL or any other third-party corpus, so the numbers here are a
-//! regression net rather than a benchmark of those corpora — see the plan's §7.
+//! packs (ten documents and at least ten labelled queries each).  Nothing in
+//! it is copied from UD, MIRACL or any other third-party corpus, so the
+//! numbers here are a regression net rather than a benchmark of those
+//! corpora — see the plan's §7.
 //!
 //! Every pack is in exactly one state, and the fixture says which:
 //!
@@ -32,9 +33,20 @@
 //!    reach the pack's `target_word_rate`; `Profile::Sag2ZhV1` is pinned to its
 //!    recorded `baseline_word_rate`, so the default path cannot move unnoticed.
 //! 2. **R@10** - the pack's ten documents are indexed in a temporary
-//!    directory and its ten queries are replayed in [`QueryMode::Lexical`] and
-//!    [`QueryMode::Phrase3`].  Phrase3 must not trail Lexical, and the packs
-//!    that ask for a gain (`target_query_gain`) must clear it.
+//!    directory and its queries are replayed in [`QueryMode::Lexical`] and
+//!    [`QueryMode::Phrase3`].  Every labelled query must retrieve its document
+//!    in Lexical mode (R@10 = 1.000); that pin is what makes a language rule
+//!    observable, because [`word_level`] compares a word against its own
+//!    normalisation and a letter substitution cancels out there, while the
+//!    query spelling has to reach the stored one.  Phrase3 must not trail
+//!    Lexical, and the packs that ask for a gain (`target_query_gain`) must
+//!    clear it.
+//!
+//! 3. **fold pairs** - the spellings a language rule must collapse (`ѝ`/`и`,
+//!    `Ħal`/`hal`, `İstanbul`/`istanbul`, the three Ukrainian apostrophes) are
+//!    declared by the pack and must normalise and tokenise alike.  The rates
+//!    cannot see an in-word substitution, so this is the check that fails when
+//!    a rule is deleted.
 //!
 //! The packs are tiny, so the index is built with a sentence-sized
 //! [`CHUNK_CHARS`] and a top-10 cut over the resulting chunks; with ten
@@ -108,9 +120,25 @@ struct Pack {
     /// whose queries are evaluated, `None` for the dictionary packs.
     #[serde(default)]
     target_query_gain: Option<f64>,
+    /// Spellings the profile's language rule must fold onto one token stream.
+    ///
+    /// The rates cannot see a pure in-word letter substitution: `word_level`
+    /// normalises the word it compares (`ѝ` and `и` are each whole runs), and
+    /// the corpus's code-point tokens make a cross-spelling query match anyway.
+    /// The pack therefore states the pairs its rule owns and
+    /// `the_declared_fold_pairs_reach_one_token_stream` asserts them directly.
+    #[serde(default)]
+    fold_pairs: Vec<FoldPair>,
     content_words: Vec<String>,
     docs: Vec<PackDocument>,
     queries: Vec<PackQuery>,
+}
+
+/// One `(from, to)` spelling pair a language rule must collapse.
+#[derive(Debug, Deserialize)]
+struct FoldPair {
+    from: String,
+    to: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -332,7 +360,11 @@ fn the_fixture_covers_thirty_languages_in_three_states() {
     );
     for pack in &packs {
         assert_eq!(pack.docs.len(), 10, "{}: ten documents", pack.lang);
-        assert_eq!(pack.queries.len(), 10, "{}: ten queries", pack.lang);
+        assert!(
+            pack.queries.len() >= 10,
+            "{}: at least ten labelled queries",
+            pack.lang
+        );
         assert!(
             pack.content_words.len() >= 10,
             "{}: at least ten content words",
@@ -437,6 +469,42 @@ fn a_dictionary_profile_refuses_the_character_fallback() {
 }
 
 #[test]
+fn the_declared_fold_pairs_reach_one_token_stream() {
+    // A letter substitution inside a word is invisible to `word_level`, and
+    // the code-point tokens every non-ASCII run emits make a cross-spelling
+    // query match either way, so the rule's own contract is asserted here: the
+    // two spellings the pack declares must normalise alike and tokenise alike.
+    // Deleting a language rule fails this test.
+    let mut checked = 0;
+    for pack in &packs() {
+        let Profile::Multilingual { language } = profile(pack) else {
+            continue;
+        };
+        let profile = Profile::Multilingual { language };
+        for pair in &pack.fold_pairs {
+            checked += 1;
+            assert_eq!(
+                normalize(language, &pair.from),
+                normalize(language, &pair.to),
+                "{}: {:?} and {:?} must normalise alike",
+                pack.lang,
+                pair.from,
+                pair.to
+            );
+            assert_eq!(
+                tokenize_with(profile, &pair.from).expect("a dictionary-free profile tokenises"),
+                tokenize_with(profile, &pair.to).expect("a dictionary-free profile tokenises"),
+                "{}: {:?} and {:?} must reach one token stream",
+                pack.lang,
+                pair.from,
+                pair.to
+            );
+        }
+    }
+    assert_eq!(checked, 8, "every rule-bearing pack declares its pairs");
+}
+
+#[test]
 fn word_rates_meet_the_targets_and_the_baseline_is_pinned() {
     let mut table = String::from(
         "\nlanguage  profile                 words  hits  rate    target  baseline  state\n",
@@ -498,7 +566,7 @@ fn word_rates_meet_the_targets_and_the_baseline_is_pinned() {
 }
 
 #[test]
-fn phrase3_recall_clears_every_target() {
+fn recall_meets_every_target() {
     let directory = tempfile::tempdir().expect("temp dir");
     let mut table = String::from(
         "\nlanguage  profile                 chunks  lexical  phrase3  gain    target\n",
@@ -534,6 +602,18 @@ fn phrase3_recall_clears_every_target() {
                 pack.lang,
                 describe(&lexical_outcomes),
                 describe(&phrase_outcomes)
+            ));
+        }
+        // A labelled query has to retrieve its document.  This is the pin that
+        // makes a normaliser rule observable: `word_level` normalises the word
+        // it compares, so an in-word substitution (`ħ→h`, `ѝ→и`) cancels out
+        // on both sides, while a query is the other spelling of the corpus
+        // word and only reaches it when the rule ran at build time.
+        if lexical + EPSILON < 1.0 {
+            failures.push(format!(
+                "{}: a labelled query misses its document (Lexical R@10 {lexical:.3})\n{}",
+                pack.lang,
+                describe(&lexical_outcomes)
             ));
         }
         if gain + EPSILON < target {
