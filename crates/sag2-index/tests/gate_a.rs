@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 use sag2_index::{
-    open, open_readonly, IndexOptions, OpenError, Profile, QueryOptions, RebuildPolicy,
+    open, open_readonly, IndexOptions, Language, OpenError, Profile, QueryOptions, RebuildPolicy,
     CHUNK_POLICY, INDEX_SCHEMA,
 };
 
@@ -78,14 +78,21 @@ fn a_python_built_fixture_reads_only_as_the_reference_profile() {
     let error = open_readonly(
         &fixture_path("C0"),
         &signature_of("C0"),
-        Profile::MultilingualV1,
+        Profile::Multilingual {
+            language: Language::De,
+        },
         QueryOptions::default(),
     )
     .expect_err("must refuse");
     match error {
         OpenError::AnalysisMismatch { index, expected } => {
             assert_eq!(index, None);
-            assert_eq!(expected, Profile::MultilingualV1);
+            assert_eq!(
+                expected,
+                Profile::Multilingual {
+                    language: Language::De
+                }
+            );
         }
         other => panic!("unexpected error: {other}"),
     }

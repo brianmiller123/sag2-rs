@@ -1,0 +1,125 @@
+//! Profile normalisation: the steps a multilingual profile runs before the §4
+//! tokenizer.
+//!
+//! The order is fixed and [`normalize`] is its only entry point:
+//!
+//! 1. `NFKC`,
+//! 2. [`fold_script`] - the shared Latin fold plus the language rules,
+//! 3. lower (the Final_Sigma-aware table the tokenizer already certifies).
+//!
+//! The fold is deliberately lossy: it trades orthographic detail for recall, so
+//! `Straße`, `STRASSE` and `strasse` all reach one term.  Index building and
+//! every query-side call go through the same function, which is why a stored
+//! token and a query token can never be normalised by different rules.
+//!
+//! [`crate::Profile::Sag2ZhV1`] never enters this module.
+
+use crate::unicode::{combining_class, lower, nfd, nfkc};
+
+use super::Language;
+
+/// `NFKC -> fold_script -> lower` for `language`.
+pub fn normalize(language: Language, text: &str) -> String {
+    lower(&fold_script(language, &nfkc(text)))
+}
+
+/// The script fold of [`normalize`]: the shared Latin replacements plus the
+/// language-specific rules.
+///
+/// | scope | rule |
+/// |---|---|
+/// | every language | `ß→ss æ→ae œ→oe ø→o ł→l đ→d ð→d þ→th ı→i ſ→s` (both cases) |
+/// | [`Language::El`], [`Language::Vi`] | `NFD`, drop every combining mark, `NFKC` |
+/// | [`Language::Ar`] | `أإآٱ→ا`, `ى→ي`, `ؤ→و`, `ئ→ي`; delete `U+0640` and `U+064B–U+0652`; `ة` is kept |
+/// | other languages | no further rule |
+///
+/// Dropping *every* combining mark is what the Greek and Vietnamese profiles
+/// ask for: NFD cannot tell a tonos from a circumflex, so `ế` and `e` collapse
+/// together as well as `ά` and `α`.
+pub fn fold_script(language: Language, text: &str) -> String {
+    let folded = fold_latin(text);
+    match language {
+        Language::El | Language::Vi => nfkc(&strip_marks(&nfd(&folded))),
+        Language::Ar => fold_arabic(&folded),
+        _ => folded,
+    }
+}
+
+/// The shared Latin fold, including the uppercase spellings so the result does
+/// not depend on the later `lower` step.
+fn fold_latin(text: &str) -> String {
+    let mut folded = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            'ß' | 'ẞ' => folded.push_str("ss"),
+            'æ' | 'Æ' => folded.push_str("ae"),
+            'œ' | 'Œ' => folded.push_str("oe"),
+            'ø' | 'Ø' => folded.push('o'),
+            'ł' | 'Ł' => folded.push('l'),
+            'đ' | 'Đ' => folded.push('d'),
+            'ð' | 'Ð' => folded.push('d'),
+            'þ' | 'Þ' => folded.push_str("th"),
+            'ı' => folded.push('i'),
+            'ſ' => folded.push('s'),
+            other => folded.push(other),
+        }
+    }
+    folded
+}
+
+/// Drop every code point with a non-zero canonical combining class.
+fn strip_marks(text: &str) -> String {
+    text.chars()
+        .filter(|character| combining_class(*character as u32) == 0)
+        .collect()
+}
+
+/// The Arabic orthography rules: hamza carriers, alef maksura and tatweel.
+fn fold_arabic(text: &str) -> String {
+    let mut folded = String::with_capacity(text.len());
+    for character in text.chars() {
+        match character {
+            // `أ` `إ` `آ` `ٱ` -> `ا`.
+            '\u{0623}' | '\u{0625}' | '\u{0622}' | '\u{0671}' => folded.push('\u{0627}'),
+            // `ى` and `ئ` -> `ي`.
+            '\u{0649}' | '\u{0626}' => folded.push('\u{064A}'),
+            // `ؤ` -> `و`.
+            '\u{0624}' => folded.push('\u{0648}'),
+            // Tatweel and the harakat (U+064B..U+0652) are deleted; `ة` stays.
+            '\u{0640}' => {}
+            '\u{064B}'..='\u{0652}' => {}
+            other => folded.push(other),
+        }
+    }
+    folded
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fold_script, normalize};
+    use crate::analysis::Language;
+
+    #[test]
+    fn nfkc_runs_before_the_fold() {
+        // The `œ` ligature is itself the fold target; `ﬁ` is NFKC's business.
+        assert_eq!(normalize(Language::De, "ﬁ"), "fi");
+        assert_eq!(normalize(Language::De, "①"), "1");
+    }
+
+    #[test]
+    fn the_latin_fold_applies_to_every_language() {
+        for language in [Language::De, Language::Ru, Language::Ja, Language::Other] {
+            // `fold_script` runs before `lower`, so the case is still there.
+            assert_eq!(
+                fold_script(language, "Ærøskøbing Straße œuvre"),
+                "aeroskobing Strasse oeuvre"
+            );
+        }
+    }
+
+    #[test]
+    fn empty_text_stays_empty() {
+        assert_eq!(normalize(Language::El, ""), "");
+        assert_eq!(fold_script(Language::Ar, ""), "");
+    }
+}

@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 
-use sag2_core::{Profile, DEFAULT_CHUNK_CHARS};
+use sag2_core::{analysis::REMOVED_MULTILINGUAL_V1, Language, Profile, DEFAULT_CHUNK_CHARS};
 
 use crate::build::{self, BuildError, Document};
 use crate::pool::{QueryOptions, QueryPool};
@@ -292,6 +292,12 @@ impl std::fmt::Display for OpenError {
                 "index {field} {index} is incompatible with runtime {runtime}"
             ),
             OpenError::AnalysisMismatch { index, expected } => match index {
+                Some(found) if found == REMOVED_MULTILINGUAL_V1 => write!(
+                    formatter,
+                    "index analysis profile {found} is the removed language-less profile; \
+                     rebuild the index with a language profile (for example {})",
+                    Profile::Multilingual { language: Language::Ja }
+                ),
                 Some(found) => write!(
                     formatter,
                     "index analysis profile {found} cannot be read as {expected}"
@@ -710,8 +716,12 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::{
-        decide, Decision, ExistingIndex, OpenError, Profile, RebuildPolicy, RebuildReason,
-        RuntimeVersions, FORMAT_VERSION, RUNTIME_VERSIONS,
+        decide, Decision, ExistingIndex, Language, OpenError, Profile, RebuildPolicy,
+        RebuildReason, RuntimeVersions, FORMAT_VERSION, REMOVED_MULTILINGUAL_V1, RUNTIME_VERSIONS,
+    };
+
+    const MULTILINGUAL: Profile = Profile::Multilingual {
+        language: Language::Ja,
     };
 
     const EXPECTED: &str =
@@ -1038,16 +1048,10 @@ mod tests {
             RebuildPolicy::OnCorpusChange,
             RebuildPolicy::Always,
         ] {
-            match rejection(decide(
-                policy,
-                &rust,
-                EXPECTED,
-                &RUNTIME,
-                Profile::MultilingualV1,
-            )) {
+            match rejection(decide(policy, &rust, EXPECTED, &RUNTIME, MULTILINGUAL)) {
                 OpenError::AnalysisMismatch { index, expected } => {
                     assert_eq!(index.as_deref(), Some("sag2-zh-v1"));
-                    assert_eq!(expected, Profile::MultilingualV1);
+                    assert_eq!(expected, MULTILINGUAL);
                 }
                 other => panic!("{policy:?} must refuse, got {other:?}"),
             }
@@ -1057,14 +1061,14 @@ mod tests {
     #[test]
     fn a_multilingual_index_is_reused_only_under_its_own_profile() {
         let mut metadata = current_metadata();
-        metadata.insert("analysis".to_owned(), "multilingual-v1".to_owned());
+        metadata.insert("analysis".to_owned(), "multilingual-v1-ja".to_owned());
         let rust = existing(Some(EXPECTED), Some(metadata));
         is_reuse(decide(
             RebuildPolicy::Strict,
             &rust,
             EXPECTED,
             &RUNTIME,
-            Profile::MultilingualV1,
+            MULTILINGUAL,
         ));
         assert!(matches!(
             rejection(decide(
@@ -1095,11 +1099,11 @@ mod tests {
             &rust,
             EXPECTED,
             &RUNTIME,
-            Profile::MultilingualV1,
+            MULTILINGUAL,
         )) {
             OpenError::AnalysisMismatch { index, expected } => {
                 assert_eq!(index, None);
-                assert_eq!(expected, Profile::MultilingualV1);
+                assert_eq!(expected, MULTILINGUAL);
             }
             other => panic!("unexpected {other}"),
         }
@@ -1121,10 +1125,37 @@ mod tests {
                 &python,
                 EXPECTED,
                 &RUNTIME,
-                Profile::MultilingualV1
+                MULTILINGUAL
             )),
             OpenError::AnalysisMismatch { index: None, .. }
         ));
+    }
+
+    #[test]
+    fn the_removed_language_less_profile_is_never_mapped() {
+        let mut metadata = current_metadata();
+        metadata.insert("analysis".to_owned(), REMOVED_MULTILINGUAL_V1.to_owned());
+        let rust = existing(Some(EXPECTED), Some(metadata));
+        for profile in [Profile::Sag2ZhV1, MULTILINGUAL] {
+            for policy in [
+                RebuildPolicy::Strict,
+                RebuildPolicy::OnCorpusChange,
+                RebuildPolicy::Always,
+            ] {
+                let error = rejection(decide(policy, &rust, EXPECTED, &RUNTIME, profile));
+                match &error {
+                    OpenError::AnalysisMismatch { index, .. } => {
+                        assert_eq!(index.as_deref(), Some(REMOVED_MULTILINGUAL_V1))
+                    }
+                    other => panic!("unexpected {other}"),
+                }
+                let message = error.to_string();
+                assert!(
+                    message.contains("rebuild the index with a language profile"),
+                    "{message}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1137,16 +1168,10 @@ mod tests {
             RebuildPolicy::OnCorpusChange,
             RebuildPolicy::Always,
         ] {
-            match rejection(decide(
-                policy,
-                &changed,
-                EXPECTED,
-                &RUNTIME,
-                Profile::MultilingualV1,
-            )) {
+            match rejection(decide(policy, &changed, EXPECTED, &RUNTIME, MULTILINGUAL)) {
                 OpenError::AnalysisMismatch { index, expected } => {
                     assert_eq!(index.as_deref(), Some(Profile::Sag2ZhV1.as_str()));
-                    assert_eq!(expected, Profile::MultilingualV1);
+                    assert_eq!(expected, MULTILINGUAL);
                 }
                 other => panic!("{policy:?} must refuse by profile, got {other:?}"),
             }
@@ -1182,7 +1207,7 @@ mod tests {
         let mut metadata = current_metadata();
         metadata.insert("analysis".to_owned(), "sag2-zh-v0".to_owned());
         let rust = existing(Some(EXPECTED), Some(metadata));
-        for profile in [Profile::Sag2ZhV1, Profile::MultilingualV1] {
+        for profile in [Profile::Sag2ZhV1, MULTILINGUAL] {
             match rejection(decide(
                 RebuildPolicy::Always,
                 &rust,

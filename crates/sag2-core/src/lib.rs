@@ -21,7 +21,7 @@ mod query;
 mod tokenize;
 mod unicode;
 
-pub use analysis::{tokenize_with, Profile, UnknownProfile};
+pub use analysis::{tokenize_with, Language, Profile, UnknownProfile};
 pub use chunk::{chunk_document, source_content, utf16_length, Chunk, DEFAULT_CHUNK_CHARS};
 pub use collate::sort_key;
 pub use dict::{

@@ -676,10 +676,15 @@ fn py_strip(text: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use rusqlite::Connection;
+    use sag2_core::Language;
 
     use super::*;
     use crate::open::{IndexOptions, RebuildPolicy, RUNTIME_VERSIONS};
     use crate::{CorpusIndex, OpenAction, OpenError, QueryOptions};
+
+    const MULTILINGUAL: Profile = Profile::Multilingual {
+        language: Language::Ja,
+    };
 
     fn materialised(chunk_chars: usize) -> IndexOptions {
         IndexOptions {
@@ -815,7 +820,7 @@ mod tests {
             idx: None,
         }];
         let mut options = materialised(2200);
-        options.profile = Profile::MultilingualV1;
+        options.profile = MULTILINGUAL;
         CorpusIndex::open(&path, &corpus, "fixture", options.clone()).expect("build");
 
         let db = Connection::open(&path).expect("open");
@@ -827,7 +832,7 @@ mod tests {
             )
             .expect("analysis row");
         drop(db);
-        assert_eq!(recorded, Profile::MultilingualV1.as_str());
+        assert_eq!(recorded, MULTILINGUAL.as_str());
 
         // Same corpus, same signature, other profile: refused, never rebuilt.
         let mut reference = options.clone();
@@ -835,7 +840,7 @@ mod tests {
         reference.rebuild = RebuildPolicy::Strict;
         match CorpusIndex::open(&path, &corpus, "fixture", reference.clone()) {
             Err(OpenError::AnalysisMismatch { index, expected }) => {
-                assert_eq!(index.as_deref(), Some(Profile::MultilingualV1.as_str()));
+                assert_eq!(index.as_deref(), Some(MULTILINGUAL.as_str()));
                 assert_eq!(expected, Profile::Sag2ZhV1);
             }
             other => panic!("the reader must refuse, got {other:?}"),
@@ -852,13 +857,9 @@ mod tests {
             ),
             Err(OpenError::AnalysisMismatch { .. })
         ));
-        assert!(crate::open_readonly(
-            &path,
-            &signature,
-            Profile::MultilingualV1,
-            QueryOptions::default()
-        )
-        .is_ok());
+        assert!(
+            crate::open_readonly(&path, &signature, MULTILINGUAL, QueryOptions::default()).is_ok()
+        );
 
         // A row without the key predates profiles and reads as Sag2ZhV1.
         let db = Connection::open(&path).expect("open");
