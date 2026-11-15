@@ -356,13 +356,15 @@ fn emit_segment(segment: &str, kind: Segment, variant: Option<&str>, out: &mut V
 
 /// Whether `word` carries a character the German fold rewrites.
 ///
-/// `ä/ö/ü` expand into two letters, so the transliteration and the deaccented
-/// spelling differ and both are emitted.  `ß/ẞ` also trigger the emission, but
-/// the shared Latin fold already maps them to `ss` on both sides, so their two
-/// spellings are the same string and only one token results.
+/// `word` is a word run of the profile's `lower(nfkc(text))` spelling, so only
+/// the lowercase forms can occur (`ẞ` has already become `ß`).  `ä/ö/ü` expand
+/// into two letters, so the transliteration and the deaccented spelling differ
+/// and both are emitted.  `ß` also triggers the emission, but the shared Latin
+/// fold maps it to `ss` on both sides, so its two spellings are the same string
+/// and only one token results.
 fn has_german_umlaut(word: &str) -> bool {
     word.chars()
-        .any(|character| matches!(character, 'ä' | 'ö' | 'ü' | 'ß' | 'Ä' | 'Ö' | 'Ü' | 'ẞ'))
+        .any(|character| matches!(character, 'ä' | 'ö' | 'ü' | 'ß'))
 }
 
 /// Rules 3-5 and the final filter, over the words a splitter produced.

@@ -574,9 +574,9 @@ fn load_statistics(
 /// index records none of them (ten rows), because an absent `analysis` row reads
 /// back as `sag2-zh-v1` and an absent `analysis_dict` row as `none` (see
 /// [`crate::recorded_profile`]).  A dictionary-free multilingual profile records
-/// `analysis` and `analysis_version` (eleven rows), and a dictionary-backed one
-/// adds `analysis_dict` (twelve).  That keeps a default index at exactly the key
-/// set Gate D certifies.
+/// `analysis` and `analysis_version` (twelve rows), and a dictionary-backed one
+/// adds `analysis_dict` (thirteen).  That keeps a default index at exactly the
+/// key set Gate D certifies.
 fn write_rust_metadata(
     tx: &Transaction<'_>,
     versions: &RuntimeVersions,
