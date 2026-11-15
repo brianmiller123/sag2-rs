@@ -7,7 +7,7 @@
 //! lower, and the tables below give its output after `lower`.
 
 use sag2_core::analysis::normalize::{fold_script, normalize};
-use sag2_core::{tokenize, tokenize_with, Language, Profile};
+use sag2_core::{nfd, tokenize, tokenize_with, Language, Profile};
 
 /// [`tokenize_with`] for a profile that never needs a dictionary; the tests
 /// below all use one, so the typed error is a test failure here.
@@ -334,6 +334,30 @@ fn vietnamese_keeps_the_tone_marks() {
     assert_eq!(normalize(Language::Vi, "trường"), "trường");
     assert_ne!(normalize(Language::Vi, "ma"), normalize(Language::Vi, "má"));
     assert_ne!(normalize(Language::Vi, "má"), normalize(Language::Vi, "mà"));
+}
+
+#[test]
+fn vietnamese_is_canonical_invariant() {
+    // Keeping the marks means the composed and decomposed spellings have to
+    // reach the same token stream on their own: NFKC composes the NFD input, so
+    // no mark-dropping step is left to hide a difference.
+    let profile = Profile::Multilingual {
+        language: Language::Vi,
+    };
+    for text in ["trường", "Hà Nội", "Đà Nẵng", "Việt Nam"] {
+        let decomposed = nfd(text);
+        assert_ne!(decomposed, text, "{text:?} has a decomposed spelling");
+        assert_eq!(
+            normalize(Language::Vi, &decomposed),
+            normalize(Language::Vi, text),
+            "{text:?}"
+        );
+        assert_eq!(
+            tokens(profile, &decomposed),
+            tokens(profile, text),
+            "{text:?}"
+        );
+    }
 }
 
 #[test]

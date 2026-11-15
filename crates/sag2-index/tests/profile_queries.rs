@@ -6,7 +6,7 @@
 //! orthographic variants, so a query reaches the tokens the build stored.
 
 use sag2_core::analysis::normalize::normalize;
-use sag2_core::{match_query, match_query_with, Language, Profile, QueryMode};
+use sag2_core::{match_query, match_query_with, nfd, Language, Profile, QueryMode};
 use sag2_index::{
     open_readonly, CorpusIndex, Document, IndexOptions, OpenError, QueryOptions, RebuildPolicy,
     Seed,
@@ -41,7 +41,7 @@ fn build(profile: Profile) -> (tempfile::TempDir, CorpusIndex) {
 
 fn build_documents(
     profile: Profile,
-    documents: &[Document<'static>],
+    documents: &[Document<'_>],
 ) -> (tempfile::TempDir, CorpusIndex) {
     let directory = tempfile::tempdir().expect("temp dir");
     let path = directory.path().join("index.sqlite");
@@ -321,4 +321,26 @@ fn vietnamese_keeps_its_diacritics_and_answers_a_diacritic_free_query() {
             "{query:?} must reach the document through {expression:?}"
         );
     }
+
+    // The same document stored decomposed answers the composed query: the fold
+    // composes NFD input via NFKC, so the two spellings are one token stream and
+    // the marks the fold used to strip are not what makes them agree.
+    let decomposed = nfd("Trường đại học ở Hà Nội mở cửa sớm.");
+    let documents = [Document {
+        title: "Trường",
+        text: &decomposed,
+        path: None,
+        idx: None,
+    }];
+    let (_directory, index) = build_documents(VIETNAMESE, &documents);
+    let expression = index
+        .match_query_with(QueryMode::Lexical, "trường đại học")
+        .expect("expression");
+    let hits = index
+        .retrieve(&expression, &Default::default(), 10, None)
+        .expect("retrieve");
+    assert!(
+        hits.iter().any(|hit| hit.title == "Trường"),
+        "the NFC query must reach the NFD document through {expression:?}"
+    );
 }

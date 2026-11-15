@@ -137,19 +137,23 @@ fn class(character: char) -> Class {
 /// to reach [`emit_block`] one code point at a time.  This set keeps a word
 /// together in every script, and it is built from the pinned Unicode 15.0.0
 /// tables of [`crate::unicode`], so the classification cannot drift with the
-/// compiler's Unicode version.  A stacked mark (ccc != 0) is normally a mark on
-/// the *previous* code point, so it ends a run only when it is not a joiner;
-/// two canonical combining classes are joiners by definition, since ccc 7 is
-/// assigned only to nukta and ccc 9 only to virama across the Indic scripts.
-/// That keeps `सड़क` and `ट्रेन` whole while an ordinary stacked mark (a Vedic
-/// accent, ccc 230) still splits.
+/// compiler's Unicode version.  A stacked mark (ccc != 0) normally marks the
+/// *previous* code point and therefore ends a run; the two exceptions are the
+/// attachment classes - ccc 7 (`Nukta`) and ccc 9 (`Virama`) - which attach the
+/// following code point and keep the run together.  Those classes are assigned
+/// in several script families, not only the Indic ones (ccc 9 also in Thai,
+/// Lao, Tibetan, Myanmar, Khmer, Sinhala, Balinese and Sundanese; ccc 7 also in
+/// Myanmar, Balinese, Batak, Javanese and Adlam), which is why the rule is a
+/// class rule and why the word set it changes is pipeline-wide: the `ml-2` bump
+/// applies to every `multilingual-v1-<lang>` profile, not only `-hi`, because
+/// the version names the pipeline rather than the language.
 fn is_word_character(character: char) -> bool {
     let cp = character as u32;
     if unicode::is_number(cp) {
         return true;
     }
-    // ccc 7 (nukta) and ccc 9 (virama) attach the following code point to the
-    // current word instead of ending it.
+    // The attachment classes: ccc 7 (Nukta) and ccc 9 (Virama) join the next
+    // code point to the current word instead of ending it.
     let joins = matches!(unicode::combining_class(cp), 0 | 7 | 9);
     joins && (unicode::is_letter(cp) || unicode::is_mark(cp))
 }

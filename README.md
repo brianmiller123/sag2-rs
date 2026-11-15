@@ -200,8 +200,15 @@ Typing without diacritics does not need a fold for French, Polish or Vietnamese:
 FTS5 `unicode61` removes diacritics by default, and the whole-word token the
 word run stores is what puts the accented word in the body, so `bibliotheque`
 reaches `bibliothèque` and `truong dai hoc` reaches `trường đại học`.  Stripping
-the marks in `normalize` would only merge homographs (`cote`/`côté`/`côte`,
-`ma`/`má`/`mà`/`mả`/`mã`/`mạ`) for recall the word run already banked.
+the marks in `normalize` would still be wrong for Vietnamese: `ma`, `má`, `mà`,
+`mả`, `mã` and `mạ` are six words, and the fold would merge them before the
+index sees them.  That distinction survives in the **token stream**, not in the
+FTS index - `chunk_fts` uses SQLite's default `unicode61`
+(`remove_diacritics=1`), which folds the marks on both sides of a match - so a
+tone-exact query is not available: the recall rests on word-token
+distinctiveness, not on preserved index terms.  For French and Polish the same
+strip would only merge homographs (`cote`/`côté`/`côte`) for recall the word run
+already banked.
 
 German is the exception the fold exists for: an ASCII keyboard spells `Müller`
 as the transliteration `mueller`, which FTS cannot bridge from the

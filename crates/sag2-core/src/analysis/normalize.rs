@@ -36,10 +36,13 @@ pub fn normalize(language: Language, text: &str) -> String {
 ///
 /// Dropping *every* combining mark is what the Greek profile asks for: NFD
 /// cannot tell a tonos from a circumflex, so `ά` and `α` collapse together.
-/// Vietnamese does not: its tone marks are lexical identity (`ma`, `má`, `mà`,
-/// `mả`, `mã`, `mạ` are six words), and the index layer already removes the
-/// diacritics (FTS5 `unicode61`), so stripping them here would only destroy the
-/// distinctiveness of the stored word tokens.
+/// Vietnamese does not: its tone marks carry lexical identity (`ma`, `má`,
+/// `mà`, `mả`, `mã`, `mạ` are six words), and stripping them here would merge
+/// those six into one before the index ever sees them.  That distinction lives
+/// in the token stream, not in the FTS index: `chunk_fts` uses SQLite's
+/// `unicode61` with `remove_diacritics=1`, which folds the marks on both sides
+/// of a match, so tone-exact queries are not available and the recall comes
+/// from word-token distinctiveness rather than from preserved index terms.
 pub fn fold_script(language: Language, text: &str) -> String {
     let folded = fold_latin(text);
     match language {
